@@ -8,6 +8,21 @@ v1.0.0 decoder: the tests compare per-frame MD5s against the in-process AVM deco
 CelV2 is an independent project. It is not affiliated with or endorsed by the Alliance for
 Open Media.
 
+## Download
+
+[Releases](https://github.com/Stou-1/celv2/releases) has a Windows zip with the GUI (Japanese UI),
+`celv2enc.exe`, `av2_mux.exe` and the licenses: unpack it and run `CelV2Gui.exe`. It needs:
+
+- Windows 10 or 11, 64-bit, and a CPU with AVX2
+- For speed, an NVIDIA GPU, Turing (GeForce RTX 20) or newer with driver r580 or newer, or a
+  discrete GPU with Vulkan (checked on an Intel Arc Pro B50: the same output as on CUDA). Without
+  either it codes on the CPU, much more slowly.
+- ffmpeg (`ffmpeg.exe` and `ffprobe.exe`), not included; MP4Box (GPAC) for an MP4 with audio,
+  optional
+
+The zip needs no Visual Studio or CUDA toolkit; [Requirements](#requirements-windows) below is for
+building from source. [gui/README_ja.txt](gui/README_ja.txt) (Japanese) says how to use it.
+
 ## Status
 
 - 4:2:0 at 8 or 10 bits (y4m `C420` / `C420p10`); 10-bit coding by default, 8-bit inputs too
