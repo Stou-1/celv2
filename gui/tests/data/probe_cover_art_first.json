@@ -1,0 +1,39 @@
+{
+    "streams":  [
+                    {
+                        "index":  0,
+                        "codec_type":  "video",
+                        "codec_name":  "mjpeg",
+                        "width":  64,
+                        "height":  64,
+                        "pix_fmt":  "yuvj420p",
+                        "r_frame_rate":  "90000/1",
+                        "avg_frame_rate":  "0/0",
+                        "duration":  "2.000000",
+                        "disposition":  {
+                                            "default":  0,
+                                            "attached_pic":  1
+                                        }
+                    },
+                    {
+                        "index":  1,
+                        "codec_type":  "video",
+                        "codec_name":  "h264",
+                        "width":  320,
+                        "height":  240,
+                        "pix_fmt":  "yuv420p",
+                        "r_frame_rate":  "24/1",
+                        "avg_frame_rate":  "24/1",
+                        "field_order":  "progressive",
+                        "nb_frames":  "48",
+                        "duration":  "2.000000",
+                        "disposition":  {
+                                            "default":  1,
+                                            "attached_pic":  0
+                                        }
+                    }
+                ],
+    "format":  {
+                   "duration":  "2.000000"
+               }
+}

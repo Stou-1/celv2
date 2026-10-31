@@ -1,0 +1,20 @@
+Third-party software in celv2enc.exe and the runtime files next to it
+====================================================================
+
+AVM (AV2 reference decoder library, v1.0.0)
+  Statically linked. Its license and the AOMedia Patent License 1.0 are in
+  third_party\avm\LICENSE and third_party\avm\PATENTS.
+
+NVIDIA CUDA Runtime (cudart, static)
+  celv2enc.exe contains the CUDA Runtime (cudart_static, CUDA Toolkit 13.3.1, cudart 13.3.29)
+  and GPU code compiled with the CUDA Toolkit. These distributable parts are redistributed as
+  object code inside celv2enc.exe under the NVIDIA CUDA Toolkit End User License Agreement
+  (EULA, section 1.1 and Attachment A, "CUDA Runtime"): https://docs.nvidia.com/cuda/eula/
+  No NVIDIA DLL is shipped. The GPU driver (nvcuda.dll) comes with the user's NVIDIA driver.
+
+Microsoft Visual C++ runtime (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll)
+  Redistributed unchanged from Visual Studio's "VC\Redist" folder, as allowed by Microsoft's
+  Visual Studio license terms for redistributable files. Copyright (c) Microsoft Corporation.
+
+av2_mux.exe
+  See third_party\av2-tools\ (LICENSE, PATENTS, README.txt, THIRD_PARTY_NOTICES.txt).

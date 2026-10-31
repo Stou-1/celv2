@@ -1,0 +1,29 @@
+diff --git a/av2/encoder/encoder.c b/av2/encoder/encoder.c
+index b38b0b0ec..524c1e25d 100644
+--- a/av2/encoder/encoder.c
++++ b/av2/encoder/encoder.c
+@@ -15,6 +15,7 @@
+ #include <math.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "av2/common/av2_common_int.h"
+@@ -4820,6 +4821,16 @@ static int encode_frame_to_data_rate(AV2_COMP *cpi, size_t *size, uint8_t *dest,
+   } else {
+     cpi->common.features.cur_frame_force_integer_mv = 0;
+   }
++  // celv2 ablation: AVM_ABL_INTMV=1 turns screen content tools on for inter
++  // frames (control), =2 also forces integer MVs (only signalable with them on).
++  {
++    const char *abl = getenv("AVM_ABL_INTMV");
++    if (abl && atoi(abl) > 0 && !is_stat_generation_stage(cpi) &&
++        !frame_is_intra_only(cm)) {
++      features->allow_screen_content_tools = 1;
++      features->cur_frame_force_integer_mv = atoi(abl) == 2;
++    }
++  }
+   set_max_drl_bits(cpi);
+ 
+   // Set various flags etc to special state if it is a key frame.

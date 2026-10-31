@@ -1,0 +1,12 @@
+# Fails if any source under src/ includes an AVM encoder header (spec: never use av2/encoder).
+file(GLOB_RECURSE srcs "${SRC_DIR}/*.h" "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.cu" "${SRC_DIR}/*.cuh")
+set(bad "")
+foreach(f IN LISTS srcs)
+  file(STRINGS "${f}" lines REGEX "#[ \t]*include[ \t]*[<\"]av2/encoder/")
+  if(lines)
+    list(APPEND bad "${f}")
+  endif()
+endforeach()
+if(bad)
+  message(FATAL_ERROR "AVM encoder headers included in: ${bad}")
+endif()

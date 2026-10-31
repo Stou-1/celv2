@@ -1,0 +1,751 @@
+diff --git a/src/bitstream/bit_count.h b/src/bitstream/bit_count.h
+new file mode 100644
+index 0000000..3b4ec88
+--- /dev/null
++++ b/src/bitstream/bit_count.h
+@@ -0,0 +1,23 @@
++// A symbol sink for the syntax templates (bitstream/coeff_syntax.h) that prices instead of codes:
++// each symbol's bits under its CDF as it stands (no adaptation), literals and bits at 1 bit each.
++#pragma once
++#include <cmath>
++#include <cstdint>
++
++#include "av2/common/entropy.h"
++
++namespace celv2 {
++
++struct BitCount {
++  double bits = 0;
++  // avm_od_ec_encode_cdf_q15()'s probability of s under the inverse CDF icdf.
++  void symbol(int s, const avm_cdf_prob* icdf, int n) {
++    (void)n;
++    const int hi = s > 0 ? icdf[s - 1] : CDF_PROB_TOP, p = hi - icdf[s];
++    bits += std::log2(static_cast<double>(CDF_PROB_TOP) / (p > 0 ? p : 1));
++  }
++  void literal(int v, int n) { (void)v, bits += n; }
++  void bit(int b) { (void)b, bits += 1; }
++};
++
++}  // namespace celv2
+diff --git a/src/bitstream/block_writer.cpp b/src/bitstream/block_writer.cpp
+index 6b4a81e..9898eff 100644
+--- a/src/bitstream/block_writer.cpp
++++ b/src/bitstream/block_writer.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "bitstream/block_writer.h"
+ 
++#include "bitstream/coeff_syntax.h"
++
+ #include <algorithm>
+ #include <climits>
+ #include <cmath>
+@@ -521,70 +523,12 @@ void BlockWriter::pre_txb(int plane, TX_SIZE tx_size) {
+ 
+ // decodetxb.c decode_eob()
+ void BlockWriter::eob_symbols(int plane, TX_SIZE tx_size, int eob) {
+-  MACROBLOCKD* const xd = xd_;
+-  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+-  const int is_inter = is_inter_block(xd->mi[0], xd->tree_type);
+-  const int pl_ctx = get_eob_plane_ctx(plane, is_inter);
+-  int eob_pt = 1;
+-  while (eob_pt + 1 < 12 && av2_eob_group_start[eob_pt + 1] <= eob) eob_pt++;
+-  const int eob_extra = eob - av2_eob_group_start[eob_pt];
+-  const int sym = eob_pt - 1;
+-  const int ms = txsize_log2_minus4[tx_size];
+-  switch (ms) {
+-    case 0: w_->symbol(sym, ec_ctx->eob_flag_cdf16[pl_ctx], EOB_MAX_SYMS - 6); break;
+-    case 1: w_->symbol(sym, ec_ctx->eob_flag_cdf32[pl_ctx], EOB_MAX_SYMS - 5); break;
+-    case 2: w_->symbol(sym, ec_ctx->eob_flag_cdf64[pl_ctx], EOB_MAX_SYMS - 4); break;
+-    case 3: w_->symbol(sym, ec_ctx->eob_flag_cdf128[pl_ctx], EOB_MAX_SYMS - 3); break;
+-    default: {
+-      avm_cdf_prob* cdf = ms == 4   ? ec_ctx->eob_flag_cdf256[pl_ctx]
+-                          : ms == 5 ? ec_ctx->eob_flag_cdf512[pl_ctx]
+-                                    : ec_ctx->eob_flag_cdf1024[pl_ctx];
+-      const int low = AVMMIN(sym, EOB_PT_INDEX_COUNT - 1);
+-      w_->symbol(low, cdf, EOB_MAX_SYMS - 3);
+-      if (low == EOB_PT_INDEX_COUNT - 1) w_->literal(sym - low, ms == 4 ? 1 : 2);
+-      break;
+-    }
+-  }
+-  const int bits = av2_eob_offset_bits[eob_pt];
+-  if (bits > 0) {
+-    w_->symbol((eob_extra >> (bits - 1)) & 1, ec_ctx->eob_extra_cdf, 2);
+-    w_->literal(eob_extra & ((1 << (bits - 1)) - 1), bits - 1);
+-  }
++  celv2::eob_syntax(w_, xd_->tile_ctx, plane, is_inter_block(xd_->mi[0], xd_->tree_type), tx_size, eob);
+ }
+ 
+-namespace {
+ 
+-void write_low_range(SymbolLog* w, avm_cdf_prob* cdf, int br) {  // br = level above the base
+-  for (int idx = 0; idx < COEFF_BASE_RANGE; idx += BR_CDF_SIZE - 1) {
+-    const int k = AVMMIN(br - idx, BR_CDF_SIZE - 1);
+-    w->symbol(k, cdf, BR_CDF_SIZE);
+-    if (k < BR_CDF_SIZE - 1) break;
+-  }
+-}
+-
+-void write_exp_golomb(SymbolLog* w, int level, int k) {
+-  const int x = level + (1 << k);
+-  const int length = get_msb(x) + 1;
+-  w->literal(0, length - 1 - k);
+-  w->literal(x, length);
+-}
+-
+-// Inverse of decodetxb.c read_adaptive_hr()
+-void write_adaptive_hr(SymbolLog* w, int level, int ctx) {
+-  const int m = get_adaptive_param(ctx);
+-  const int k = m + 1, cmax = AVMMIN(m + 4, 6);
+-  const int q = level >> m;
+-  if (q >= cmax) {
+-    w->literal(0, cmax);
+-    write_exp_golomb(w, level - (cmax << m), k);
+-  } else {
+-    w->literal(0, q);
+-    w->literal(1, 1);
+-    w->literal(level & ((1 << m) - 1), m);
+-  }
+-}
+-
+-}  // namespace
++using celv2::write_adaptive_hr;
++using celv2::write_low_range;
+ 
+ // decodetxb.c av2_read_coeffs_txb_skip(): levels forward from bob (the first nonzero one, in scan
+ // order) to the end of the block, then signs and high ranges in the same order; no TCQ.
+@@ -650,185 +594,19 @@ int BlockWriter::levels_and_signs(int plane, TX_SIZE tx_size, const TXB_CTX& txb
+                                   const tran_low_t* qcoeff, int eob, int blk_row, int blk_col) {
+   AV2_COMMON* const cm = st_.cm();
+   MACROBLOCKD* const xd = xd_;
+-  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+   MB_MODE_INFO* const mbmi = xd->mi[0];
+-  const TX_SIZE txs_ctx = get_txsize_entropy_ctx(tx_size);
+   const PLANE_TYPE plane_type = get_plane_type(plane);
+-  const int bwl = get_txb_bwl(tx_size);
+-  const int width = get_txb_wide(tx_size);
+-  const int height = get_txb_high(tx_size);
+-  uint8_t levels_buf[TX_PAD_2D];
+-  std::memset(levels_buf, 0, sizeof(levels_buf));
+-  uint8_t* const levels = set_levels(levels_buf, width);
+   const TX_TYPE tx_type = av2_get_tx_type(xd, plane_type, blk_row, blk_col, tx_size,
+                                           is_reduced_tx_set_used(cm, plane_type));
+   const TX_CLASS tx_class = tx_type_to_class[get_primary_tx_type(tx_type)];
+-  const int16_t* const scan = get_scan(tx_size, tx_type)->scan;
+   if (plane == AVM_PLANE_Y &&
+       (is_inter_block(mbmi, xd->tree_type) ? (eob > 3 && cm->seq_params.enable_inter_ist)
+                                            : (eob != 1 && cm->seq_params.enable_ist)))
+     throw std::runtime_error("IST is disabled but signalled");
+   const int tcq_mode =
+       tcq_enable(cm->features.tcq_mode, xd->lossless[mbmi->segment_id], plane, tx_class);
+-  int state = tcq_init_state(tcq_mode);
+-  auto full_level = [&](int c) { return std::abs(static_cast<int>(qcoeff[scan[c]])); };
+-  // The level the base and range symbols code: with TCQ one from max_br - 1 up codes its parity
+-  // (max_br - 1 or max_br) and the rest as a high range in steps of 2 (read_high_range()).
+-  auto abs_level = [&](int c) {
+-    const int a = full_level(c);
+-    if (!tcq_mode) return a;
+-    const int pos = scan[c], row = pos >> bwl;
+-    const int max_br = get_lf_limits(row, pos - (row << bwl), tx_class, plane) ? LF_MAX_BASE_BR_RANGE : MAX_BASE_BR_RANGE;
+-    return a >= max_br - 1 ? max_br - 1 + ((a - max_br + 1) & 1) : a;
+-  };
+-
+-  {  // last coefficient (scan index eob - 1)
+-    const int c = eob - 1;
+-    const int pos = scan[c];
+-    const int coeff_ctx = get_lower_levels_ctx_eob(bwl, height, c);
+-    const int a = abs_level(c);
+-    const int row = pos >> bwl;
+-    const int col = pos - (row << bwl);
+-    const int limits = get_lf_limits(row, col, tx_class, plane);
+-    int level;
+-    if (plane > 0) {
+-      if (limits) {
+-        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
+-        w_->symbol(level - 1, ec_ctx->coeff_base_lf_eob_uv_cdf[coeff_ctx],
+-                         LF_BASE_SYMBOLS - 1);
+-      } else {
+-        level = AVMMIN(a, 3);
+-        w_->symbol(level - 1, ec_ctx->coeff_base_eob_uv_cdf[coeff_ctx], 3);
+-        if (level > NUM_BASE_LEVELS) {
+-          write_low_range(w_, ec_ctx->coeff_br_uv_cdf[0], a - 1 - NUM_BASE_LEVELS);
+-          level = AVMMIN(a, MAX_BASE_BR_RANGE);
+-        }
+-      }
+-    } else {
+-      if (limits) {
+-        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
+-        w_->symbol(level - 1, ec_ctx->coeff_base_lf_eob_cdf[txs_ctx][coeff_ctx],
+-                         LF_BASE_SYMBOLS - 1);
+-        if (level > LF_NUM_BASE_LEVELS) {
+-          const int br_ctx = get_br_ctx_lf_eob(pos, tx_class);
+-          write_low_range(w_, ec_ctx->coeff_br_lf_cdf[br_ctx], a - 1 - LF_NUM_BASE_LEVELS);
+-          level = AVMMIN(a, LF_MAX_BASE_BR_RANGE);
+-        }
+-      } else {
+-        level = AVMMIN(a, 3);
+-        w_->symbol(level - 1, ec_ctx->coeff_base_eob_cdf[txs_ctx][coeff_ctx], 3);
+-        if (level > NUM_BASE_LEVELS) {
+-          write_low_range(w_, ec_ctx->coeff_br_cdf[0], a - 1 - NUM_BASE_LEVELS);
+-          level = AVMMIN(a, MAX_BASE_BR_RANGE);
+-        }
+-      }
+-    }
+-    levels[get_padded_idx(pos, bwl)] = static_cast<uint8_t>(level);
+-    state = tcq_next_state(state, level);
+-  }
+-
+-  // Remaining coefficients in reverse scan order: read_coeffs_reverse_2d() for 1..eob-2 when the
+-  // class is 2D, then read_coeffs_reverse() for the rest (always for DC).
+-  auto code_one = [&](int c, bool use_2d) {
+-    const int pos = scan[c];
+-    const int a = abs_level(c);
+-    const int row = pos >> bwl;
+-    const int col = pos - (row << bwl);
+-    const int limits = get_lf_limits(row, col, use_2d ? TX_CLASS_2D : tx_class, plane);
+-    const int q_i = tcq_quant(state);
+-    int level;
+-    if (plane > 0) {
+-      if (limits) {
+-        const int ctx = use_2d ? get_lower_levels_ctx_lf_2d_chroma(levels, pos, bwl, plane)
+-                               : get_lower_levels_lf_ctx_chroma(levels, pos, bwl, tx_class, plane);
+-        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
+-        w_->symbol(level, ec_ctx->coeff_base_lf_uv_cdf[ctx], LF_BASE_SYMBOLS);
+-      } else {
+-        const int ctx = use_2d ? get_lower_levels_ctx_2d_chroma(levels, pos, bwl, plane)
+-                               : get_lower_levels_ctx_chroma(levels, pos, bwl, tx_class, plane);
+-        level = AVMMIN(a, 3);
+-        w_->symbol(level, ec_ctx->coeff_base_uv_cdf[ctx], 4);
+-        if (level > NUM_BASE_LEVELS) {
+-          const int br_ctx = use_2d ? get_br_ctx_2d_chroma(levels, pos, bwl)
+-                                    : get_br_ctx_chroma(levels, pos, bwl, tx_class);
+-          write_low_range(w_, ec_ctx->coeff_br_uv_cdf[br_ctx], a - 1 - NUM_BASE_LEVELS);
+-          level = AVMMIN(a, MAX_BASE_BR_RANGE);
+-        }
+-      }
+-    } else {
+-      if (limits) {
+-        const int ctx = use_2d ? get_lower_levels_ctx_lf_2d(levels, pos, bwl)
+-                               : get_lower_levels_lf_ctx(levels, pos, bwl, tx_class);
+-        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
+-        w_->symbol(level, ec_ctx->coeff_base_lf_cdf[txs_ctx][ctx][q_i],
+-                         LF_BASE_SYMBOLS);
+-        if (level > LF_NUM_BASE_LEVELS) {
+-          const int br_ctx = use_2d ? get_br_lf_ctx_2d(levels, pos, bwl)
+-                                    : get_br_lf_ctx(levels, pos, bwl, tx_class);
+-          write_low_range(w_, ec_ctx->coeff_br_lf_cdf[br_ctx], a - 1 - LF_NUM_BASE_LEVELS);
+-          level = AVMMIN(a, LF_MAX_BASE_BR_RANGE);
+-        }
+-      } else {
+-        const int ctx = use_2d ? get_lower_levels_ctx_2d(levels, pos, bwl, plane)
+-                               : get_lower_levels_ctx(levels, pos, bwl, tx_class, plane);
+-        level = AVMMIN(a, 3);
+-        w_->symbol(level, ec_ctx->coeff_base_cdf[txs_ctx][ctx][q_i], 4);
+-        if (level > NUM_BASE_LEVELS) {
+-          const int br_ctx = use_2d ? get_br_ctx_2d(levels, pos, bwl)
+-                                    : get_br_ctx(levels, pos, bwl, tx_class);
+-          write_low_range(w_, ec_ctx->coeff_br_cdf[br_ctx], a - 1 - NUM_BASE_LEVELS);
+-          level = AVMMIN(a, MAX_BASE_BR_RANGE);
+-        }
+-      }
+-    }
+-    levels[get_padded_idx(pos, bwl)] = static_cast<uint8_t>(level);
+-    state = tcq_next_state(state, level);
+-  };
+-  if (eob > 1) {
+-    for (int c = eob - 2; c >= 1; --c) code_one(c, tx_class == TX_CLASS_2D);
+-    code_one(0, false);
+-  }
+-
+-  // Signs and high ranges.
+-  int cul_level = 0, dc_val = 0, hr_level_avg = 0;
+-  for (int c = eob - 1; c >= 0; --c) {
+-    const int pos = scan[c];
+-    int level = levels[get_padded_idx(pos, bwl)];
+-    if (plane == AVM_PLANE_U) xd->tmp_sign[pos] = 0;
+-    if (!level) continue;
+-    const int a = full_level(c);
+-    const int sign = qcoeff[pos] < 0;
+-    const int row = pos >> bwl;
+-    const int col = pos - (row << bwl);
+-    const bool dc_2dtx = c == 0;
+-    const bool dc_hor = col == 0 && tx_class == TX_CLASS_HORIZ;
+-    const bool dc_ver = row == 0 && tx_class == TX_CLASS_VERT;
+-    if (dc_2dtx || dc_hor || dc_ver) {
+-      const int dc_sign_ctx = dc_2dtx ? txb_ctx.dc_sign_ctx : 0;
+-      if (plane == AVM_PLANE_Y)
+-        w_->symbol(sign, ec_ctx->dc_sign_cdf[plane_type][0][dc_sign_ctx], 2);
+-      else
+-        w_->literal(sign, 1);
+-      if (plane == AVM_PLANE_U) xd->tmp_sign[pos] = sign ? 2 : 1;
+-    } else {
+-      w_->bit(sign);
+-    }
+-    // read_high_range()
+-    const int lf = get_lf_limits(row, col, tx_class, plane);
+-    const int max_br =
+-        lf ? (plane == 0 ? LF_MAX_BASE_BR_RANGE : LF_NUM_BASE_LEVELS + 1) : MAX_BASE_BR_RANGE;
+-    if (tcq_mode ? level >= max_br - 1 : level >= max_br) {
+-      const int hr = tcq_mode ? (a - level) >> 1 : a - level;
+-      write_adaptive_hr(w_, hr, hr_level_avg);
+-      level += tcq_mode ? hr << 1 : hr;
+-      hr_level_avg = (hr_level_avg + hr) >> 1;
+-    }
+-    if (c == 0) dc_val = sign ? -level : level;
+-    cul_level += level;
+-  }
+-  cul_level = AVMMIN(COEFF_CONTEXT_MASK, cul_level);
+-  set_dc_sign(&cul_level, dc_val);
+-  return cul_level;
++  return celv2::levels_syntax(w_, xd->tile_ctx, plane, tx_size, tx_class, get_scan(tx_size, tx_type)->scan, tcq_mode,
++                             txb_ctx.dc_sign_ctx, qcoeff, eob, plane == AVM_PLANE_U ? xd->tmp_sign : nullptr);
+ }
+ 
+ int BlockWriter::coeffs(int plane, int blk_row, int blk_col, TX_SIZE tx_size,
+diff --git a/src/bitstream/coeff_syntax.h b/src/bitstream/coeff_syntax.h
+new file mode 100644
+index 0000000..25c8ad5
+--- /dev/null
++++ b/src/bitstream/coeff_syntax.h
+@@ -0,0 +1,261 @@
++// The coefficient syntax of a transform block (eob, levels, signs) over any symbol sink: SymbolLog
++// codes it, BitCount (bitstream/bit_count.h) prices it with the same contexts.
++// Portions of this file are derived from the AVM v1.0.0 decoder (av2/decoder),
++// Copyright (c) 2021, Alliance for Open Media, under the BSD 3-Clause Clear License
++// and the Alliance for Open Media Patent License 1.0: see third_party/avm/.
++#pragma once
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++extern "C" {
++#include "av2/common/entropy.h"
++#include "av2/common/entropymode.h"
++#include "av2/common/hr_coding.h"
++#include "av2/common/quant_common.h"
++#include "av2/common/scan.h"
++#include "av2/common/txb_common.h"
++}
++
++namespace celv2 {
++
++template <class W>
++void write_low_range(W* w, avm_cdf_prob* cdf, int br) {  // br = level above the base
++  for (int idx = 0; idx < COEFF_BASE_RANGE; idx += BR_CDF_SIZE - 1) {
++    const int k = AVMMIN(br - idx, BR_CDF_SIZE - 1);
++    w->symbol(k, cdf, BR_CDF_SIZE);
++    if (k < BR_CDF_SIZE - 1) break;
++  }
++}
++
++template <class W>
++void write_exp_golomb(W* w, int level, int k) {
++  const int x = level + (1 << k);
++  const int length = get_msb(x) + 1;
++  w->literal(0, length - 1 - k);
++  w->literal(x, length);
++}
++
++// Inverse of decodetxb.c read_adaptive_hr()
++template <class W>
++void write_adaptive_hr(W* w, int level, int ctx) {
++  const int m = get_adaptive_param(ctx);
++  const int k = m + 1, cmax = AVMMIN(m + 4, 6);
++  const int q = level >> m;
++  if (q >= cmax) {
++    w->literal(0, cmax);
++    write_exp_golomb(w, level - (cmax << m), k);
++  } else {
++    w->literal(0, q);
++    w->literal(1, 1);
++    w->literal(level & ((1 << m) - 1), m);
++  }
++}
++
++// decodetxb.c decode_eob()
++template <class W>
++void eob_syntax(W* w, FRAME_CONTEXT* fc, int plane, int is_inter, TX_SIZE tx_size, int eob) {
++  const int pl_ctx = get_eob_plane_ctx(plane, is_inter);
++  int eob_pt = 1;
++  while (eob_pt + 1 < 12 && av2_eob_group_start[eob_pt + 1] <= eob) eob_pt++;
++  const int eob_extra = eob - av2_eob_group_start[eob_pt];
++  const int sym = eob_pt - 1;
++  const int ms = txsize_log2_minus4[tx_size];
++  switch (ms) {
++    case 0: w->symbol(sym, fc->eob_flag_cdf16[pl_ctx], EOB_MAX_SYMS - 6); break;
++    case 1: w->symbol(sym, fc->eob_flag_cdf32[pl_ctx], EOB_MAX_SYMS - 5); break;
++    case 2: w->symbol(sym, fc->eob_flag_cdf64[pl_ctx], EOB_MAX_SYMS - 4); break;
++    case 3: w->symbol(sym, fc->eob_flag_cdf128[pl_ctx], EOB_MAX_SYMS - 3); break;
++    default: {
++      avm_cdf_prob* cdf = ms == 4   ? fc->eob_flag_cdf256[pl_ctx]
++                          : ms == 5 ? fc->eob_flag_cdf512[pl_ctx]
++                                    : fc->eob_flag_cdf1024[pl_ctx];
++      const int low = AVMMIN(sym, EOB_PT_INDEX_COUNT - 1);
++      w->symbol(low, cdf, EOB_MAX_SYMS - 3);
++      if (low == EOB_PT_INDEX_COUNT - 1) w->literal(sym - low, ms == 4 ? 1 : 2);
++      break;
++    }
++  }
++  const int bits = av2_eob_offset_bits[eob_pt];
++  if (bits > 0) {
++    w->symbol((eob_extra >> (bits - 1)) & 1, fc->eob_extra_cdf, 2);
++    w->literal(eob_extra & ((1 << (bits - 1)) - 1), bits - 1);
++  }
++}
++
++// decodetxb.c av2_read_coeffs_txb() with IST and parity hiding off: the levels in reverse scan
++// order, then signs and high ranges; tmp_sign: the U plane's (MACROBLOCKD::tmp_sign), else nullptr.
++// Returns the decoder's cul_level.
++template <class W>
++int levels_syntax(W* w, FRAME_CONTEXT* fc, int plane, TX_SIZE tx_size, TX_CLASS tx_class, const int16_t* scan,
++                  int tcq_mode, int txb_dc_sign_ctx, const tran_low_t* qcoeff, int eob, int32_t* tmp_sign) {
++  const TX_SIZE txs_ctx = get_txsize_entropy_ctx(tx_size);
++  const PLANE_TYPE plane_type = get_plane_type(plane);
++  const int bwl = get_txb_bwl(tx_size);
++  const int width = get_txb_wide(tx_size);
++  const int height = get_txb_high(tx_size);
++  uint8_t levels_buf[TX_PAD_2D];
++  std::memset(levels_buf, 0, sizeof(levels_buf));
++  uint8_t* const levels = set_levels(levels_buf, width);
++  int state = tcq_init_state(tcq_mode);
++  auto full_level = [&](int c) { return std::abs(static_cast<int>(qcoeff[scan[c]])); };
++  // The level the base and range symbols code: with TCQ one from max_br - 1 up codes its parity
++  // (max_br - 1 or max_br) and the rest as a high range in steps of 2 (read_high_range()).
++  auto abs_level = [&](int c) {
++    const int a = full_level(c);
++    if (!tcq_mode) return a;
++    const int pos = scan[c], row = pos >> bwl;
++    const int max_br = get_lf_limits(row, pos - (row << bwl), tx_class, plane) ? LF_MAX_BASE_BR_RANGE : MAX_BASE_BR_RANGE;
++    return a >= max_br - 1 ? max_br - 1 + ((a - max_br + 1) & 1) : a;
++  };
++
++  {  // last coefficient (scan index eob - 1)
++    const int c = eob - 1;
++    const int pos = scan[c];
++    const int coeff_ctx = get_lower_levels_ctx_eob(bwl, height, c);
++    const int a = abs_level(c);
++    const int row = pos >> bwl;
++    const int col = pos - (row << bwl);
++    const int limits = get_lf_limits(row, col, tx_class, plane);
++    int level;
++    if (plane > 0) {
++      if (limits) {
++        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
++        w->symbol(level - 1, fc->coeff_base_lf_eob_uv_cdf[coeff_ctx],
++                         LF_BASE_SYMBOLS - 1);
++      } else {
++        level = AVMMIN(a, 3);
++        w->symbol(level - 1, fc->coeff_base_eob_uv_cdf[coeff_ctx], 3);
++        if (level > NUM_BASE_LEVELS) {
++          write_low_range(w, fc->coeff_br_uv_cdf[0], a - 1 - NUM_BASE_LEVELS);
++          level = AVMMIN(a, MAX_BASE_BR_RANGE);
++        }
++      }
++    } else {
++      if (limits) {
++        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
++        w->symbol(level - 1, fc->coeff_base_lf_eob_cdf[txs_ctx][coeff_ctx],
++                         LF_BASE_SYMBOLS - 1);
++        if (level > LF_NUM_BASE_LEVELS) {
++          const int br_ctx = get_br_ctx_lf_eob(pos, tx_class);
++          write_low_range(w, fc->coeff_br_lf_cdf[br_ctx], a - 1 - LF_NUM_BASE_LEVELS);
++          level = AVMMIN(a, LF_MAX_BASE_BR_RANGE);
++        }
++      } else {
++        level = AVMMIN(a, 3);
++        w->symbol(level - 1, fc->coeff_base_eob_cdf[txs_ctx][coeff_ctx], 3);
++        if (level > NUM_BASE_LEVELS) {
++          write_low_range(w, fc->coeff_br_cdf[0], a - 1 - NUM_BASE_LEVELS);
++          level = AVMMIN(a, MAX_BASE_BR_RANGE);
++        }
++      }
++    }
++    levels[get_padded_idx(pos, bwl)] = static_cast<uint8_t>(level);
++    state = tcq_next_state(state, level);
++  }
++
++  // Remaining coefficients in reverse scan order: read_coeffs_reverse_2d() for 1..eob-2 when the
++  // class is 2D, then read_coeffs_reverse() for the rest (always for DC).
++  auto code_one = [&](int c, bool use_2d) {
++    const int pos = scan[c];
++    const int a = abs_level(c);
++    const int row = pos >> bwl;
++    const int col = pos - (row << bwl);
++    const int limits = get_lf_limits(row, col, use_2d ? TX_CLASS_2D : tx_class, plane);
++    const int q_i = tcq_quant(state);
++    int level;
++    if (plane > 0) {
++      if (limits) {
++        const int ctx = use_2d ? get_lower_levels_ctx_lf_2d_chroma(levels, pos, bwl, plane)
++                               : get_lower_levels_lf_ctx_chroma(levels, pos, bwl, tx_class, plane);
++        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
++        w->symbol(level, fc->coeff_base_lf_uv_cdf[ctx], LF_BASE_SYMBOLS);
++      } else {
++        const int ctx = use_2d ? get_lower_levels_ctx_2d_chroma(levels, pos, bwl, plane)
++                               : get_lower_levels_ctx_chroma(levels, pos, bwl, tx_class, plane);
++        level = AVMMIN(a, 3);
++        w->symbol(level, fc->coeff_base_uv_cdf[ctx], 4);
++        if (level > NUM_BASE_LEVELS) {
++          const int br_ctx = use_2d ? get_br_ctx_2d_chroma(levels, pos, bwl)
++                                    : get_br_ctx_chroma(levels, pos, bwl, tx_class);
++          write_low_range(w, fc->coeff_br_uv_cdf[br_ctx], a - 1 - NUM_BASE_LEVELS);
++          level = AVMMIN(a, MAX_BASE_BR_RANGE);
++        }
++      }
++    } else {
++      if (limits) {
++        const int ctx = use_2d ? get_lower_levels_ctx_lf_2d(levels, pos, bwl)
++                               : get_lower_levels_lf_ctx(levels, pos, bwl, tx_class);
++        level = AVMMIN(a, LF_BASE_SYMBOLS - 1);
++        w->symbol(level, fc->coeff_base_lf_cdf[txs_ctx][ctx][q_i],
++                         LF_BASE_SYMBOLS);
++        if (level > LF_NUM_BASE_LEVELS) {
++          const int br_ctx = use_2d ? get_br_lf_ctx_2d(levels, pos, bwl)
++                                    : get_br_lf_ctx(levels, pos, bwl, tx_class);
++          write_low_range(w, fc->coeff_br_lf_cdf[br_ctx], a - 1 - LF_NUM_BASE_LEVELS);
++          level = AVMMIN(a, LF_MAX_BASE_BR_RANGE);
++        }
++      } else {
++        const int ctx = use_2d ? get_lower_levels_ctx_2d(levels, pos, bwl, plane)
++                               : get_lower_levels_ctx(levels, pos, bwl, tx_class, plane);
++        level = AVMMIN(a, 3);
++        w->symbol(level, fc->coeff_base_cdf[txs_ctx][ctx][q_i], 4);
++        if (level > NUM_BASE_LEVELS) {
++          const int br_ctx = use_2d ? get_br_ctx_2d(levels, pos, bwl)
++                                    : get_br_ctx(levels, pos, bwl, tx_class);
++          write_low_range(w, fc->coeff_br_cdf[br_ctx], a - 1 - NUM_BASE_LEVELS);
++          level = AVMMIN(a, MAX_BASE_BR_RANGE);
++        }
++      }
++    }
++    levels[get_padded_idx(pos, bwl)] = static_cast<uint8_t>(level);
++    state = tcq_next_state(state, level);
++  };
++  if (eob > 1) {
++    for (int c = eob - 2; c >= 1; --c) code_one(c, tx_class == TX_CLASS_2D);
++    code_one(0, false);
++  }
++
++  // Signs and high ranges.
++  int cul_level = 0, dc_val = 0, hr_level_avg = 0;
++  for (int c = eob - 1; c >= 0; --c) {
++    const int pos = scan[c];
++    int level = levels[get_padded_idx(pos, bwl)];
++    if (tmp_sign) tmp_sign[pos] = 0;
++    if (!level) continue;
++    const int a = full_level(c);
++    const int sign = qcoeff[pos] < 0;
++    const int row = pos >> bwl;
++    const int col = pos - (row << bwl);
++    const bool dc_2dtx = c == 0;
++    const bool dc_hor = col == 0 && tx_class == TX_CLASS_HORIZ;
++    const bool dc_ver = row == 0 && tx_class == TX_CLASS_VERT;
++    if (dc_2dtx || dc_hor || dc_ver) {
++      const int dc_sign_ctx = dc_2dtx ? txb_dc_sign_ctx : 0;
++      if (plane == AVM_PLANE_Y)
++        w->symbol(sign, fc->dc_sign_cdf[plane_type][0][dc_sign_ctx], 2);
++      else
++        w->literal(sign, 1);
++      if (tmp_sign) tmp_sign[pos] = sign ? 2 : 1;
++    } else {
++      w->bit(sign);
++    }
++    // read_high_range()
++    const int lf = get_lf_limits(row, col, tx_class, plane);
++    const int max_br =
++        lf ? (plane == 0 ? LF_MAX_BASE_BR_RANGE : LF_NUM_BASE_LEVELS + 1) : MAX_BASE_BR_RANGE;
++    if (tcq_mode ? level >= max_br - 1 : level >= max_br) {
++      const int hr = tcq_mode ? (a - level) >> 1 : a - level;
++      write_adaptive_hr(w, hr, hr_level_avg);
++      level += tcq_mode ? hr << 1 : hr;
++      hr_level_avg = (hr_level_avg + hr) >> 1;
++    }
++    if (c == 0) dc_val = sign ? -level : level;
++    cul_level += level;
++  }
++  cul_level = AVMMIN(COEFF_CONTEXT_MASK, cul_level);
++  set_dc_sign(&cul_level, dc_val);
++  return cul_level;
++}
++
++}  // namespace celv2
+diff --git a/src/core/encoder.h b/src/core/encoder.h
+index 9e387d5..c46445a 100644
+--- a/src/core/encoder.h
++++ b/src/core/encoder.h
+@@ -38,6 +38,8 @@ class Encoder {
+   const Frame420& last_recon() const { return st_->recon(); }
+   // The display order hint of the frame begin() set up (as ref_display_hints report them).
+   int display_order_hint() const { return static_cast<int>(st_->cm()->current_frame.display_order_hint); }
++  // The CDFs the frame begin() set up starts from.
++  const FRAME_CONTEXT& frame_context() const { return *st_->cm()->fc; }
+   // coef_scale() of a luma transform (for the CPU RD pass).
+   double luma_scale(TX_SIZE tx);
+ 
+diff --git a/src/core/rd_pass.cpp b/src/core/rd_pass.cpp
+index 70cec8f..feaadc6 100644
+--- a/src/core/rd_pass.cpp
++++ b/src/core/rd_pass.cpp
+@@ -5,6 +5,8 @@
+ #include <cstdint>
+ #include <immintrin.h>
+ 
++#include "bitstream/bit_count.h"
++#include "bitstream/coeff_syntax.h"
+ #include "core/quant.h"
+ #include "core/transform.h"
+ #include "gpu/inter_common.h"
+@@ -45,7 +47,7 @@ TX_SIZE tx_of(int w, int h) {
+ // One transform of res (stride w of the block) quantized as the coder does: squared error in steps
+ // (with what a 64-point one drops), and the bits of its levels and end of block - weighed like the
+ // side bits, unlike quantize_cost()'s RDOQ weight.
+-Cost tx_cost(const int16_t* res, int stride, TX_SIZE t, const RdPassParams& p) {
++Cost tx_cost(const int16_t* res, int stride, TX_SIZE t, bool inter, const RdPassParams& p) {
+   tran_low_t coeff[1024], q[1024], dq[1024];
+   fwd_dct(res, stride, t, p.scale[t], coeff);
+   const int eob = quantize(coeff, q, dq, t, p.qindex, 0, DCT_DCT, nullptr, p.tcq);
+@@ -55,11 +57,21 @@ Cost tx_cost(const int16_t* res, int stride, TX_SIZE t, const RdPassParams& p) {
+   const int n = get_txb_wide(t) * get_txb_high(t);
+   const int16_t* const iscan = get_scan(t, DCT_DCT)->iscan;
+   Cost c;
+-  c.bits = eob ? 2 + 1.5 * std::log2(static_cast<double>(eob)) : 1;
++  if (p.fc) {  // as BlockWriter::coeffs() codes it: a whole-block transform's skip context is 0
++    celv2::BitCount b;
++    b.symbol(eob == 0, p.fc->txb_skip_cdf[inter][get_txsize_entropy_ctx(t)][0], 2);
++    if (eob) {
++      celv2::eob_syntax(&b, p.fc, 0, inter, t, eob);
++      celv2::levels_syntax(&b, p.fc, 0, t, TX_CLASS_2D, get_scan(t, DCT_DCT)->scan, p.tcq, 0, q, eob, nullptr);
++    }
++    c.bits = b.bits;
++  } else {
++    c.bits = eob ? 2 + 1.5 * std::log2(static_cast<double>(eob)) : 1;
++  }
+   for (int pos = 0; pos < n; pos++) {
+     const double e = (coeff[pos] - dq[pos]) / (pos == 0 ? step_dc : step_ac);
+     c.d += e * e;
+-    if (iscan[pos] < eob) c.bits += coeff_level_bits(std::abs(static_cast<int>(q[pos])));
++    if (!p.fc && iscan[pos] < eob) c.bits += coeff_level_bits(std::abs(static_cast<int>(q[pos])));
+   }
+   c.d += dropped_cost(res, stride, t, p.scale[t], coeff, p.qindex);
+   return c;
+@@ -128,12 +140,12 @@ void predict(const celv2::Plane& r, int x, int y, int w, int h, int qx, int qy, u
+ 
+ // The block's luma cost: its largest transform, or for a 64-wide or -high block also 32x32 parts
+ // (what TileCoder::choose_tx_partition() picks from).
+-Cost residual_cost(const int16_t* res, int w, int h, const RdPassParams& p) {
+-  Cost c = tx_cost(res, w, tx_of(w, h), p);
++Cost residual_cost(const int16_t* res, int w, int h, bool inter, const RdPassParams& p) {
++  Cost c = tx_cost(res, w, tx_of(w, h), inter, p);
+   if (w == 64 || h == 64) {
+     Cost parts;
+     for (int y = 0; y < h && parts.j(p) < c.j(p); y += 32)
+-      for (int x = 0; x < w; x += 32) parts += tx_cost(res + y * w + x, w, TX_32X32, p);
++      for (int x = 0; x < w; x += 32) parts += tx_cost(res + y * w + x, w, TX_32X32, inter, p);
+     if (parts.j(p) < c.j(p)) c = parts;
+   }
+   return c;
+@@ -166,7 +178,7 @@ struct Pass {
+         const int pred = comp ? (p0[k] + p1[k] + 1) >> 1 : p0[k];
+         res[k] = static_cast<int16_t>(src(y + i, x + j) - pred);
+       }
+-    Cost c = residual_cost(res, w, h, p);
++    Cost c = residual_cost(res, w, h, true, p);
+     c.bits += comp ? kCompoundBits + d.ref + d.ref2 : celv2::inter_bits(d.ref);
+     return c;
+   }
+@@ -176,7 +188,7 @@ struct Pass {
+     for (int i = 0; i < h; i++)
+       for (int j = 0; j < w; j++)
+         res[i * w + j] = static_cast<int16_t>(src(y + i, x + j) - celv2::intra_pred(s, x, y, w, h, mode, i, j));
+-    Cost c = residual_cost(res, w, h, p);
++    Cost c = residual_cost(res, w, h, false, p);
+     c.bits += celv2::mode_bits(mode) + (inter_frame ? celv2::kIntraInInterBits : 0);
+     return c;
+   }
+diff --git a/src/core/rd_pass.h b/src/core/rd_pass.h
+index 4c3a2b6..221f029 100644
+--- a/src/core/rd_pass.h
++++ b/src/core/rd_pass.h
+@@ -14,6 +14,8 @@ extern "C" {
+ #include "av2/common/enums.h"
+ }
+ 
++struct frame_contexts;  // FRAME_CONTEXT
++
+ struct RdPassParams {
+   int qindex = 0;
+   bool tcq = false;
+@@ -24,6 +26,9 @@ struct RdPassParams {
+   // / -15.0%; at 0.02-0.03, 10 to 20 bits within 1.3%. 0 bits at 0.05: +1.4 / -8.1%.
+   double bit_weight = 0.025;
+   double block_bits = 12;
++  // The frame's starting CDFs: a transform's level bits priced by the coder's syntax with them
++  // (skip flag, end of block, levels, signs); nullptr: coeff_level_bits() per level.
++  frame_contexts* fc = nullptr;
+ };
+ 
+ // Re-picks the tree and blocks of the 64x64 superblock whose top left is (sb_x, sb_y) from
+diff --git a/src/pipeline.cpp b/src/pipeline.cpp
+index 6dcd61d..4338f50 100644
+--- a/src/pipeline.cpp
++++ b/src/pipeline.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdlib>
+ #include <exception>
+ #include <memory>
+ #include <future>
+@@ -136,7 +137,8 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& spec,
+   std::future<void> collector;
+   try {
+     collector = std::async(std::launch::async, [&] {
+-      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq);
++      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq,
++              enc_.frame_context());
+     });
+   } catch (...) {
+     // No collector thread: drain the launched work here (collect leaves none pending on failure).
+@@ -160,11 +162,16 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& spec,
+ }
+ 
+ void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
+-                       int qindex, const std::vector<int>& sb_dq) {
++                       int qindex, const std::vector<int>& sb_dq, const FRAME_CONTEXT& fc) {
+   if (!cfg_.rd_pass) return engine_->collect(dm, gate);
+   RdPassParams p;
+   p.qindex = qindex;
+   p.tcq = cfg_.tcq;
++  // A copy: the coder runs meanwhile, and the pass's syntax templates take a non-const pointer.
++  std::unique_ptr<FRAME_CONTEXT> own;
++  if (std::getenv("CELV2_RDBITS")) own = std::make_unique<FRAME_CONTEXT>(fc), p.fc = own.get();
++  if (const char* e = std::getenv("CELV2_RDBW")) p.bit_weight = std::atof(e);
++  if (const char* e = std::getenv("CELV2_RDBB")) p.block_bits = std::atof(e);
+   for (int t = 0; t < TX_SIZES_ALL; t++) {  // the pass's transforms: 4x8 to 64, at most 2:1
+     const int w = tx_size_wide[t], h = tx_size_high[t];
+     if (w <= 2 * h && h <= 2 * w) p.scale[t] = enc_.luma_scale(static_cast<TX_SIZE>(t));
+@@ -268,7 +275,7 @@ std::vector<std::vector<uint8_t>> Pipeline::code_group(const std::vector<const F
+       if (i + 1 < n) engine_->prepare(*srcs[i + 1], specs[i + 1].display);
+       auto collector = std::async(std::launch::async, [&, i] {
+         collect(dms[i], *gates[i], *srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)),
+-                specs[i].sb_dq);
++                specs[i].sb_dq, encs[i]->frame_context());
+       });
+       coders.push_back(std::async(std::launch::async, [&, i] { return encs[i]->code(*srcs[i], dms[i], gates[i].get()); }));
+       collector.get();  // a decision error surfaces here (and fails the gate the coder waits on)
+diff --git a/src/pipeline.h b/src/pipeline.h
+index 6516542..65b932d 100644
+--- a/src/pipeline.h
++++ b/src/pipeline.h
+@@ -79,7 +79,8 @@ class Pipeline {
+   // Keeps the reconstruction of the frame just coded as spec where later frames may predict from it.
+   void keep(const FrameSpec& spec);
+   // engine_->collect(dm, gate), with the CPU RD pass (core/rd_pass.h) on every superblock before
+-  // its row reaches gate when cfg_.rd_pass is on, each superblock at qindex plus its sb_dq offset.
++  // its row reaches gate when cfg_.rd_pass is on, each superblock at qindex plus its sb_dq offset;
++  // fc: the frame's starting CDFs (Encoder::frame_context()).
+   void collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
+-               int qindex, const std::vector<int>& sb_dq);
++               int qindex, const std::vector<int>& sb_dq, const FRAME_CONTEXT& fc);
+ };

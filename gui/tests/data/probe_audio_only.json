@@ -1,0 +1,16 @@
+{
+    "streams":  [
+                    {
+                        "index":  0,
+                        "codec_type":  "audio",
+                        "codec_name":  "aac",
+                        "r_frame_rate":  "0/0",
+                        "avg_frame_rate":  "0/0",
+                        "nb_frames":  "88",
+                        "duration":  "2.000000"
+                    }
+                ],
+    "format":  {
+                   "duration":  "2.000000"
+               }
+}

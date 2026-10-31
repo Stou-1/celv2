@@ -1,0 +1,6 @@
+build/
+.superpowers/
+build_dbg/
+gui/bin/
+dist/
+build_prof/
