@@ -49,6 +49,14 @@ foreach ($src in $files.Keys) {
 # the staged copy of av2_mux gets the UTF-8 active code page; the original in -Av2MuxDir is never changed
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $gui 'utf8-manifest.ps1') -Exe (Join-Path $stage 'av2_mux.exe')
 if ($LASTEXITCODE -ne 0) { Fail 'utf8-manifest failed for av2_mux.exe' }
+# A build path in a binary (__FILE__, a PDB path) would publish the builder's user name.
+foreach ($f in Get-ChildItem -Recurse -File $stage -Include *.exe, *.dll) {
+    $b = [IO.File]::ReadAllBytes($f.FullName)
+    $s = ([Text.Encoding]::ASCII.GetString($b) + [Text.Encoding]::Unicode.GetString($b)).ToLowerInvariant()
+    if ($s.Contains(':\users\') -or $s.Contains(':/users/')) {
+        Fail "$($f.Name) holds a path under C:\Users; build it with the paths rewritten (scripts\build_avm_lib.ps1, third_party\av2-tools\README.txt)"
+    }
+}
 $zip = Join-Path $repo ("dist\celv2-gui-{0}.zip" -f (Get-Date -Format 'yyyyMMdd'))
 if (Test-Path $zip) { Remove-Item -Force $zip }
 # ZipFile.CreateFromDirectory in .NET Framework 4.x writes backslash separators; build entries by hand with '/'.

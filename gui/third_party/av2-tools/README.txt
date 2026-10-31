@@ -15,7 +15,11 @@ Local modification: av2-tools-celv2.patch (apply with "git apply" in a checkout 
   filled in (libisomedia wrote 0), the creation/modification times are 0, there
   is no iods box, the tkhd size is the picture size (libisomedia left 320x240),
   and cslg's compositionEndTime includes the last sample's duration.
-  Build: cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release
+  Build (PowerShell, in the checkout; /d1trimfile keeps the checkout's path, and the
+  user name in it, out of __FILE__, which gui\package.ps1 checks):
+         cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+           "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /d1trimfile:$PWD" `
+           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /d1trimfile:$PWD"
          cmake --build _build --target av2_mux
   Then set AV2MUX_DIR to _build\apps\av2_mux for gui\build.ps1 and gui\package.ps1.
 
