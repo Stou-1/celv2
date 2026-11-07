@@ -3,8 +3,8 @@
 
 #include "check.h"
 #include "core/encoder.h"
-#include "gpu/engine.h"
 #include "test_frames.h"
+#include "vk/vk_engine.h"
 #include "verify/avm_decode.h"
 
 struct Coded {
@@ -29,7 +29,7 @@ static int keyframe_gpu_bitexact() {
   const int sizes[][2] = {{640, 360}, {1920, 1080}};
   for (const auto& s : sizes) {
     const Frame420 src = scene_frame(s[0], s[1]);
-    GpuEngine gpu(s[0], s[1], 64);
+    VulkanEngine gpu(s[0], s[1], 64);
     const Coded r = code(src, gpu.decide_intra(src, 120), 120);
     std::fprintf(stderr, "%dx%d gpu: %zu bytes, %.2f dB\n", s[0], s[1], r.bytes, r.psnr);
     CHECK_EQ(r.diff, std::string());
@@ -39,7 +39,7 @@ static int keyframe_gpu_bitexact() {
 
 static int keyframe_gpu_better_than_uniform() {
   const Frame420 src = scene_frame(640, 360);
-  GpuEngine gpu(640, 360, 64);
+  VulkanEngine gpu(640, 360, 64);
   const Coded g = code(src, gpu.decide_intra(src, 120), 120);
   CHECK_EQ(g.diff, std::string());
   // Rate-matched comparison: lower the uniform encode's qindex until it spends at least as many

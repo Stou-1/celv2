@@ -8,17 +8,17 @@ namespace CelV2.Runner
     public static class ToolLocator
     {
         // ffmpeg/ffprobe: configured folder -> toolsFolder (the app's exe folder) -> PATH.
-        // MP4Box: same order. fdkaac: the ffmpeg folder, then the same. celv2enc: toolsFolder only. av2_mux: av2MuxFolder -> toolsFolder.
+        // MP4Box: same order. fdkaac: its configured folder, the ffmpeg folder, then the same. celv2enc: toolsFolder only. av2_mux: av2MuxFolder -> toolsFolder.
         // A member is null when the tool is not found.
         public static ToolPaths Find(string configuredFfmpegFolder, string configuredMp4BoxFolder, string toolsFolder,
-                                     string av2MuxFolder)
+                                     string av2MuxFolder, string configuredFdkaacFolder = null)
         {
             return new ToolPaths
             {
                 Ffmpeg = Locate("ffmpeg.exe", true, configuredFfmpegFolder, toolsFolder),
                 Ffprobe = Locate("ffprobe.exe", true, configuredFfmpegFolder, toolsFolder),
                 Mp4Box = Locate("MP4Box.exe", true, configuredMp4BoxFolder, toolsFolder),
-                Fdkaac = Locate("fdkaac.exe", true, configuredFfmpegFolder, toolsFolder),
+                Fdkaac = Locate("fdkaac.exe", true, configuredFdkaacFolder, configuredFfmpegFolder, toolsFolder),
                 CelV2enc = Locate("celv2enc.exe", false, toolsFolder),
                 Av2Mux = Locate("av2_mux.exe", false, av2MuxFolder, toolsFolder),
             };

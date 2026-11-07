@@ -32,6 +32,7 @@ struct DownsamplePush {
 struct SubpelPush {
   PlanePush src;
   uint64_t dst, phase;
+  int half;
 };
 struct MePush {
   PlanePush cur, ref;
@@ -175,10 +176,10 @@ void Kernels::downsample(const DevPlane& src, const Buffer& dst) {
   ctx_.dispatch(downsample_, &p, groups(src.w / 2, 16), groups(src.h / 2, 16));
 }
 
-void Kernels::subpel(const DevPlane& src, const Buffer& dst, uint64_t phase) {
-  const SubpelPush p{plane(src), dst.addr, phase};
-  constexpr uint32_t kPhases = 15;  // 1..15; phase 0 is src
-  ctx_.dispatch(subpel_, &p, groups(src.w, 16), groups(src.h, 16), kPhases);
+void Kernels::subpel(const DevPlane& src, const Buffer& dst, uint64_t phase, bool half) {
+  const SubpelPush p{plane(src), dst.addr, phase, half ? 1 : 0};
+  const uint32_t phases = half ? 3 : 15;  // 2, 8, 10 at slots 1..3; or 1..15 (phase 0 is src)
+  ctx_.dispatch(subpel_, &p, groups(src.w, 16), groups(src.h, 16), phases);
 }
 
 void Kernels::me_level(const DevPlane& cur, const DevPlane& ref, const Buffer* pred_x, const Buffer* pred_y,

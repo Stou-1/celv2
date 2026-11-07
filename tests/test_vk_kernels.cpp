@@ -1,6 +1,4 @@
 // The Vulkan kernels against their CPU references, on every discrete GPU (none: nothing to check).
-#include <cuda_runtime.h>
-
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -11,7 +9,7 @@
 
 #include "check.h"
 #include "gpu/inter_common.h"
-#include "gpu/kernels.h"
+#include "gpu/sb_blocks.h"
 #include "gpu/kernels_ref.h"
 #include "vk/vk_kernels.h"
 
@@ -159,114 +157,41 @@ static int satd_matches_ref() {
   });
 }
 
-// cost and finalize on the same inputs as the CUDA kernels: a 320x200 source (5 x 4 superblocks, the
-// last row partial) and 3 references with their phases and motion fields; also intra only.
-static int cost_finalize_match_cuda() {
-  int ncuda = 0;
-  if (cudaGetDeviceCount(&ncuda) != cudaSuccess || ncuda == 0) return std::puts("no CUDA GPU: skipped"), 0;
-  const int w = 320, h = 200, stride = 320, sb_cols = 5, sb_rows = 4, nrefs = 3, cols = w / 8, rows = h / 8, k = 2;
-  const uint64_t phase = static_cast<uint64_t>(stride) * h;
-  std::mt19937 rng(9);
-  std::vector<uint8_t> src(phase);
+// Every intra cost (blocks of 32x32 and below, all modes) equals the CPU rule's: a 320x200 source, 5 x 4
+// superblocks, the last row partial. The costs of inter blocks and the decisions are checked whole,
+// against the CPU engine, in test_gpu_me and test_gpu_intra.
+static int intra_costs_match_ref() {
+  const int w = 320, h = 200, sb_cols = 5, sb_rows = 4, k = 2;
+  std::vector<uint8_t> src(static_cast<size_t>(w) * h);
   for (int y = 0; y < h; y++)
-    for (int x = 0; x < w; x++)  // gradients, edges and noise, so the intra modes and splits vary
-      src[y * stride + x] = static_cast<uint8_t>(((x / 40 + y / 25) % 2 ? x + y : 255 - 2 * y) / 2 + (x * y % 7) * (y > 100 ? 9 : 1) + rng() % 6);
-  std::vector<std::vector<uint8_t>> ref(nrefs);
-  std::vector<std::vector<int>> fx(nrefs), fy(nrefs);
-  for (int r = 0; r < nrefs; r++) {
-    ref[r].resize(phase * celv2::kSubpelPhases);
-    for (int y = 0; y < h; y++)
-      for (int x = 0; x < w; x++) {
-        const int sy = std::min(h - 1, std::max(0, y + r - 1)), sx = std::min(w - 1, std::max(0, x - 2 * r));
-        ref[r][y * stride + x] = static_cast<uint8_t>(std::min(255, src[sy * stride + sx] + static_cast<int>(rng() % (4 + 4 * r))));
-      }
-    const celv2::Plane p0{ref[r].data(), stride, w, h};
-    for (int q = 1; q < celv2::kSubpelPhases; q++)
-      for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) ref[r][q * phase + y * stride + x] = static_cast<uint8_t>(celv2::subpel_px(p0, y, x, q / 4, q % 4));
-    fx[r].resize(cols * rows), fy[r].resize(cols * rows);
-    for (int i = 0; i < cols * rows; i++) {  // pairs of cells share an MV, so candidates repeat
-      const int c = i % cols / 2 * 2 + i / cols * cols;
-      fx[r][i] = c == i ? static_cast<int>(rng() % 41) - 20 : fx[r][c];
-      fy[r][i] = c == i ? static_cast<int>(rng() % 41) - 20 : fy[r][c];
-    }
-  }
-  const int64_t lam = lambda_q8(110);
-  const size_t n_sb = static_cast<size_t>(sb_cols) * sb_rows;
-  const size_t intra_n = n_sb * celv2::kIntraCosts, costs_n = n_sb * celv2::costs_per_sb(nrefs), out_n = n_sb * sizeof(celv2::SbOut);
-
-  // CUDA.
-  auto dev = [](const void* p, size_t n) {
-    void* d = nullptr;
-    if (cudaMalloc(&d, n) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-    if (p) cudaMemcpy(d, p, n, cudaMemcpyHostToDevice);
-    else cudaMemset(d, 0, n);
-    return d;
-  };
-  std::vector<void*> cuda_mem;
-  auto cdev = [&](const void* p, size_t n) { return cuda_mem.emplace_back(dev(p, n)); };
-  const celv2::DevPlane csrc{static_cast<uint8_t*>(cdev(src.data(), src.size())), stride, w, h};
-  celv2::DevRefs crefs;
-  crefs.n = nrefs, crefs.mv_cols = cols, crefs.mv_rows = rows;
-  for (int r = 0; r < nrefs; r++) {
-    crefs.plane[r] = {static_cast<uint8_t*>(cdev(ref[r].data(), ref[r].size())), stride, w, h, phase};
-    crefs.mvx[r] = static_cast<int*>(cdev(fx[r].data(), fx[r].size() * 4));
-    crefs.mvy[r] = static_cast<int*>(cdev(fy[r].data(), fy[r].size() * 4));
-  }
-  auto* c_intra = static_cast<int64_t*>(cdev(nullptr, intra_n * 8));
-  auto* c_costs = static_cast<int64_t*>(cdev(nullptr, costs_n * 8));
-  auto* c_out = static_cast<celv2::SbOut*>(cdev(nullptr, out_n));
-  auto* c_out0 = static_cast<celv2::SbOut*>(cdev(nullptr, out_n));
-  celv2::launch_intra(csrc, sb_cols, 0, sb_rows, k, c_intra, nullptr);
-  celv2::launch_costs(csrc, crefs, sb_cols, 0, sb_rows, k, lam, c_costs, nullptr);
-  celv2::launch_finalize(csrc, crefs, sb_cols, 0, sb_rows, lam, c_intra, c_costs, c_out, nullptr);
-  celv2::launch_finalize(csrc, celv2::DevRefs{}, sb_cols, 0, sb_rows, lam, c_intra, c_costs, c_out0, nullptr);
-  CHECK(cudaDeviceSynchronize() == cudaSuccess);
-  std::vector<int64_t> want_intra(intra_n), want_costs(costs_n);
-  std::vector<uint8_t> want_out(out_n), want_out0(out_n);
-  cudaMemcpy(want_intra.data(), c_intra, intra_n * 8, cudaMemcpyDeviceToHost);
-  cudaMemcpy(want_costs.data(), c_costs, costs_n * 8, cudaMemcpyDeviceToHost);
-  cudaMemcpy(want_out.data(), c_out, out_n, cudaMemcpyDeviceToHost);
-  cudaMemcpy(want_out0.data(), c_out0, out_n, cudaMemcpyDeviceToHost);
-  for (void* p : cuda_mem) cudaFree(p);
-
+    for (int x = 0; x < w; x++)  // gradients, edges and noise, so the intra modes vary
+      src[y * w + x] = static_cast<uint8_t>(((x / 40 + y / 25) % 2 ? x + y : 255 - 2 * y) / 2 + (x * y % 7));
+  constexpr int kIntraCosts = celv2::kSbBlocks * celv2::kNumModes;
+  const size_t n = static_cast<size_t>(sb_cols) * sb_rows * kIntraCosts;
+  const celv2::Plane s{src.data(), w, w, h};
+  const int offset[4] = {0, 1, 5, 21};
   return each_gpu([&](celv2::vk::Context& ctx, celv2::vk::Kernels& kv) {
-    std::vector<celv2::vk::Buffer> mem;
-    auto vdev = [&](const void* p, size_t n) -> celv2::vk::Buffer& {
-      mem.push_back(ctx.buffer(n));
-      if (p) ctx.upload(mem.back(), p, n);
-      else ctx.upload(mem.back(), std::vector<uint8_t>(n).data(), n);
-      return mem.back();
-    };
-    mem.reserve(32);  // the references below point into mem
-    const celv2::vk::DevPlane vsrc{&vdev(src.data(), src.size()), stride, w, h};
-    celv2::vk::Refs vrefs;
-    vrefs.n = nrefs, vrefs.mv_cols = cols, vrefs.mv_rows = rows;
-    for (int r = 0; r < nrefs; r++) {
-      vrefs.plane[r] = {&vdev(ref[r].data(), ref[r].size()), stride, w, h, phase};
-      vrefs.mvx[r] = &vdev(fx[r].data(), fx[r].size() * 4);
-      vrefs.mvy[r] = &vdev(fy[r].data(), fy[r].size() * 4);
-    }
-    const celv2::vk::Buffer &v_intra = vdev(nullptr, intra_n * 8), &v_costs = vdev(nullptr, costs_n * 8);
-    const celv2::vk::Buffer &v_out = vdev(nullptr, out_n), &v_out0 = vdev(nullptr, out_n);
-    kv.intra(vsrc, sb_cols, 0, sb_rows, k, v_intra);
-    kv.costs(vsrc, vrefs, sb_cols, 0, sb_rows, k, lam, v_costs);
-    kv.finalize(vsrc, vrefs, sb_cols, 0, sb_rows, lam, v_intra, v_costs, v_out);
-    kv.finalize(vsrc, celv2::vk::Refs{}, sb_cols, 0, sb_rows, lam, v_intra, v_costs, v_out0);
-    const bool intra_ok = get<int64_t>(ctx, v_intra) == want_intra, costs_ok = get<int64_t>(ctx, v_costs) == want_costs;
-    const bool out_ok = get<uint8_t>(ctx, v_out) == want_out, out0_ok = get<uint8_t>(ctx, v_out0) == want_out0;
-    int nblocks = 0, ninter = 0, ncomp = 0;  // what the decisions cover
-    for (size_t i = 0; i < n_sb; i++) {
-      const celv2::SbOut& o = reinterpret_cast<const celv2::SbOut*>(want_out.data())[i];
-      nblocks += o.nblocks;
-      for (int b = 0; b < o.nblocks; b++) ninter += o.mode[b] == celv2::kNumModes, ncomp += o.ref2[b] != 255;
-    }
-    std::printf("%s cost/finalize vs CUDA: intra %s, inter %s, decisions %s (%d blocks: %d inter, %d compound), "
-                "intra-only %s\n",
-                ctx.name().c_str(), intra_ok ? "same" : "DIFFER", costs_ok ? "same" : "DIFFER",
-                out_ok ? "same" : "DIFFER", nblocks, ninter, ncomp, out0_ok ? "same" : "DIFFER");
-    for (celv2::vk::Buffer& b : mem) ctx.free(b);
-    CHECK(intra_ok && costs_ok && out_ok && out0_ok);
+    celv2::vk::Buffer sb = put(ctx, src.data(), src.size()), costs = ctx.buffer(n * 8);
+    kv.intra(celv2::vk::DevPlane{&sb, w, w, h}, sb_cols, 0, sb_rows, k, costs);
+    const std::vector<int64_t> g = get<int64_t>(ctx, costs);
+    ctx.free(sb), ctx.free(costs);
+    int bad = 0;
+    for (int i = 0; i < sb_cols * sb_rows; i++)
+      for (int b = 5; b < celv2::kSbBlocks; b++) {  // the 64x64 level is never costed
+        const int sq = b / 5, kind = b % 5;
+        int level = 0;
+        while (level < 3 && sq >= offset[level + 1]) level++;
+        const int idx = sq - offset[level], m = 1 << level, size = 64 >> level, half = size / 2;
+        int x = (idx % m) * size, y = (idx / m) * size, bw = size, bh = size;
+        if (kind == 1 || kind == 2) bh = half, y += kind == 2 ? half : 0;
+        if (kind == 3 || kind == 4) bw = half, x += kind == 4 ? half : 0;
+        x += (i % sb_cols) * 64, y += (i / sb_cols) * 64;
+        for (int mode = 0; mode < celv2::kNumModes; mode++) {
+          const int64_t want = celv2::block_mode_satd(s, x, y, bw, bh, mode) * 256;  // finalize adds the bits
+          if (g[static_cast<size_t>(i) * kIntraCosts + b * celv2::kNumModes + mode] != want) bad++;
+        }
+      }
+    CHECK_EQ(bad, 0);
     return 0;
   });
 }
@@ -278,7 +203,7 @@ int main() {
   fails += RUN(subpel_matches_ref);
   fails += RUN(me_matches_ref);
   fails += RUN(satd_matches_ref);
-  fails += RUN(cost_finalize_match_cuda);
+  fails += RUN(intra_costs_match_ref);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;
 }

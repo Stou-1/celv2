@@ -15,6 +15,14 @@ $nasm = if ($env:CELV2_NASM) { $env:CELV2_NASM } else { "$env:LOCALAPPDATA\bin\N
 $env:PATH = "$nasm;$env:ProgramFiles\LLVM\bin;$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;$env:ProgramFiles\Git\usr\bin;$env:PATH"
 # AVM sources contain UTF-8 comments; without this, cl/clang-cl on a Japanese (CP932) system can drop code lines.
 $env:CL = '/utf-8'
+# cl prints its include notes in the console's code page, and ninja's msvc_deps_prefix was recorded
+# in the system's: on a UTF-8 console a Japanese Windows's notes match nothing, ninja records no
+# header dependencies, and a header edit leaves stale objects (mismatched structs, crashes).
+$acp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
+if ([Console]::OutputEncoding.CodePage -ne [int]$acp) {
+  chcp $acp | Out-Null
+  [Console]::OutputEncoding = [Text.Encoding]::GetEncoding([int]$acp)
+}
 # AVM v1.0.0 source tree: $env:AVM_ROOT, else ~\avm. Exported so CMake sees it too.
 $global:AVM_ROOT = if ($env:AVM_ROOT) { $env:AVM_ROOT } else { "$HOME\avm" }
 $global:AVM_LIB_BUILD = "$AVM_ROOT\_build_lib"

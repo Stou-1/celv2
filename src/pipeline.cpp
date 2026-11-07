@@ -1,5 +1,11 @@
 #include "pipeline.h"
 
+#include <cstdlib>
+#include <string>
+
+#include "core/quant.h"
+#include "core/wide.h"
+
 #include <algorithm>
 #include <atomic>
 #include <exception>
@@ -11,6 +17,7 @@
 #include <thread>
 
 #include "bitstream/obu.h"
+#include "core/profile.h"
 #include "core/rd_pass.h"
 #include "core/threads.h"
 #include "gpu/cpu_engine.h"
@@ -19,11 +26,12 @@
 #include "vk/vk_context.h"
 #include "vk/vk_engine.h"
 #endif
+#ifdef CELV2_ORACLE
+#include "oracle.h"
+#endif
 
-std::vector<std::pair<std::string, std::string>> list_devices(const std::function<ProbeResult()>& probe) {
+std::vector<std::pair<std::string, std::string>> list_devices() {
   std::vector<std::pair<std::string, std::string>> out;
-  const ProbeResult p = probe();
-  if (p.ok) out.emplace_back("gpu", p.name + " (CUDA)");
 #ifdef CELV2_HAVE_VULKAN
   const std::vector<std::string> vk = celv2::vk::Context::devices();
   for (size_t i = 0; i < vk.size() && i < 2; i++) out.emplace_back(i ? "vulkan2" : "vulkan", vk[i] + " (Vulkan)");
@@ -34,45 +42,36 @@ std::vector<std::pair<std::string, std::string>> list_devices(const std::functio
 
 std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height, int tile_threads,
                                             const std::function<ProbeResult()>& probe,
-                                            std::string* description) {
+                                            std::string* description, int engines) {
   constexpr int kSbSize = 64;
-  if (device == Device::Vulkan || device == Device::Vulkan2) {
-#ifdef CELV2_HAVE_VULKAN
-    auto e = std::make_unique<VulkanEngine>(width, height, kSbSize, device == Device::Vulkan2 ? 1 : 0);
-    *description = "decisions on Vulkan (" + e->device_name() + ")";
-    return e;
-#else
-    throw std::runtime_error("this celv2enc was built without Vulkan");
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::level() >= 2) device = Device::Cpu;  // ImportEngine never asks it
 #endif
+  if (device == Device::Cuda) {
+    const ProbeResult p = probe();
+    if (!p.ok) throw std::runtime_error("no usable CUDA GPU: " + p.reason);
+    *description = "decisions on CUDA (" + p.name + ", compute " + std::to_string(p.cc_major) + "." +
+                   std::to_string(p.cc_minor) + ")";
+    return std::make_unique<GpuEngine>(width, height, kSbSize);
   }
   if (device == Device::Cpu) {
     *description = "decisions on CPU (requested with --device cpu)";
   } else {
-    const ProbeResult p = probe();
-    if (p.ok) {
-      *description = "decisions on GPU (" + p.name + ", compute " + std::to_string(p.cc_major) +
-                     "." + std::to_string(p.cc_minor) + ")";
-      if (device == Device::Gpu) return std::make_unique<GpuEngine>(width, height, kSbSize);
-      // Auto is still at startup: a GPU that passes the probe but fails to start (e.g. out of
-      // memory on a busy GPU) falls back to the CPU; an explicit --device gpu reports the error.
-      try {
-        return std::make_unique<GpuEngine>(width, height, kSbSize);
-      } catch (const std::exception& e) {
-        *description = std::string("decisions on CPU (GPU engine failed to start: ") + e.what() + ")";
-      }
-    } else {
-      if (device == Device::Gpu) throw std::runtime_error("no usable GPU: " + p.reason);
-      *description = "decisions on CPU (" + p.reason + ")";
-    }
 #ifdef CELV2_HAVE_VULKAN
-    // Auto without CUDA: the first Vulkan GPU (the same decisions; anime A 1080p q130 coded at 3.1 fps
-    // with the Arc Pro B50 against 0.09 fps with the CPU engine), else the CPU.
+    // Auto is still at startup: a GPU that fails to start (none, or out of memory on a busy one) falls
+    // back to the CPU; an explicit device reports the error.
     try {
-      auto e = std::make_unique<VulkanEngine>(width, height, kSbSize, 0);
+      auto e = std::make_unique<VulkanEngine>(width, height, kSbSize, device == Device::Vulkan2 ? 1 : 0, engines);
       *description = "decisions on Vulkan (" + e->device_name() + ")";
       return e;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+      if (device == Device::Gpu) throw std::runtime_error(std::string("no usable GPU: ") + e.what());
+      if (device != Device::Auto) throw;
+      *description = std::string("decisions on CPU (") + e.what() + ")";
     }
+#else
+    if (device != Device::Auto) throw std::runtime_error("this celv2enc was built without Vulkan");
+    *description = "decisions on CPU (built without Vulkan)";
 #endif
   }
   // The decision workers and the tile threads together fit in the cores.
@@ -83,9 +82,12 @@ std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height
 Pipeline::Pipeline(const SeqConfig& c, Device device)
     : cfg_(c),
       enc_(c),
-      engine_(make_engine(device, c.width, c.height, enc_.tile_threads(), probe_gpu, &description_)) {
+      engine_(make_engine(device, c.width, c.height, enc_.tile_threads(), probe_gpu, &description_, c.engines)) {
   // Every tile row starts coding as soon as its first superblock row is decided (16K with 4 tile
   // rows: the lower 12 of 16 tiles waited for the rows above them).
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::level()) engine_ = celv2::oracle::import_engine(std::move(engine_));
+#endif
   engine_->set_row_streams(enc_.tile_rows());
 }
 
@@ -125,6 +127,7 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given,
                                     int next_display) {
   FrameSpec spec = given;
   spec.qindex_delta += qindex_offset_;
+  snap_sb_dq(spec.sb_dq, cfg_.width, cfg_.height, enc_.sb_px());  // the RD pass decides at the coded qindex
   // The inter decision searches the reconstructions (what the decoder predicts from), so its cost
   // includes the references' coding error. launch() copies them.
   DecisionMap dm;
@@ -132,13 +135,16 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given,
   std::vector<const Frame420*> refs;
   std::vector<long long> keys;
   references(enc_.begin(spec), refs, keys);
-  engine_->launch(src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), dm, keys, spec.display);
-  if (next && next_display >= 0) engine_->prepare(*next, next_display);
+  {
+    celv2::StageScope prof(celv2::Stage::Decision);
+    engine_->launch(src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), dm, keys, spec.display);
+    if (next && next_display >= 0) engine_->prepare(*next, next_display);
+  }
   // Tile threads code each superblock row as soon as the collector publishes it.
   std::future<void> collector;
   try {
     collector = std::async(std::launch::async, [&] {
-      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq);
+      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq, spec.map.get(), spec.screen, spec.ibc.get());
     });
   } catch (...) {
     // No collector thread: drain the launched work here (collect leaves none pending on failure).
@@ -162,13 +168,37 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given,
 }
 
 void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
-                       int qindex, const std::vector<int>& sb_dq) {
-  if (!cfg_.rd_pass) return engine_->collect(dm, gate);
+                       int qindex, const std::vector<int>& sb_dq, const celv2::AqMap* map, bool screen,
+                       const celv2::IntrabcIndex* ibc) {
+  if (!cfg_.rd_pass) {
+    celv2::StageScope prof(celv2::Stage::Decision);
+    return engine_->collect(dm, gate);
+  }
   RdPassParams p;
   p.qindex = qindex;
   p.tcq = cfg_.tcq;
+  p.all_intra_modes = cfg_.rd_intra || celv2::wide('5');
+  p.per_ref = celv2::wide('1'), p.full_search = celv2::wide('2'), p.chroma = celv2::wide('4'), p.all_pairs = celv2::wide('6');
+  p.intra64 = cfg_.intra64;
+  p.psy = cfg_.psy_rd, p.map = map, p.psy_lines = cfg_.psy_lines, p.trellis = cfg_.psy_trellis;
+  p.screen = screen, p.ibc = ibc;
+  if (const char* e = std::getenv("X_RDW")) p.bit_weight = std::atof(e);
+  if (const char* e = std::getenv("X_RDB")) p.block_bits = std::atof(e);
+  // W3: X_ALTS="weight:bits,weight:bits": the pass run again with these, each result an alternative.
+  std::vector<std::pair<double, double>> alts;
+  if (celv2::wide('3')) {
+    const char* e = std::getenv("X_ALTS");
+    for (std::string s = e ? e : "0.0125:12,0.05:12,0.025:24"; !s.empty();) {
+      const size_t c = s.find(','), k = s.find(':');
+      alts.emplace_back(std::atof(s.c_str()), std::atof(s.c_str() + k + 1));
+      s = c == std::string::npos ? "" : s.substr(c + 1);
+    }
+  }
   for (int t = 0; t < TX_SIZES_ALL; t++) {  // the pass's transforms: 4x8 to 64, at most 2:1
     const int w = tx_size_wide[t], h = tx_size_high[t];
+#ifdef CELV2_ORACLE
+    if (celv2::oracle::level() == 1) p.scale[t] = enc_.luma_scale(static_cast<TX_SIZE>(t));  // avmenc's 4:1 and 8:1 leaves
+#endif
     if (w <= 2 * h && h <= 2 * w) p.scale[t] = enc_.luma_scale(static_cast<TX_SIZE>(t));
   }
   // Workers take superblocks in raster order as the engine's rows arrive (on `inner`, in any
@@ -180,10 +210,22 @@ void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, cons
   std::unique_ptr<std::atomic<int>[]> done(new std::atomic<int>[dm.sb_rows]());
   std::atomic<bool> stop{false};
   auto work = [&] {
+    celv2::StageScope prof(celv2::Stage::RdPass);
+    g_rd_zero = cfg_.rd_zero;
     try {
       for (size_t i; !stop && (i = next++) < n;) {
         const int r = static_cast<int>(i / cols);
         inner.wait_row(r);
+#ifdef CELV2_ORACLE
+        dm.sbs[i].forced = engine_->forced(i);
+#endif
+        for (const auto& a : alts) {
+          RdPassParams pa = p;
+          pa.bit_weight = a.first, pa.block_bits = a.second;
+          if (!sb_dq.empty()) pa.qindex = std::max(1, std::min(255, qindex + sb_dq[i]));
+          rd_pass_sb(src, refs, static_cast<int>(i % cols) * dm.sb_size, r * dm.sb_size, pa, dm.sbs[i]);
+          dm.sbs[i].alts.push_back({std::move(dm.sbs[i].tree), std::move(dm.sbs[i].blocks)});
+        }
         if (sb_dq.empty()) {
           rd_pass_sb(src, refs, static_cast<int>(i % cols) * dm.sb_size, r * dm.sb_size, p, dm.sbs[i]);
         } else {  // the superblock's own qindex (FrameSpec::sb_dq)
@@ -206,6 +248,7 @@ void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, cons
   std::exception_ptr err;
   try {
     for (int t = 0; t < nt; t++) pool.emplace_back(work);
+    celv2::StageScope prof(celv2::Stage::Decision);
     engine_->collect(dm, inner);  // fails `inner` on error, which ends the workers
   } catch (...) {
     err = std::current_exception();
@@ -247,7 +290,7 @@ void Pipeline::keep(const FrameSpec& spec) {
   if (spec.key) recons_.clear(), last_shown_.doh = -1;
   if (spec.key || spec.reference) {
     recons_.push_back(Recon{enc_.display_order_hint(), next_key++, copy_frame(enc_.last_recon(), false)});
-    if (static_cast<int>(recons_.size()) > cfg_.refs + 8) recons_.erase(recons_.begin());
+    if (static_cast<int>(recons_.size()) > cfg_.refs + 8 && spec.refresh < 0) recons_.erase(recons_.begin());
   } else if (spec.shown && spec.keep_shown) {
     last_shown_ = Recon{enc_.display_order_hint(), next_key++, copy_frame(enc_.last_recon(), false)};
   }
@@ -257,7 +300,7 @@ std::vector<std::vector<uint8_t>> Pipeline::code_group(const std::vector<const F
                                                        const std::vector<FrameSpec>& given,
                                                        std::vector<Frame420>* recons) {
   std::vector<FrameSpec> specs = given;
-  for (FrameSpec& s : specs) s.qindex_delta += qindex_offset_;
+  for (FrameSpec& s : specs) s.qindex_delta += qindex_offset_, snap_sb_dq(s.sb_dq, cfg_.width, cfg_.height, enc_.sb_px());
   const size_t n = srcs.size();
   if (n == 0 || specs.size() != n) throw std::invalid_argument("code_group: one spec per frame");
   for (size_t i = 0; i + 1 < n; i++)
@@ -278,12 +321,13 @@ std::vector<std::vector<uint8_t>> Pipeline::code_group(const std::vector<const F
   std::exception_ptr err;
   for (size_t i = 0; i < n && !err; i++) {
     try {
+      celv2::StageScope prof(celv2::Stage::Decision);
       engine_->launch(*srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)), dms[i],
                       keys[i], specs[i].display);
       if (i + 1 < n) engine_->prepare(*srcs[i + 1], specs[i + 1].display);
       auto collector = std::async(std::launch::async, [&, i] {
         collect(dms[i], *gates[i], *srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)),
-                specs[i].sb_dq);
+                specs[i].sb_dq, specs[i].map.get(), specs[i].screen, specs[i].ibc.get());
       });
       coders.push_back(std::async(std::launch::async, [&, i] { return encs[i]->code(*srcs[i], dms[i], gates[i].get()); }));
       collector.get();  // a decision error surfaces here (and fails the gate the coder waits on)

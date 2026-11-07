@@ -50,6 +50,8 @@ class Context {
   Context& operator=(const Context&) = delete;
 
   const std::string& name() const { return name_; }
+  // What the largest device-local heap has left (VK_EXT_memory_budget), or its size without that.
+  uint64_t free_vram() const;
 
   Buffer buffer(size_t size);
   void free(Buffer& b);

@@ -13,6 +13,7 @@ namespace CelV2.Tests
             foreach (var t in RunnerTests.All) yield return t;
             foreach (var t in UiTests.All) yield return t;
             foreach (var t in QualityTests.All) yield return t;
+            foreach (var t in DetailsTests.All) yield return t;
         }
 
         [STAThread]

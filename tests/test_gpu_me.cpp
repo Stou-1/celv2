@@ -6,10 +6,10 @@
 #include <vector>
 
 #include "check.h"
-#include "gpu/engine.h"
 #include "gpu/inter_common.h"
 #include "gpu/kernels_ref.h"
 #include "io/y4m.h"
+#include "vk/vk_engine.h"
 #include "test_frames.h"
 
 // Fully textured picture (no flat areas, so every block has a unique best match);
@@ -50,7 +50,7 @@ static int gpu_me_matches_ref() {
   const int w = 640, h = 360;
   const Frame420 prev = textured(w, h, 0, 0);
   const Frame420 cur = textured(w, h, 5, -3);  // content moved left 5, down 3
-  GpuEngine gpu(w, h, 64);
+  VulkanEngine gpu(w, h, 64);
   const DecisionMap g = gpu.decide_inter(cur, prev, 120);
   const DecisionMap r = decide_inter_ref(cur, prev, 64, 120);
   CHECK(same(g, r));
@@ -119,7 +119,7 @@ static Frame420 smooth(int w, int h, double sx, double sy) {
 static int gpu_me_finds_quarter_pel_motion() {
   const int w = 320, h = 192;
   const Frame420 prev = smooth(w, h, 0, 0), cur = smooth(w, h, 2.5, -1.25);
-  GpuEngine gpu(w, h, 64);
+  VulkanEngine gpu(w, h, 64);
   const DecisionMap g = gpu.decide_inter(cur, prev, 60);
   const DecisionMap r = decide_inter_ref(cur, prev, 64, 60);
   CHECK(same(g, r));
@@ -172,6 +172,49 @@ static int me_rows_split_matches_whole() {
   return 0;
 }
 
+// Motion of (96, 24) px, beyond what a 3-level pyramid reaches (+-52 px): most of the level-0 field
+// finds it where the earlier frame has the content.
+static int me_finds_large_motion() {
+  const Frame420 prev = scene_frame(640, 360, 0, 0), cur = scene_frame(640, 360, 96, 24);
+  const RefPyramid pc = build_pyramid_ref(cur), pr = build_pyramid_ref(prev, true);
+  const auto lv = me_pyramid(pc, pr, {-1});
+  const RefMvLevel& l0 = lv[0];
+  int cells = 0, hit = 0;
+  for (int r = 4; r < l0.rows; r++)
+    for (int c = 13; c < l0.cols; c++) {
+      cells++;
+      const size_t k = static_cast<size_t>(r) * l0.cols + c;
+      hit += l0.mvx[k] == -96 * 4 && l0.mvy[k] == -24 * 4;  // level 0 is in quarter pels
+    }
+  std::fprintf(stderr, "large motion: %d of %d cells\n", hit, cells);
+  CHECK(hit * 4 >= cells * 3);
+  return 0;
+}
+
+// One cell whose best search centre (zero: the content plus 3) is a dead end, while its second
+// (the coarser level's 26, 0) is 6 px from the exact match at (20, 0): both centres are searched.
+static int me_cell_searches_two_centres() {
+  const int w = 128, h = 64, bx = 4, by = 2;
+  std::vector<uint8_t> cur(w * h), ref(w * h);
+  uint32_t v = 7;
+  auto rnd = [&v] { return v = v * 1664525u + 1013904223u, static_cast<uint8_t>(v >> 24); };
+  for (auto& p : cur) p = rnd();
+  for (auto& p : ref) p = rnd();
+  for (int y = by * 8; y < by * 8 + 8; y++)
+    for (int x = bx * 8; x < bx * 8 + 8; x++) {
+      ref[y * w + x + 20] = cur[y * w + x];
+      ref[y * w + x] = static_cast<uint8_t>(cur[y * w + x] + 3);
+    }
+  const celv2::Plane pc{cur.data(), w, w, h}, pr{ref.data(), w, w, h};
+  const int pcols = w / 16, prows = h / 16;
+  const std::vector<int> pmx(pcols * prows, 13), pmy(pcols * prows, 0);
+  int mx, my;
+  celv2::me_cell(pc, pr, bx, by, pmx.data(), pmy.data(), pcols, prows, &mx, &my);
+  CHECK_EQ(mx, 20);
+  CHECK_EQ(my, 0);
+  return 0;
+}
+
 static int decide_sb_ref_matches_decide() {
   const int sizes[2][2] = {{202, 122}, {640, 360}};
   for (const auto& sz : sizes) {
@@ -194,11 +237,29 @@ static int decide_sb_ref_matches_decide() {
   return 0;
 }
 
+// By frame size, then by free VRAM.
+static int phase_layouts() {
+  const int64_t hd = 1920 * 1080, k16 = 15360ll * 8640, k8 = 7680 * 4320;
+  constexpr uint64_t kGB = 1ull << 30;
+  CHECK_EQ(vk_phase_layout(hd, 32 * kGB), '1');
+  CHECK_EQ(vk_phase_layout(k8, 32 * kGB), '1');
+  CHECK_EQ(vk_phase_layout(k16, 32 * kGB), 'B');
+  CHECK_EQ(vk_phase_layout(k8, 3 * kGB), 'B');
+  CHECK_EQ(vk_phase_layout(k8, 16 * kGB), '1');
+  CHECK_EQ(vk_phase_layout(k8, 16 * kGB, 4), 'B');  // four engines share the card
+  CHECK_EQ(vk_phase_layout(k16, 6 * kGB), 'A');
+  CHECK_EQ(vk_phase_layout(k16, 1 * kGB), 0);
+  return 0;
+}
+
 int main() {
   int fails = 0;
+  fails += RUN(phase_layouts);
   fails += RUN(gpu_me_matches_ref);
   fails += RUN(gpu_me_finds_quarter_pel_motion);
   fails += RUN(me_rows_split_matches_whole);
+  fails += RUN(me_finds_large_motion);
+  fails += RUN(me_cell_searches_two_centres);
   fails += RUN(decide_sb_ref_matches_decide);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;

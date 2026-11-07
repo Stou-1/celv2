@@ -32,7 +32,8 @@ class Kernels {
   // downsample_kernel: dst (w/2 x h/2, contiguous) = 2x2 averages of src (celv2::downsample_px).
   void downsample(const DevPlane& src, const Buffer& dst);
   // subpel_kernel: quarter-pel phases 1..15 of src at dst + k * phase (celv2::subpel_px).
-  void subpel(const DevPlane& src, const Buffer& dst, uint64_t phase);
+  // half: the half-pel phases 2, 8, 10 only, at dst + 1..3 * phase (DevPlane's kPhasesHalf layout).
+  void subpel(const DevPlane& src, const Buffer& dst, uint64_t phase, bool half = false);
   // me_kernel: one pyramid level's 8x8 field (cols x rows) into mvx / mvy, from the coarser
   // level's field (pred_x == nullptr at the top); refine: quarter-pel refinement (level 0).
   void me_level(const DevPlane& cur, const DevPlane& ref, const Buffer* pred_x, const Buffer* pred_y, int pred_cols,

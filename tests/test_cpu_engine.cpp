@@ -149,8 +149,8 @@ static int cpu_engine_many_frames() {
   return 0;
 }
 
-// A fake failed probe: Auto falls back to Vulkan (in a build and on a machine with it) or to the
-// CPU with the reason, Gpu throws, Cpu never probes.
+// A fake failed probe: only Cuda minds (it throws); Auto takes Vulkan (in a build and on a machine with
+// it) or the CPU, and Cpu never probes.
 static int make_engine_selection() {
   const auto failed = [] {
     ProbeResult p;
@@ -162,10 +162,9 @@ static int make_engine_selection() {
   const bool vulkan = desc.find("decisions on Vulkan") != std::string::npos;
   CHECK(vulkan || dynamic_cast<CpuEngine*>(autoe.get()) != nullptr);
   CHECK(vulkan || desc.find("decisions on CPU") != std::string::npos);
-  CHECK(vulkan || desc.find("fake") != std::string::npos);
   bool threw = false;
   try {
-    make_engine(Device::Gpu, 640, 360, 1, failed, &desc);
+    make_engine(Device::Cuda, 640, 360, 1, failed, &desc);
   } catch (const std::runtime_error&) {
     threw = true;
   }

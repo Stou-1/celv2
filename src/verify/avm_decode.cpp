@@ -58,10 +58,14 @@ std::string i420_md5(const uint8_t* y, int ys, const uint8_t* u, const uint8_t* 
   return hex(d);
 }
 
-std::vector<Frame420> decode_frames(const std::vector<std::vector<uint8_t>>& temporal_units) {
+std::vector<Frame420> decode_frames(const std::vector<std::vector<uint8_t>>& temporal_units, bool film_grain) {
   avm_codec_ctx_t codec;
   if (avm_codec_dec_init(&codec, avm_codec_av2_dx(), nullptr, 0) != AVM_CODEC_OK)
     throw std::runtime_error("avm_codec_dec_init failed");
+  if (avm_codec_control(&codec, AV2D_SET_SKIP_FILM_GRAIN, film_grain ? 0 : 1) != AVM_CODEC_OK) {
+    avm_codec_destroy(&codec);
+    throw std::runtime_error("AV2D_SET_SKIP_FILM_GRAIN failed");
+  }
   std::vector<Frame420> out;
   try {
     for (const auto& tu : temporal_units) {

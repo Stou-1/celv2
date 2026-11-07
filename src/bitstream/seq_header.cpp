@@ -2,6 +2,9 @@
 // Copyright (c) 2021, Alliance for Open Media, under the BSD 3-Clause Clear License
 // and the Alliance for Open Media Patent License 1.0: see third_party/avm/.
 
+#ifdef CELV2_ORACLE
+#include "oracle.h"
+#endif
 #include "bitstream/seq_header.h"
 
 #include <cstring>
@@ -10,6 +13,7 @@
 extern "C" {
 #include "av2/common/level.h"
 #include "av2/common/quant_common.h"
+#include "av2/common/restoration.h"
 #include "avm_dsp/bitwriter_buffer.h"
 }
 
@@ -50,6 +54,7 @@ void fill_sequence_params(const SeqConfig& c, SequenceHeader* s) {
   s->seq_profile_idc = MAIN_420_10_IP0;
   s->seq_max_level_idx = choose_seq_level(c.width, c.height, c.fps_num, c.fps_den);
   s->seq_tier = 0;
+  s->film_grain_params_present = c.film_grain;
   s->subsampling_x = 1;
   s->subsampling_y = 1;
   s->monochrome = 0;
@@ -72,8 +77,10 @@ void fill_sequence_params(const SeqConfig& c, SequenceHeader* s) {
   s->mib_size = mi_size_wide[s->sb_size];
   s->mib_size_log2 = mi_size_wide_log2[s->sb_size];
   s->max_pb_aspect_ratio_log2_m1 = 2;
-  // Inter group: translation only, 8-frame DPB, everything else off.
-  s->seq_enabled_motion_modes = (1 << SIMPLE_TRANSLATION);
+  // Inter group: translation (inter-intra, local warp), 8-frame DPB, everything else off.
+  s->seq_enabled_motion_modes =
+      (1 << SIMPLE_TRANSLATION) | (c.interintra ? 1 << INTERINTRA : 0) | (c.warp ? 1 << WARP_DELTA : 0);
+  s->seq_frame_motion_modes_present_flag = c.warp;  // each frame turns warp on or off
   s->order_hint_info.order_hint_bits_minus_1 = 6;
   s->enable_bawp = 1;  // block-adaptive weighted prediction (BlockWriter::inter_block_mode_info())
   s->enable_drl_reorder = DRL_REORDER_DISABLED;
@@ -83,14 +90,19 @@ void fill_sequence_params(const SeqConfig& c, SequenceHeader* s) {
   // -0.8% on the anime clips (6 candidates: -1.1% on anime A). Temporal MVs: SeqConfig::tmv.
   s->enable_refmvbank = 1;
   s->def_max_drl_bits = MIN_MAX_DRL_BITS + 3;
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::level() >= 2) s->def_max_drl_bits = celv2::oracle::max_drl_bits();
+#endif
   s->def_max_bvp_drl_bits = MIN_MAX_IBC_DRL_BITS;
   s->enable_opfl_refine = AVM_OPFL_REFINE_NONE;
-  // Screen content tools off; integer MV then defaults to "select".
-  s->force_screen_content_tools = 0;
+  // Screen content tools off, or (--screen) chosen per frame; integer MV defaults to "select".
+  s->force_screen_content_tools = c.screen ? 2 : 0;
   s->force_integer_mv = 2;
   // Intra group: the edge filter and intra bi-prediction only change the prediction (no block
   // syntax), so AVM's predictor applies them in celv2's reconstruction too.
   s->enable_intra_edge_filter = 1;
+  s->enable_mhccp = c.mhccp;  // BlockWriter::intra_modes() tries its three filter directions
+  s->enable_cfl_intra = c.cfl;  // BlockWriter::intra_modes() tries UV_CFL_PRED with CFL_DERIVED_ALPHA
   s->enable_adaptive_mvd = c.amvd;  // NEWMV only (BlockWriter::inter_block_mode_info())
   s->order_hint_info.enable_ref_frame_mvs = c.tmv;
   s->enable_flex_mvres = c.flex_mv;
@@ -103,16 +115,42 @@ void fill_sequence_params(const SeqConfig& c, SequenceHeader* s) {
   // Filter group: CDEF (not on blocks without residual) or no in-loop filter but deblocking.
   s->enable_cdef = c.cdef;
   s->enable_cdef_on_skip_txfm = CDEF_ON_SKIP_TXFM_DISABLED;
+  s->enable_restoration = c.lr;
+  // Luma PC_WIENER only (the nonseparable Wiener off); chroma the nonseparable Wiener with lr_uv, else
+  // the luma mask with PC_WIENER off too, as decodeframe.c derives them.
+  s->lr_tools_disable_mask[0] = c.lr ? 1 << RESTORE_WIENER_NONSEP : 0;
+  s->lr_tools_disable_mask[1] = !c.lr ? 0 : c.lr_uv ? DEF_UV_LR_TOOLS_DISABLE_MASK : s->lr_tools_disable_mask[0] | DEF_UV_LR_TOOLS_DISABLE_MASK;
   s->enable_ccso = c.ccso;  // after CDEF, offsets from the deblocked luma (CodecState::ccso())
   s->ccso_unit_matches_sb_size = 0;
   s->df_par_bits_minus2 = c.deblock_delta || c.deblock_search ? 3 : 0;  // 5-bit deblocking deltas when one is used
   s->enable_tcq = c.tcq ? TCQ_8ST : TCQ_DISABLE;  // trellis coded quantization of luma (every frame)
+  s->enable_ist = c.ist;  // TileCoder::residual_code() picks it per luma transform block
+  s->enable_inter_ist = c.ist;
+  s->enable_cctx = c.cctx;  // TileCoder::residual_code_uv() picks it per chroma transform block
   s->enable_global_motion = 1;  // rotation / zoom of the whole frame (core/global_motion.h)
   // Forward skip coding (inter IDTX luma coded from its first level on, without TCQ; celv2 codes no
   // intra block in FSC mode) works but stays off: on anime A 1080p the bytes moved by 0.002% and on an
   // anime clip q90 it lost 0.06 dB at the same size (IDTX without TCQ).
   s->enable_fsc = 0;
   s->enable_idtx_intra = s->enable_fsc;  // implied by forward skip coding
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::level() >= 3) {  // the syntax of avmenc's transforms
+    const OracleFrame& o = celv2::oracle::first_head();
+    s->reduced_tx_part_set = static_cast<uint8_t>(o.reduced_tx_part_set), s->enable_idtx_intra = static_cast<uint8_t>(o.enable_idtx_intra);
+    s->enable_inter_ist = static_cast<uint8_t>(o.enable_inter_ist), s->enable_chroma_dctonly = static_cast<uint8_t>(o.enable_chroma_dctonly);
+  }
+  if (celv2::oracle::level() >= 5) {  // what avmenc's prediction takes
+    const OracleFrame& o = celv2::oracle::first_head();
+    s->enable_ibp = static_cast<uint8_t>(o.enable_ibp), s->cfl_ds_filter_index = static_cast<uint8_t>(o.cfl_ds_filter_index);
+    s->enable_cfl_intra = static_cast<uint8_t>(o.enable_cfl_intra), s->enable_mhccp = static_cast<uint8_t>(o.enable_mhccp);
+  }
+  if (celv2::oracle::filters()) {  // the syntax of avmenc's filters
+    const OracleFrame& o = celv2::oracle::first_head();
+    s->lr_tools_disable_mask[0] = static_cast<uint8_t>(o.lr_mask[0]), s->lr_tools_disable_mask[1] = static_cast<uint8_t>(o.lr_mask[1]);
+    s->df_par_bits_minus2 = static_cast<uint8_t>(o.df_par_bits_minus2);
+    s->enable_cdef_on_skip_txfm = static_cast<uint8_t>(o.enable_cdef_on_skip_txfm);
+  }
+#endif
 }
 
 static void write_sequence_tools(const SequenceHeader* s, avm_write_bit_buffer* wb) {
@@ -137,6 +175,9 @@ static void write_sequence_tools(const SequenceHeader* s, avm_write_bit_buffer* 
   // Inter group (not a single-picture header).
   for (int mm = INTERINTRA; mm < MOTION_MODES; mm++)
     avm_wb_write_bit(wb, (s->seq_enabled_motion_modes >> mm) & 1);
+  if (s->seq_enabled_motion_modes != (1 << SIMPLE_TRANSLATION))
+    avm_wb_write_bit(wb, s->seq_frame_motion_modes_present_flag);
+  if (s->seq_enabled_motion_modes & (1 << WARP_DELTA)) avm_wb_write_bit(wb, 0);  // enable_six_param_warp_delta
   avm_wb_write_bit(wb, s->enable_masked_compound);
   avm_wb_write_bit(wb, s->order_hint_info.enable_ref_frame_mvs);
   if (s->order_hint_info.enable_ref_frame_mvs) avm_wb_write_bit(wb, s->order_hint_info.reduced_ref_frame_mvs_mode);
@@ -169,9 +210,16 @@ static void write_sequence_tools(const SequenceHeader* s, avm_write_bit_buffer* 
   avm_wb_write_bit(wb, s->enable_flex_mvres);
   avm_wb_write_bit(wb, s->enable_global_motion);
   avm_wb_write_bit(wb, s->enable_short_refresh_frame_flags);
-  // Screen content group: tools forced off.
-  avm_wb_write_bit(wb, 0);
-  avm_wb_write_bit(wb, s->force_screen_content_tools);
+  // Screen content group (write_sequence_scc_group_tool_flags()): off, or chosen per frame with
+  // integer MVs chosen per frame too.
+  if (s->force_screen_content_tools == 2) {
+    avm_wb_write_bit(wb, 1);
+    if (s->force_integer_mv != 2) throw std::runtime_error("integer MV not per frame");
+    avm_wb_write_bit(wb, 1);
+  } else {
+    avm_wb_write_bit(wb, 0);
+    avm_wb_write_bit(wb, s->force_screen_content_tools);
+  }
   // Transform/quant/entropy group.
   avm_wb_write_bit(wb, s->enable_fsc);
   if (!s->enable_fsc) avm_wb_write_bit(wb, s->enable_idtx_intra);
@@ -195,9 +243,19 @@ static void write_sequence_tools(const SequenceHeader* s, avm_write_bit_buffer* 
   avm_wb_write_bit(wb, s->enable_cdef);
   avm_wb_write_bit(wb, s->enable_gdf);
   avm_wb_write_bit(wb, s->enable_restoration);
+  if (s->enable_restoration) {
+    for (int i = 1; i < RESTORE_SWITCHABLE_TYPES; i++) avm_wb_write_bit(wb, (s->lr_tools_disable_mask[0] >> i) & 1);
+    const bool uv = s->lr_tools_disable_mask[1] != (s->lr_tools_disable_mask[0] | DEF_UV_LR_TOOLS_DISABLE_MASK);
+    avm_wb_write_bit(wb, uv);  // else chroma: the luma mask with DEF_UV_LR_TOOLS_DISABLE_MASK
+    for (int i = 1; uv && i < RESTORE_SWITCHABLE_TYPES; i++)
+      if (!(DEF_UV_LR_TOOLS_DISABLE_MASK & (1 << i))) avm_wb_write_bit(wb, (s->lr_tools_disable_mask[1] >> i) & 1);
+  }
   avm_wb_write_bit(wb, s->enable_ccso);
   if (s->enable_ccso) avm_wb_write_bit(wb, s->ccso_unit_matches_sb_size);
   avm_wb_write_bit(wb, s->enable_cdef_on_skip_txfm == CDEF_ON_SKIP_TXFM_ALWAYS_ON);
+#ifdef CELV2_ORACLE
+  if (s->enable_cdef_on_skip_txfm != CDEF_ON_SKIP_TXFM_ALWAYS_ON)
+#endif
   avm_wb_write_bit(wb, s->enable_cdef_on_skip_txfm == CDEF_ON_SKIP_TXFM_DISABLED);
   avm_wb_write_literal(wb, s->df_par_bits_minus2, 2);
   // Tile config.

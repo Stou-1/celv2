@@ -5,9 +5,12 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "bitstream/seq_header.h"
+#include "core/intrabc_index.h"
+#include "core/perceptual_aq.h"
 #include "io/y4m.h"
 
 extern "C" {
@@ -36,7 +39,26 @@ struct FrameSpec {
   // Per 64x64 superblock (raster, the decision map's grid): the qindex offset of its blocks, coded
   // as a delta qindex per coded superblock (the 64x64 offsets under it averaged). Empty: none.
   std::vector<int> sb_dq;
+  // The frame's --paq importance map, which --psy-rd weighs its blocks by (null: none).
+  std::shared_ptr<const celv2::AqMap> map;
+  // --screen: the frame's screen content tools (palette, IntraBC) on; needs SeqConfig::screen.
+  bool screen = false;
+  // With screen: where the frame's source repeats itself, for IntraBC.
+  std::shared_ptr<const celv2::IntrabcIndex> ibc;
+  int refresh = -1;  // the slots it refreshes, in place of the turns (X_L0; -1: the turns)
 };
+
+// Every 64x64 offset of sb_dq (FrameSpec's grid for a width x height frame) replaced by its coded
+// superblock's (coded_sb_px square): the group's mean rounded to the nearest multiple of kDeltaQRes,
+// as begin_frame() codes it (without its clamp to the qindex range). Empty stays empty.
+void snap_sb_dq(std::vector<int>& sb_dq, int width, int height, int coded_sb_px);
+
+#ifdef CELV2_ORACLE
+namespace celv2::oracle {
+struct Frame;
+}
+void wienerns_shape(const WienernsFilterParameters* prm, const int16_t* t, int* s, int* sym);
+#endif
 
 class CodecState {
  public:
@@ -65,10 +87,21 @@ class CodecState {
   int slot_of(int display_order_hint) const;
   // Per-tile init the decoder does before tile t's first superblock (decode_tiles()).
   void begin_tile(int t);
-  // Saves the adapted CDFs into the frame, runs the in-loop filters (CDEF's strength chosen
-  // against src), updates the reference slots and copies the reconstruction into recon().
-  // sse_per_bit: what a header bit costs the CCSO search, in squared error.
+  // Runs the in-loop filters (CDEF's strength and the restoration units chosen against src),
+  // updates the reference slots and copies the reconstruction into recon(). sse_per_bit: what a
+  // bit costs the CCSO search and the restoration choice, in squared error. Then, once the tiles
+  // are range coded (lr_flags() in hand), save_contexts().
   void end_frame(const Frame420& src, double sse_per_bit);
+  // Per restoration unit, raster, the planes restored as the tiles were coded one after the other: 1
+  // where restore() kept the filter, 0 where not (what the tiles' deferred flags code,
+  // SymbolLog::replay()), kLrSkip for a plane restore() left without restoration (no flag coded).
+  const std::vector<uint8_t>& lr_flags() const { return lr_flags_; }
+  static constexpr int kWienerTaps = 18;  // wienerns_filter_uv's
+  static constexpr uint8_t kLrSkip = 2;
+  // A WIENER_NONSEP plane's frame filter syntax (read_wienerns_framefilters_hdr()), one bit a byte.
+  const std::vector<uint8_t>& lr_filter_bits(int p) const { return lr_filter_bits_[p]; }
+  // Saves the tiles' adapted CDFs (as the range coder left them) into the frame.
+  void save_contexts();
   // Makes this state's reference slots (the frames, with the contexts they carry), default frame
   // context and frame counters those of o, a state of the same SeqConfig, copying the frames this
   // one does not hold yet: a frame coded here next codes as on o, so frames that depend on none of
@@ -120,6 +153,35 @@ class CodecState {
   // deblocked luma (padded as extend_ccso_border()), and applies them as the decoder does.
   void apply_ccso(const std::vector<uint16_t>& luma);
   void ccso(const Frame420& src, std::vector<uint16_t>& luma, double sse_per_bit);
+  // Loop restoration after CCSO: every luma unit filtered with PC_WIENER, then each kept where it
+  // brings the frame nearer src by more than a bit's worth, else put back (lr_flags_).
+  void restore(const Frame420& src, bool optimized, double sse_per_bit);
+  void fit_wienerns(const Frame420& src, int p, double* a, double* v) const;
+  int wienerns_syntax(int p, int match, int s, const int16_t* t, int16_t* ref, std::vector<uint8_t>* out);
+  std::pair<int, int> wienerns_matches(int p);
+#ifdef CELV2_ORACLE  // tools/oracle/filter_import.inc
+ public:
+  // A WIENER_NONSEP unit's syntax: per class, what it is coded against.
+  struct LrPlan {
+    bool exact[WIENERNS_MAX_CLASSES] = {};
+    int ref[WIENERNS_MAX_CLASSES] = {}, size[WIENERNS_MAX_CLASSES] = {};
+    int16_t taps[WIENERNS_MAX_CLASSES][WIENERNS_TAPS_MAX] = {};
+  };
+  const std::vector<LrPlan>& lr_plan(int p) const { return lr_plan_[p]; }
+  void import_frame_filter_bits(int p);
+
+ private:
+  void import_filters(const celv2::oracle::Frame& o);
+  void import_lr_types(const celv2::oracle::Frame& o);
+  void import_lr_units(const celv2::oracle::Frame& o);
+  void import_end_frame();
+  std::vector<LrPlan> lr_plan_[MAX_MB_PLANE];
+#endif
+  std::vector<uint8_t> lr_flags_;
+  std::vector<uint8_t> lr_filter_bits_[MAX_MB_PLANE];
+  std::vector<uint16_t> lr_keep_[MAX_MB_PLANE];  // restore(): the planes before restoration
+  AV2LrStruct lr_ctxt_ = {};
+  AV2LrSync lr_sync_ = {};  // restore() on lf_workers_
 
   SeqConfig cfg_;
   AV2_COMMON* cm_ = nullptr;

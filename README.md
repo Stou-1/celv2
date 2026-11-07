@@ -14,9 +14,8 @@ Open Media.
 `celv2enc.exe`, `av2_mux.exe` and the licenses: unpack it and run `CelV2Gui.exe`. It needs:
 
 - Windows 10 or 11, 64-bit, and a CPU with AVX2
-- For speed, an NVIDIA GPU, Turing (GeForce RTX 20) or newer with driver r580 or newer, or a
-  discrete GPU with Vulkan (checked on an Intel Arc Pro B50: the same output as on CUDA). Without
-  either it codes on the CPU, much more slowly.
+- For speed, a discrete GPU with Vulkan (tested on an RTX 5090 and an Intel Arc Pro B50). Without
+  one it codes on the CPU, much more slowly.
 - ffmpeg (`ffmpeg.exe` and `ffprobe.exe`), not included; MP4Box (GPAC) for an MP4 with audio,
   optional
 
@@ -29,12 +28,17 @@ building from source. [gui/README_ja.txt](gui/README_ja.txt) (Japanese) says how
   (`--bit-depth 8` codes 8 bits). Fixed qindex per frame type.
 - Keyframes at scene cuts; 8- or 16-frame mini-GOPs with a hidden anchor, hidden pyramid mid frames and
   B frames from both sides (the leaf B frames coded in parallel); up to 7 reference frames.
-- Intra: directional, smooth and DC modes, intra prediction from further reference lines (MRLS).
+- Intra: directional, smooth and DC modes, intra prediction from further reference lines (MRLS),
+  chroma modes searched apart from luma, chroma from luma (CfL, with `--tune animation`; else
+  multi-hypothesis cross-component prediction, MHCCP).
 - Inter: NEARMV / NEWMV with MV refinement, adaptive and joint MVDs, compound prediction, global
-  motion, BAWP for fades, local warp (`--warp`, off by default), skip mode.
-- Residual: DCT / ADST / identity transforms with transform partitions, trellis coded
-  quantization (TCQ).
-- In-loop filters: deblocking, CDEF (one strength per frame), CCSO. No loop restoration.
+  motion, BAWP for fades, local warp (`--warp`, off by default), inter-intra (`--interintra`, off by default), skip mode.
+- Residual: DCT / ADST / identity transforms with transform partitions, the intra secondary
+  transform (IST) on luma, the cross-chroma transform (CCTX, U and V rotated together),
+  trellis coded quantization (TCQ).
+- In-loop filters: deblocking, CDEF (one strength per frame), CCSO, loop restoration (luma
+  pixel-classified Wiener, on or off per 128x128 unit; chroma a Wiener filter fitted per frame, on
+  or off per 64x64 unit).
 - Decision engines: CUDA (NVIDIA), Vulkan (tested on an RTX 5090 and an Arc Pro B50) and a CPU
   fallback, all giving the same bytes.
 
@@ -106,21 +110,28 @@ celv2enc halves the width until it is under 1280 and the height until it is unde
 tiles: 2 at 1080p, 4 at 4K, 16 at 8K and 16K. Each tile costs a few bits (4K: 2, 4 and 8 tiles ran
 at 2.4, 2.7 and 3.1 fps for +0.6% and +1.6% bytes).
 
-`--device auto` (the default) decides on a CUDA GPU (Turing or newer, driver r580 or newer) if
-there is one, else on the first discrete Vulkan GPU, else on the CPU, which is much slower. All
-give the same output. `--device gpu|cpu|vulkan|vulkan2` picks one (`vulkan2`: the second discrete
-Vulkan GPU). On the CPU path `--threads` limits only the tile threads; the decision threads take
+`--device auto` (the default) decides on the first discrete Vulkan GPU, else on the CPU, which is
+much slower. All give the same output. `--device gpu|cuda|cpu|vulkan|vulkan2` picks one (`cuda`: an
+NVIDIA GPU, Turing or newer, driver r580 or newer; `vulkan2`: the second discrete Vulkan GPU). On the CPU path `--threads` limits only the tile threads; the decision threads take
 the other cores.
 
 ### Settings by content, effort and size
 
 `--tune animation|film|still` sets several options for the kind of video (as x264's `--tune`):
-longer mini-GOPs where the picture stays still, and keyframe and anchor boosts for anime; delta-q
+longer mini-GOPs where the picture stays still, and keyframe boosts, temporal MVs and a temporally
+filtered keyframe (`--key-filter`) for anime; delta-q
 for live action; 16-frame mini-GOPs throughout for slides. Options given on the command line win.
+
+`--screen auto`, the default, opens palettes and IntraBC frame by frame where a picture is screen content or halftone
+(Angel Beats -8.20%, Flash -4.79%), and leaves regular video as it is. Sources that open it encode 1.12-1.18x slower;
+`--screen 0` turns it off.
+
+`--rd-zero 1` lets the quantizer drop a block's last coefficients, or all of them, where that costs less by rate and distortion.
+On with `--tune animation`, off otherwise: it helps anime and costs live action detail ([the spec](docs/superpowers/specs/2026-11-06-rd-zeroing-design.md)).
 
 `--preset max` ignores speed for quality and size: a 16-frame mini-GOP is coded both as one and as
 two of 8 and the better kept (`--gop-trial`), and live action gets a per-frame deblocking search
-(`--deblock-search`). See [docs/design/2026-10-31-preset-max.md](docs/design/2026-10-31-preset-max.md).
+(`--deblock-search`), and the RD pass tries every intra mode (`--rd-intra`). See [docs/design/2026-10-31-preset-max.md](docs/design/2026-10-31-preset-max.md).
 
 A target size takes two runs over the same input:
 

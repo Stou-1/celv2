@@ -7,6 +7,8 @@
 #pragma once
 #include <vector>
 
+#include "core/intrabc_index.h"
+#include "core/perceptual_aq.h"
 #include "gpu/decision_map.h"
 #include "io/y4m.h"
 
@@ -24,6 +26,25 @@ struct RdPassParams {
   // / -15.0%; at 0.02-0.03, 10 to 20 bits within 1.3%. 0 bits at 0.05: +1.4 / -8.1%.
   double bit_weight = 0.025;
   double block_bits = 12;
+  // Every intra mode on each intra block, not only the engine's best (--rd-intra; 120 frames 1080p
+  // q100-190: -0.18% BD-rate on average, about 60% slower).
+  bool all_intra_modes = false;
+  // Intra frames also try 64x64, 64x32 and 32x64 intra blocks, every mode scored here (the engines
+  // give no intra candidate above kMaxBlockSize).
+  bool intra64 = true;
+  // --psy-rd: the strength, the frame's importance map (null: off) and the rule (core/psy.h).
+  double psy = 0;
+  const celv2::AqMap* map = nullptr;
+  bool psy_lines = false;
+  double trellis = 0;  // --psy-trellis: the strength (the same map and rule)
+  // --screen, on this frame: blocks of 2-8 source values (8x8 to 64x64) also try a palette, which
+  // leaves no residual; it wins as an intra DC decision, where the coder's palette search runs.
+  bool screen = false;
+  // With screen: exact repeats of a block already coded in its window try a copy, also as an intra
+  // DC decision, where the coder's IntraBC search runs.
+  const celv2::IntrabcIndex* ibc = nullptr;
+  // CELV2_WIDE (core/wide.h): W1, W2, W4, W6.
+  bool per_ref = false, full_search = false, chroma = false, all_pairs = false;
 };
 
 // Re-picks the tree and blocks of the 64x64 superblock whose top left is (sb_x, sb_y) from

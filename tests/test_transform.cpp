@@ -13,6 +13,11 @@
 
 #include "check.h"
 #include "core/quant.h"
+extern "C" {
+#include "av2/common/idct.h"
+#include "av2/common/quant_common.h"
+#include "av2/common/scan.h"
+}
 #include "core/transform.h"
 
 static void reference(const int16_t* r, int w, int h, double scale, std::vector<long>& out) {
@@ -94,6 +99,88 @@ int main(int argc, char** argv) {
       }
     }
   }
+  // --rd-zero: a lone coefficient 0.6 steps at scan position 1 is coded off, none on (J 0.50 against 0.41), and the plain
+  // path's one at 1 step; cost-only agrees. Larger ones stay.
+  for (const bool tcq : {true, false}) {
+    tran_low_t coeff[64] = {}, q[64], dq[64];
+    const double step = av2_ac_quant_QTX(130, 0, 0, kQDepth) / static_cast<double>(1 << (QUANT_TABLE_BITS + av2_get_tx_scale(TX_8X8)));
+    coeff[get_scan(TX_8X8, DCT_DCT)->scan[1]] = static_cast<tran_low_t>((tcq ? 0.6 : 1.0) * step);
+    CHECK(quantize(coeff, q, dq, TX_8X8, 130, 0, DCT_DCT, nullptr, tcq) > 0);
+    g_rd_zero = true;
+    int eob = -1;
+    double full = 0;
+    CHECK_EQ(quantize(coeff, q, dq, TX_8X8, 130, 0, DCT_DCT, &full, tcq), 0);
+    CHECK_EQ(quantize_cost(coeff, TX_8X8, 130, DCT_DCT, &eob, tcq), full);
+    CHECK_EQ(eob, 0);
+    coeff[get_scan(TX_8X8, DCT_DCT)->scan[1]] = static_cast<tran_low_t>((tcq ? 0.9 : 1.2) * step);
+    CHECK(quantize(coeff, q, dq, TX_8X8, 130, 0, DCT_DCT, nullptr, tcq) > 0);
+    g_rd_zero = false;
+  }
+  // --rd-zero's one pass against reruns of the trellis: its levels, dequantization and J are the least over forcing each end
+  // above the threshold and all zero. Cost-only with eob null is the same J, with eob given the same end. Where two ends
+  // come within rounding of each other only J is compared. Inside one end paths can tie exactly (a coefficient 0.75 steps
+  // is as near in Q0 as in Q1), so levels are compared by what they cost, walked along the states as the decoder does.
+  int shorter = 0, zeroed = 0;
+  for (int tx = 0; tx < TX_SIZES_ALL; tx++) {
+    const int n = std::min<int>(tx_size_wide[tx], 32) * std::min<int>(tx_size_high[tx], 32);
+    const double scale = static_cast<double>(1 << (QUANT_TABLE_BITS + av2_get_tx_scale(static_cast<TX_SIZE>(tx))));
+    tran_low_t coeff[1024], q[1024], dq[1024], fq[1024], fdq[1024], bq[1024], bdq[1024];
+    for (int trial = 0; trial < 8; trial++)
+      for (int qindex : {40, 130, 220})
+        for (double psy : {0.0, 2.0}) {
+          const double step = av2_ac_quant_QTX(qindex, 0, 0, kQDepth) / scale;
+          for (int i = 0; i < n; i++) {
+            const int r = rnd();
+            const double steps = (r >> 8) % 1000 * (trial < 4 ? 0.0012 : 0.004);  // mostly under one step, or a few
+            coeff[i] = trial == 0 || r % (2 + 3 * trial) ? 0 : static_cast<tran_low_t>((r & 1 ? steps : -steps) * step);
+          }
+          double least = 1e300, next = 1e300;
+          int prep = 0, best = 0;
+          for (int end = n; end >= 0; end--) {
+            const double j = tcq_end_cost(coeff, fq, fdq, static_cast<TX_SIZE>(tx), qindex, DCT_DCT, end, psy);
+            if (j < 0) continue;
+            if (!prep) prep = end;
+            if (j < least) {
+              next = least, least = j, best = end;
+              std::copy(fq, fq + n, bq), std::copy(fdq, fdq + n, bdq);
+            } else {
+              next = std::min(next, j);
+            }
+          }
+          g_rd_zero = true;
+          double got = 0;
+          const int e = quantize(coeff, q, dq, static_cast<TX_SIZE>(tx), qindex, 0, DCT_DCT, &got, true, 8, psy);
+          CHECK(std::abs(got - least) < 1e-9);
+          if (next - least > 1e-9) {
+            CHECK_EQ(e, best);
+            const SCAN_ORDER* const so = get_scan(static_cast<TX_SIZE>(tx), DCT_DCT);
+            bool dequantized = true;
+            auto path_j = [&](const tran_low_t* l, const tran_low_t* d) {
+              static const uint8_t next_state[8][2] = {{0, 4}, {4, 0}, {1, 5}, {5, 1}, {6, 2}, {2, 6}, {7, 3}, {3, 7}};
+              double j = 0;
+              int state = 0;
+              for (int c = e - 1; c >= 0; c--) {
+                const int pos = so->scan[c], level = std::abs(l[pos]);
+                const double s = pos ? step : av2_dc_quant_QTX(qindex, 0, 0, kQDepth) / scale;
+                const double rec = !level ? 0 : state & 2 ? level - 0.5 : level, miss = std::abs(std::abs(coeff[pos]) / s - rec);
+                j += miss * miss + (pos ? psy * miss : 0) + kTcqBitWeight * coeff_level_bits(level);
+                dequantized = dequantized && std::abs(std::abs(d[pos]) - rec * s) <= 1;
+                state = next_state[state][level & 1];
+              }
+              return j;
+            };
+            CHECK(std::abs(path_j(q, dq) - path_j(bq, bdq)) < 1e-9);
+            CHECK(dequantized);
+          }
+          CHECK_EQ(quantize_cost(coeff, static_cast<TX_SIZE>(tx), qindex, DCT_DCT, nullptr, true, psy), got);
+          int eob = -1;
+          quantize_cost(coeff, static_cast<TX_SIZE>(tx), qindex, DCT_DCT, &eob, true, psy);
+          CHECK_EQ(eob, e);
+          g_rd_zero = false;
+          shorter += e && e < prep, zeroed += !e && prep;
+        }
+  }
+  CHECK(shorter > 0 && zeroed > 0);
   // TCQ's cost-only path against quantize(): coefficients mostly small (many zeros past the end of
   // block), some large, at a few qindex.
   for (int tx = 0; tx < TX_SIZES_ALL; tx++) {

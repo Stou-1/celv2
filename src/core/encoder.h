@@ -34,7 +34,8 @@ class Encoder {
   std::vector<uint8_t> show_existing(int display_order_hint);
   // Threads encode() codes tiles on: min(tiles, cores, cfg.threads > 0 ? cfg.threads : tiles).
   int tile_threads() const;
-  int tile_rows() const;  // tile rows of the frame (AV2 may have adjusted SeqConfig's)
+  int tile_rows() const;
+  int sb_px() const;  // the coded superblock's side (128 today)  // tile rows of the frame (AV2 may have adjusted SeqConfig's)
   const Frame420& last_recon() const { return st_->recon(); }
   // The display order hint of the frame begin() set up (as ref_display_hints report them).
   int display_order_hint() const { return static_cast<int>(st_->cm()->current_frame.display_order_hint); }
@@ -53,6 +54,9 @@ class Encoder {
   SeqConfig cfg_;
   std::unique_ptr<CodecState> st_;
   bool key_ = false;  // the frame begin() set up
+  std::shared_ptr<const celv2::AqMap> map_;  // its FrameSpec::map (--psy-rd)
+  std::shared_ptr<const celv2::IntrabcIndex> ibc_;  // its FrameSpec::ibc (--screen)
+  double trial_lambda_ = 0;  // CELV2_WIDE W3: sse_per_bit() at the frame's qindex
   std::mutex scale_mu_;
   std::atomic<double> scale_[2][TX_SIZES_ALL] = {};  // 0 until measured; read without the lock
 };

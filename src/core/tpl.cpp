@@ -8,6 +8,7 @@
 #include <immintrin.h>
 #include <stdexcept>
 
+#include "core/profile.h"
 #include "core/threads.h"
 
 extern "C" {
@@ -98,6 +99,7 @@ struct Motion {
 }  // namespace
 
 std::vector<TplStats> tpl_model(const std::vector<TplFrame>& frames, int threads) {
+  celv2::StageScope prof(celv2::Stage::Tpl);
   const int n = static_cast<int>(frames.size());
   if (n == 0) return {};
   const int w = frames[0].src->width, h = frames[0].src->height;

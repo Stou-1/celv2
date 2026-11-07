@@ -17,8 +17,12 @@ namespace CelV2.Tests
             ("advanced_dialog_refuses_builtin_preset_name", AdvancedDialogRefusesBuiltInName),
             ("main_form_builds", MainFormBuilds),
             ("main_form_restores_max_effort", MainFormRestoresMaxEffort),
+            ("main_form_notes_target_size", MainFormNotesTargetSize),
             ("main_form_target_size", MainFormTargetSize),
+            ("main_form_target_vmaf", MainFormTargetVmaf),
+            ("main_form_takes_ivf_for_muxing", MainFormTakesIvfForMuxing),
             ("notes_for_inputs", NotesForInputs),
+            ("mux_warning_before_start", MuxWarningBeforeStart),
             ("failure_reason_is_short", FailureReasonIsShort),
             ("advanced_dialog_clamps_bad_enums_and_matches_names_ignoring_case", AdvancedDialogRobust),
         };
@@ -36,12 +40,13 @@ namespace CelV2.Tests
             try
             {
                 string path = Path.Combine(dir, "sub", "settings.json");
-                new AppSettings { LastPreset = "小容量", OutputFolder = @"D:\出力 先", FfmpegFolder = @"C:\ff mpeg", Mp4BoxFolder = @"C:\gpac" }.Save(path);
+                new AppSettings { LastPreset = "小容量", OutputFolder = @"D:\出力 先", FfmpegFolder = @"C:\ff mpeg", Mp4BoxFolder = @"C:\gpac", FdkaacFolder = @"C:\fdk aac" }.Save(path);
                 var s = AppSettings.Load(path);
                 Check.Equal("小容量", s.LastPreset, "LastPreset");
                 Check.Equal(@"D:\出力 先", s.OutputFolder, "OutputFolder");
                 Check.Equal(@"C:\ff mpeg", s.FfmpegFolder, "FfmpegFolder");
                 Check.Equal(@"C:\gpac", s.Mp4BoxFolder, "Mp4BoxFolder");
+                Check.Equal(@"C:\fdk aac", s.FdkaacFolder, "FdkaacFolder");
             }
             finally { Directory.Delete(dir, true); }
         }
@@ -95,6 +100,8 @@ namespace CelV2.Tests
                 Num(d, "kq").Value = -8;
                 Num(d, "deblockDelta").Value = -3;
                 ((CheckBox)d.Controls.Find("cdef", true).Single()).Checked = false;
+                Check.Equal(-1m, Num(d, "grain").Value, "film grain left to celv2enc by default");
+                Num(d, "grain").Value = 25;
                 ((ComboBox)d.Controls.Find("tileRows", true).Single()).SelectedIndex = 2;
                 ((ComboBox)d.Controls.Find("parallelB", true).Single()).SelectedIndex = 2;
                 Num(d, "audioKbps").Value = 256;
@@ -115,6 +122,7 @@ namespace CelV2.Tests
                 Check.Equal(-8, r.KQ, "Result.KQ");
                 Check.Equal(-3, r.DeblockDelta, "Result.DeblockDelta");
                 Check.That(!r.Cdef, "Result.Cdef");
+                Check.Equal(25, r.Grain, "Result.Grain");
                 Check.Equal(TileMode.Two, r.TileRows, "Result.TileRows");
                 Check.Equal(ParallelMode.Off, r.ParallelB, "Result.ParallelB");
                 Check.Equal(256, r.AudioKbps, "Result.AudioKbps");
@@ -175,7 +183,7 @@ namespace CelV2.Tests
             finally { Directory.Delete(dir, true); }
         }
 
-        // 「とても遅いが最高画質」 saved on: after a restart the encode settings have it too, not only the box.
+        // 速度「とても遅い」 saved on: after a restart the encode settings have it too, not only the box.
         static void MainFormRestoresMaxEffort()
         {
             string dir = TempDir();
@@ -183,8 +191,81 @@ namespace CelV2.Tests
             {
                 using (var f = new MainForm(new AppSettings { LastMaxEffort = true }, Path.Combine(dir, "settings.json")))
                 {
-                    Check.That(((CheckBox)f.Controls.Find("maxBox", true).Single()).Checked, "box ticked");
+                    var speed = (ComboBox)f.Controls.Find("speedBox", true).Single();
+                    Check.Equal(1, speed.SelectedIndex, "とても遅い chosen");
                     Check.That(f.EncodeSettingsForTest.MaxEffort, "settings say --preset max");
+                    speed.SelectedIndex = 0;
+                    Check.That(!f.EncodeSettingsForTest.MaxEffort, "標準: no --preset max");
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        // サイズ指定 on: the note says the preset's qindex gives way to the size.
+        static void MainFormNotesTargetSize()
+        {
+            string dir = TempDir();
+            try
+            {
+                using (var f = new MainForm(new AppSettings(), Path.Combine(dir, "settings.json")))
+                {
+                    var note = f.Controls.Find("targetSizeNote", true).Single();
+                    Check.Equal("", note.Text, "empty with サイズ指定 off");
+                    ((NumericUpDown)f.Controls.Find("targetSize", true).Single()).Value = 1.4m;
+                    Check.That(note.Text.Contains("qindex"), "note: " + note.Text);
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        // A dropped .ivf is not probed: its row waits to be put into an MP4 with the audio beside it.
+        static void MainFormTakesIvfForMuxing()
+        {
+            string dir = TempDir();
+            try
+            {
+                string ivf = Path.Combine(dir, "clip.ivf");
+                File.WriteAllBytes(ivf, new byte[1]);
+                File.WriteAllBytes(Path.Combine(dir, "clip.m4a"), new byte[1]);
+                using (var f = new MainForm(new AppSettings(), Path.Combine(dir, "settings.json")))
+                {
+                    f.AddFiles(new[] { ivf });
+                    Check.Equal(0, f.PendingProbes, "no probe");
+                    var row = ((ListView)f.Controls.Find("list", true).Single()).Items.Cast<ListViewItem>().Single();
+                    Check.Equal("待機", row.SubItems[6].Text, "status");
+                    Check.Equal("clip.m4a", row.SubItems[4].Text, "audio column");
+                    Check.That(row.SubItems[5].Text.Contains("MP4 にまとめる"), "note: " + row.SubItems[5].Text);
+                    Check.That(f.Controls.Find("startButton", true).Single().Enabled, "start enabled");
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        // 画質指定（VMAF）: its value is in the encode settings, also after the preset changes; it and サイズ指定
+        // exclude each other (setting one clears the other); the note says how the qindex is chosen.
+        static void MainFormTargetVmaf()
+        {
+            string dir = TempDir();
+            try
+            {
+                using (var f = new MainForm(new AppSettings(), Path.Combine(dir, "settings.json")))
+                {
+                    var box = (NumericUpDown)f.Controls.Find("targetVmaf", true).Single();
+                    var size = (NumericUpDown)f.Controls.Find("targetSize", true).Single();
+                    var note = f.Controls.Find("targetSizeNote", true).Single();
+                    Check.Equal(0m, box.Value, "off at first");
+                    Check.Equal(100m, box.Maximum, "maximum");
+                    box.Value = 93m;
+                    Check.Equal(93.0, f.EncodeSettingsForTest.TargetVmaf, "93");
+                    Check.That(note.Text.Contains("VMAF"), "note: " + note.Text);
+                    ((ComboBox)f.Controls.Find("presetBox", true).Single()).SelectedIndex = 0;
+                    Check.Equal(93.0, f.EncodeSettingsForTest.TargetVmaf, "kept when the preset changes");
+                    size.Value = 5m;
+                    Check.Equal(0m, box.Value, "サイズ指定 clears it");
+                    Check.Equal(0.0, f.EncodeSettingsForTest.TargetVmaf, "off");
+                    box.Value = 95m;
+                    Check.Equal(0m, size.Value, "it clears サイズ指定");
+                    Check.Equal(0.0, f.EncodeSettingsForTest.TargetSizeMB, "size off");
                 }
             }
             finally { Directory.Delete(dir, true); }
@@ -229,6 +310,19 @@ namespace CelV2.Tests
             Check.Equal("別ファイルで保存", MainForm.NotesFor(new InputInfo { BitDepth = 8 }, ten, "別ファイルで保存"), "job note alone");
         }
 
+        static void MuxWarningBeforeStart()
+        {
+            var all = new CelV2.Runner.ToolPaths { Av2Mux = "av2_mux.exe", Mp4Box = "MP4Box.exe" };
+            var mp4 = new EncodeSettings { Container = ContainerKind.Mp4 };
+            Check.Equal<string>(null, MainForm.MuxWarning(all, mp4), "both tools: no warning");
+            string w = MainForm.MuxWarning(new CelV2.Runner.ToolPaths { Av2Mux = "av2_mux.exe" }, mp4);
+            Check.That(w != null && w.Contains("MP4Box") && !w.Contains("av2_mux") && w.Contains("別ファイル"), "MP4Box missing: " + w);
+            w = MainForm.MuxWarning(new CelV2.Runner.ToolPaths { Mp4Box = "MP4Box.exe" }, mp4);
+            Check.That(w != null && w.Contains("av2_mux") && !w.Contains("MP4Box が"), "av2_mux missing: " + w);
+            Check.Equal<string>(null, MainForm.MuxWarning(new CelV2.Runner.ToolPaths(), new EncodeSettings { Container = ContainerKind.Separate }),
+                "separate files need no muxer");
+        }
+
         static void FailureReasonIsShort()
         {
             string path = Path.Combine(Path.GetTempPath(), "some folder", "bad.txt");
@@ -252,7 +346,7 @@ namespace CelV2.Tests
                     Check.Equal(DecisionDevice.Auto, r.Device, "device clamped");
                     Check.Equal(ContainerKind.Mp4, r.Container, "container clamped");
                 }
-                var listed = DeviceList.Parse("gpu\tA (CUDA)\nvulkan\tA (Vulkan)\nvulkan2\tB (Vulkan)\ncpu\tCPU\n");
+                var listed = DeviceList.Parse("vulkan\tA (Vulkan)\nvulkan2\tB (Vulkan)\ncpu\tCPU\n");
                 using (var d = new AdvancedDialog(new EncodeSettings { DeviceArg = "vulkan2" }, null, listed))
                     Check.Equal("vulkan2", d.Result.DeviceArg, "listed device kept");
                 using (var d = new AdvancedDialog(new EncodeSettings { DeviceArg = "vulkan2" }))

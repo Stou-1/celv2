@@ -10,9 +10,9 @@
 #include "bitstream/obu.h"
 #include "check.h"
 #include "core/encoder.h"
-#include "gpu/engine.h"
 #include "pipeline.h"
 #include "test_frames.h"
+#include "vk/vk_engine.h"
 #include "verify/avm_decode.h"
 
 struct Sequence {
@@ -106,7 +106,7 @@ static int pipeline_matches_sync() {
     c.tile_cols_log2 = k.cols_log2;
     c.tile_rows_log2 = k.rows_log2;
     Encoder enc(c);
-    GpuEngine gpu(k.w, k.h, 64);
+    VulkanEngine gpu(k.w, k.h, 64);
     std::vector<Frame420> recons;  // the references, nearest first, as Pipeline keeps them
     for (int i = 0; i < k.frames; i++) {
       const Frame420 src = scene_frame(k.w, k.h, i * 3, i * 2);

@@ -107,6 +107,7 @@ namespace CelV2.Runner
                     stage("画質を調べています（qindex " + q + " を試し中）");
                     var s = settings.Clone();
                     s.QIndex = q;
+                    s.TargetVmaf = 0;  // one qindex: what the trial measures
                     var a = CommandBuilder.EncodeArgs(s, info, ivf).ToList();
                     a[a.IndexOf("-i") + 1] = samples;
                     var r = Proc.Capture(tools.CelV2enc, a, cancel);

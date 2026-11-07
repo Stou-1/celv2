@@ -52,7 +52,10 @@ void ThreadPool::loop() {
     if (!j) return;
     j->helpers++;
     lock.unlock();
-    work(*j);
+    {
+      StageScope prof(j->stage);
+      work(*j);
+    }
     lock.lock();
     j->helpers--;
     done_.notify_all();

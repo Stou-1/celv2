@@ -6,6 +6,13 @@
 #include <mutex>
 #include <vector>
 
+#ifdef CELV2_ORACLE
+struct OracleBlock;  // tools/oracle/oracle_format.h
+namespace celv2::oracle {
+struct Sb;
+}
+#endif
+
 enum class Part : uint8_t { None, Horz, Vert, Split };
 // The AV2 luma intra modes celv2 decides (angle delta 0); the first four keep their old values.
 enum class IntraMode : uint8_t { DC, V, H, Smooth, SmoothV, SmoothH, Paeth, D45, D67, D113, D135, D157, D203 };
@@ -21,6 +28,10 @@ struct BlockDecision {
   static constexpr uint8_t kSingleRef = 255;
   uint8_t ref2 = kSingleRef;
   int16_t mv2_row = 0, mv2_col = 0;
+#ifdef CELV2_ORACLE
+  const OracleBlock* imp = nullptr;  // L2: avmenc's block, coded as it chose it
+  bool piece = false;                // a 128 block's 64x64 after its first
+#endif
 };
 
 // An engine's best choices for one candidate block of a 64x64 superblock, both kinds, with their
@@ -45,6 +56,18 @@ struct SbDecision {
   // Every candidate block's choices (gpu/sb_blocks.h order, kSbBlocks), for the CPU RD pass; empty
   // where the decision does not come from an engine.
   std::vector<BlockCandidates> cands;
+  // CELV2_WIDE W3: other trees and blocks of the RD pass, trial-coded against tree / blocks.
+  struct Alt {
+    std::vector<Part> tree;
+    std::vector<BlockDecision> blocks;
+  };
+  std::vector<Alt> alts;
+  // CELV2_WIDE W2: per block and reference the full search's MV (col, row; 1/8 pel), kNoMv for none.
+  static constexpr int16_t kNoMv = INT16_MIN;
+  std::vector<int16_t> wide_mv;
+#ifdef CELV2_ORACLE
+  const celv2::oracle::Sb* forced = nullptr;  // L1: the tree the RD pass keeps
+#endif
 };
 
 struct DecisionMap {

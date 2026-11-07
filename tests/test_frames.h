@@ -1,5 +1,6 @@
 // Deterministic synthetic test pictures and PSNR, shared by the encoder tests.
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -44,4 +45,25 @@ inline double psnr_y(const Frame420& a, const Frame420& b) {
     }
   const double mse = se / (static_cast<double>(a.width) * a.height);
   return mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
+}
+
+// Screen-like content: 4-colour glyphs (strokes, boxes, dots) on a flat ground, every sample one of
+// 4 values; dx shifts the glyphs right by whole pixels.
+inline Frame420 glyph_frame(int w, int h, int dx = 0) {
+  Frame420 f = make_frame(w, h);
+  const uint8_t ink[4] = {40, 120, 200, 240};
+  for (int r = 0; r < h; r++)
+    for (int c = 0; c < w; c++) {
+      const int x = c - dx, cx = ((x % 24) + 24) % 24, cy = r % 20, cell = ((x + 2400) / 24 * 7 + r / 20 * 3) % 5;
+      int v = 0;  // ground
+      if (cell == 1 && (cx == 3 || cx == 4 || cy == 3)) v = 2;                      // a T stroke
+      if (cell == 2 && cx >= 4 && cx < 16 && cy >= 4 && cy < 14) v = cx < 6 || cy > 11 ? 3 : 1;  // a box
+      if (cell == 3 && (cx + cy) % 6 == 0 && cy < 16) v = 3;                        // a diagonal
+      if (cell == 4 && cx % 4 < 2 && cy % 4 < 2) v = 1;                             // dots
+      f.y[r * f.stride_y() + c] = ink[v];
+    }
+  std::fill(f.u.begin(), f.u.end(), 128);
+  std::fill(f.v.begin(), f.v.end(), 128);
+  pad_frame(f);
+  return f;
 }

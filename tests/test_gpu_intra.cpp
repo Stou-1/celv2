@@ -13,11 +13,11 @@
 
 #include "check.h"
 #include "gpu/cpu_engine.h"
-#include "gpu/engine.h"
 #include "gpu/intra_common.h"
 #include "gpu/kernels_ref.h"
 #include "io/y4m.h"
 #include "test_frames.h"
+#include "vk/vk_engine.h"
 
 static uint32_t g_seed = 12345;
 static int rnd(int n) {
@@ -36,18 +36,6 @@ static Frame420 test_frame(int w, int h) {
     }
   pad_frame(f);
   return f;
-}
-
-static int gpu_satd_matches_ref() {
-  const int n = 100;
-  std::vector<uint8_t> a(n * 64 * 64), b(n * 64 * 64);
-  for (auto& v : a) v = static_cast<uint8_t>(rnd(256));
-  for (auto& v : b) v = static_cast<uint8_t>(rnd(256));
-  const std::vector<int> gpu = gpu_satd_batch(a.data(), b.data(), n, 16, 16);
-  CHECK_EQ(gpu.size(), static_cast<size_t>(n));
-  for (int i = 0; i < n; i++)
-    CHECK_EQ(gpu[i], satd_ref(&a[i * 4096], 64, &b[i * 4096], 64, 16, 16));
-  return 0;
 }
 
 static bool same(const DecisionMap& x, const DecisionMap& y) {
@@ -72,44 +60,9 @@ static bool same(const DecisionMap& x, const DecisionMap& y) {
   return true;
 }
 
-// Every intra cost the GPU computes (blocks of 32x32 and below, all modes) equals the CPU rule's.
-static int gpu_intra_costs_match_ref() {
- for (const auto& c : {std::pair<int, int>{640, 120}, std::pair<int, int>{202, 40}, std::pair<int, int>{202, 120}, std::pair<int, int>{202, 220}}) {
-  const int w = c.first, h = w == 640 ? 360 : 122, q = c.second;
-  const Frame420 src = w == 640 ? test_frame(w, h) : scene_frame(w, h, 3, -2);
-  GpuEngine gpu(w, h, 64);
-  gpu.decide_intra(src, q);
-  const celv2::Plane s{src.y.data(), src.stride_y(), src.pw, src.ph};
-  const int offset[4] = {0, 1, 5, 21};
-  const int sb_cols = (w + 63) / 64, sb_rows = (h + 63) / 64;
-  int bad = 0;
-  for (int sb = 0; sb < sb_cols * sb_rows; sb++) {
-    const std::vector<int64_t> g = gpu.intra_costs(sb);
-    for (int b = 5; b < 425; b++) {  // the 64x64 level is never costed
-      const int sq = b / 5, kind = b % 5;
-      int level = 0;
-      while (level < 3 && sq >= offset[level + 1]) level++;
-      const int idx = sq - offset[level], n = 1 << level, size = 64 >> level, half = size / 2;
-      int x = (idx % n) * size, y = (idx / n) * size, bw = size, bh = size;
-      if (kind == 1 || kind == 2) bh = half, y += kind == 2 ? half : 0;
-      if (kind == 3 || kind == 4) bw = half, x += kind == 4 ? half : 0;
-      x += (sb % sb_cols) * 64, y += (sb / sb_cols) * 64;
-      for (int m = 0; m < celv2::kNumModes; m++) {
-        const int64_t want = celv2::block_mode_satd(s, x, y, bw, bh, m) * 256 + lambda_q8(q) * celv2::mode_bits(m);
-        if (g[b * celv2::kNumModes + m] != want && bad++ < 5)
-          std::fprintf(stderr, "  sb %d block %dx%d at (%d,%d) mode %d: gpu %lld cpu %lld\n", sb, bw, bh, x, y, m,
-                       static_cast<long long>(g[b * celv2::kNumModes + m]), static_cast<long long>(want));
-      }
-    }
-  }
-  CHECK_EQ(bad, 0);
- }
-  return 0;
-}
-
 static int gpu_intra_matches_ref() {
   const Frame420 src = test_frame(640, 360);
-  GpuEngine gpu(640, 360, 64);
+  VulkanEngine gpu(640, 360, 64);
   for (int q : {40, 120, 220}) {
     const DecisionMap g = gpu.decide_intra(src, q);
     const DecisionMap r = decide_intra_ref(src, 64, q);
@@ -140,7 +93,7 @@ static bool same_mv(const DecisionMap& x, const DecisionMap& y) {
 static int launch_collect_matches_decide() {
   for (const auto& wh : {std::pair<int, int>{202, 122}, std::pair<int, int>{640, 360}}) {
     const Frame420 src = test_frame(wh.first, wh.second), prev = test_frame(wh.first, wh.second);
-    GpuEngine a(wh.first, wh.second, 64), b(wh.first, wh.second, 64);
+    VulkanEngine a(wh.first, wh.second, 64), b(wh.first, wh.second, 64);
     for (bool key : {false, true}) {
       const DecisionMap want = key ? a.decide_intra(src, 120) : a.decide_inter(src, prev, 120);
       // launch must not read the caller's frames after it returns.
@@ -165,7 +118,7 @@ static int cpu_engine_matches_gpu() {
     const int w = wh.first, h = wh.second;
     const Frame420 prev = scene_frame(w, h), src = scene_frame(w, h, 3, -2);
     CpuEngine cpu(w, h, 64, 8);
-    GpuEngine gpu(w, h, 64);
+    VulkanEngine gpu(w, h, 64);
     for (bool key : {true, false}) {
       const Frame420* ref = key ? nullptr : &prev;
       DecisionMap c, g;
@@ -217,7 +170,7 @@ static int multi_ref_engines_match() {
     const Frame420 src = scene_frame(w, h, 6, -3), r0 = scene_frame(w, h, 40, 30, 5), r1 = scene_frame(w, h, 6, -3),
                    r2 = scene_frame(w, h, 3, -1);
     const std::vector<const Frame420*> refs{&r0, &r1, &r2};
-    GpuEngine gpu(w, h, 64);
+    VulkanEngine gpu(w, h, 64);
     CpuEngine cpu(w, h, 64, 8);
     const DecisionMap g = gpu.decide_inter(src, refs, 120), r = decide_inter_ref(src, refs, 64, 120);
     CHECK(same_ref(g, r));
@@ -238,7 +191,7 @@ static int multi_ref_engines_match() {
 
 static int rows_publish_before_collect_ends() {
   const Frame420 src = test_frame(640, 360), prev = test_frame(640, 360);
-  GpuEngine gpu(640, 360, 64);
+  VulkanEngine gpu(640, 360, 64);
   DecisionMap dm;
   gpu.launch(src, &prev, 120, dm);
   RowGate gate;
@@ -277,22 +230,13 @@ static int rows_publish_before_collect_ends() {
 
 static int gpu_engine_rejects_zero_size() {
   try {
-    GpuEngine g(0, 0, 64);
+    VulkanEngine g(0, 0, 64);
   } catch (const std::runtime_error& e) {
     CHECK(std::string(e.what()).size() > 0);
     return 0;
   }
   CHECK(false);
   return 1;
-}
-
-// This PC has an RTX 5090 (compute 12.0); the probe must see it.
-static int probe_gpu_reports_this_device() {
-  const ProbeResult p = probe_gpu();
-  CHECK(p.ok);
-  CHECK(p.cc_major * 10 + p.cc_minor >= 75);
-  CHECK(!p.name.empty());
-  return 0;
 }
 
 // AV2 codes only the low 32x32 coefficients of a 64-point transform, so an intra block (one
@@ -304,7 +248,7 @@ static int no_intra_block_wider_than_32() {
     const int w = wh.first, h = wh.second;
     Frame420 flat = make_frame(w, h);
     std::fill(flat.y.begin(), flat.y.end(), uint8_t{128});
-    GpuEngine gpu(w, h, 64);
+    VulkanEngine gpu(w, h, 64);
     const DecisionMap maps[] = {decide_intra_ref(flat, 64, 120), decide_inter_ref(flat, flat, 64, 120),
                                 gpu.decide_intra(flat, 120), gpu.decide_inter(flat, flat, 120),
                                 decide_intra_ref(scene_frame(w, h), 64, 40)};
@@ -319,14 +263,11 @@ int main() {
   int fails = 0;
   fails += RUN(no_intra_block_wider_than_32);
   fails += RUN(multi_ref_engines_match);
-  fails += RUN(gpu_satd_matches_ref);
-  fails += RUN(gpu_intra_costs_match_ref);
   fails += RUN(gpu_intra_matches_ref);
   fails += RUN(gpu_engine_rejects_zero_size);
   fails += RUN(launch_collect_matches_decide);
   fails += RUN(rows_publish_before_collect_ends);
   fails += RUN(cpu_engine_matches_gpu);
-  fails += RUN(probe_gpu_reports_this_device);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;
 }

@@ -4,6 +4,11 @@
 
 #include "bitstream/block_writer.h"
 
+#include "core/warp_fit.h"
+#ifdef CELV2_ORACLE
+#include "oracle.h"
+#endif
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -23,8 +28,11 @@ extern "C" {
 #include "av2/common/pred_common.h"
 #include "av2/common/quant_common.h"
 #include "av2/common/reconintra.h"
+#include "av2/common/restoration.h"
 #include "av2/common/scan.h"
+#include "av2/common/secondary_tx.h"
 #include "av2/common/txb_common.h"
+#include "avm_ports/bitops.h"
 }
 
 namespace {
@@ -126,6 +134,14 @@ PARTITION_TYPE BlockWriter::partition(int mi_row, int mi_col, BLOCK_SIZE bsize,
   return rect == HORZ ? PARTITION_HORZ : PARTITION_VERT;
 }
 
+// read_intra_frame_mode_info() / read_inter_frame_mode_info(): use_intrabc where the frame allows
+// IntraBC (--screen) and the block may take it.
+void BlockWriter::use_intrabc(BLOCK_SIZE bsize) {
+  MACROBLOCKD* const xd = xd_;
+  if (xd->tree_type == CHROMA_PART || !av2_allow_intrabc(st_.cm(), xd, bsize)) return;
+  w_->symbol(ibc_.on, xd->tile_ctx->intrabc_cdf[get_intrabc_ctx(xd)], 2);
+}
+
 void BlockWriter::intra_frame_mode_info(const BlockDecision& d) {
   AV2_COMMON* const cm = st_.cm();
   MACROBLOCKD* const xd = xd_;
@@ -137,9 +153,16 @@ void BlockWriter::intra_frame_mode_info(const BlockDecision& d) {
   if (xd->tree_type != CHROMA_PART) mbmi->morph_pred = 0;
   mbmi->motion_mode = SIMPLE_TRANSLATION;
   mbmi->refinemv_flag = 0;
-  mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = 0;  // no IntraBC -> no skip flag
+  ibc_.on = choose_intrabc(d, bsize);
+  use_intrabc(bsize);
+  // read_skip_txfm() for IntraBC (celv2 always codes the residual); none otherwise.
+  if (ibc_.on) w_->symbol(0, ec_ctx->skip_txfm_cdfs[av2_get_skip_txfm_context(xd)], 2);
+  mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = 0;
   if (xd->tree_type != CHROMA_PART) mbmi->segment_id = 0;
   mbmi->seg_id_predicted = 0;
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::filters() && xd->tree_type != CHROMA_PART) import_cdef();
+#endif
   if (cm->seq_params.enable_ccso && xd->tree_type != CHROMA_PART) ccso();
   if (xd->tree_type != CHROMA_PART) delta_qindex();
   mbmi->current_qindex = xd->current_base_qindex;
@@ -151,6 +174,11 @@ void BlockWriter::intra_frame_mode_info(const BlockDecision& d) {
   if (xd->tree_type != CHROMA_PART) mbmi->palette_mode_info.palette_size[0] = 0;
   mbmi->palette_mode_info.palette_size[1] = 0;
   if (xd->tree_type != CHROMA_PART) mbmi->use_intra_dip = 0;
+  if (ibc_.on) {
+    intrabc_info();
+    if (cm->seq_params.enable_refmvbank) av2_update_ref_mv_bank(cm, xd, 1, mbmi);  // av2_read_mode_info()
+    return;
+  }
 
   intra_modes(d);
   if (cm->seq_params.enable_refmvbank) decide_rmb_unit_update_count(cm, xd, mbmi);  // av2_read_mode_info()
@@ -161,6 +189,27 @@ namespace {
 double symbol_bits(const avm_cdf_prob* icdf, int s) {
   const int hi = s > 0 ? icdf[s - 1] : CDF_PROB_TOP, p = hi - icdf[s];
   return std::log2(static_cast<double>(CDF_PROB_TOP) / (p > 0 ? p : 1));
+}
+
+// read_warp_delta()'s four-parameter model: the base, plus (where allow_warp_parameter_signaling())
+// d2 / d3 steps on its zoom / rotation terms (1/32 at warp_precision_idx 0, 1/64 at 1), centred on mv.
+WarpedMotionParams warp_delta_model(const AV2_COMMON* cm, const MB_MODE_INFO* mbmi, const WarpedMotionParams& base,
+                                    bool signal, int precision, int d2, int d3, MV mv, BLOCK_SIZE bsize, int mi_row,
+                                    int mi_col) {
+  WarpedMotionParams p = base;
+  if (signal) {
+    const int step = 1 << (precision ? 10 : 11);  // get_warp_model_steps()
+    p.wmtype = ROTZOOM;
+    p.wmmat[2] = base.wmmat[2] + d2 * step;
+    p.wmmat[3] = base.wmmat[3] + d3 * step;
+    p.wmmat[4] = -p.wmmat[3];
+    p.wmmat[5] = p.wmmat[2];
+  }
+  av2_reduce_warp_model(&p);
+  av2_get_shear_params(&p, get_ref_scale_factors_const(cm, mbmi->ref_frame[0]));
+  p.invalid = 0;
+  av2_set_warp_translation(mi_row, mi_col, bsize, mv, &p);
+  return p;
 }
 }  // namespace
 
@@ -177,6 +226,11 @@ static int mvd_comp_bits(int d) {
 // 0.025 / 0.05 / 0.1: -12.7 / -11.7 / -5.0% BD-rate on anime A 1080p, +1.3 / -1.7 / -2.1% on a
 // close-up 1080p anime (luma and chroma costs, no NEAR bias).
 constexpr double kRdBitWeight = 0.05;
+// How many of the SATD search's joint luma modes the RD search re-scores (BlockWriter::set_intra_rd),
+// mode and line bits at kRdBitWeight. One frame q100-190 against the SATD search alone (Flash f20 /
+// f100 / AIR / AM / Dragon Maid): 4 at 0.2 -9.3 / -10.5 / -3.0 / -3.7 / -3.9%; from there 2 / 8 +1.8 /
+// -0.5% on average, 0.1 / 0.3 -2.2 / +3.0%, 0.05 -3.0%, 0.05 and 8 / 12 / all -4.2 / -4.6 / -4.4%.
+constexpr int kRdModes = 12;
 
 
 double BlockWriter::luma_mode_bits(int mode_idx, int ctx) const {
@@ -200,9 +254,11 @@ int BlockWriter::search_luma_mode(int ctx) {
   double best_cost = 1e300;
   int best = 0, best_dir = -1;
   double best_dir_cost = 1e300;
+  std::vector<std::pair<double, int>> tried;  // SATD cost, joint mode
   auto consider = [&](int joint) {
     const double c = static_cast<double>(intra_cost_(joint)) * 256 + lambda_q8_ * luma_mode_bits(index_of[joint], ctx);
     if (c < best_cost) best_cost = c, best = joint;
+    tried.emplace_back(c, joint);
     return c;
   };
   for (int j = 0; j < NON_DIRECTIONAL_MODES_COUNT; j++) consider(j);
@@ -213,8 +269,172 @@ int BlockWriter::search_luma_mode(int ctx) {
   }
   for (int delta = -MAX_ANGLE_DELTA; delta <= MAX_ANGLE_DELTA; delta++)
     if (delta) consider(NON_DIRECTIONAL_MODES_COUNT + best_dir * TOTAL_ANGLE_DELTA_COUNT + MAX_ANGLE_DELTA + delta);
+  rd_mrl_ = rd_multi_ = 0;
+  if (!intra_rd_) return best;
+  std::sort(tried.begin(), tried.end());
+  const AV2_COMMON* const cm = st_.cm();
+  FRAME_CONTEXT* const ec_ctx = xd_->tile_ctx;
+  const avm_cdf_prob* const line_cdf = ec_ctx->mrl_index_cdf[get_mrl_index_ctx(xd_->neighbors[0], xd_->neighbors[1])];
+  const avm_cdf_prob* const multi_cdf =
+      ec_ctx->multi_line_mrl_cdf[get_multi_line_mrl_index_ctx(xd_->neighbors[0], xd_->neighbors[1])];
+  double least = 1e300;
+  for (size_t i = 0; i < std::min(tried.size(), static_cast<size_t>(kRdModes)); i++) {
+    const int joint = tried[i].second;
+    av2_set_y_mode_and_delta_angle(joint, mbmi);
+    const bool lines = cm->seq_params.enable_mrls && av2_is_directional_mode(mbmi->mode);
+    for (int line = 0; line < (lines ? MRL_LINE_NUMBER : 1); line++)
+      for (int multi = 0; multi < (line ? 2 : 1); multi++) {
+        mbmi->mrl_index = static_cast<uint8_t>(line), mbmi->multi_line_mrl = static_cast<uint8_t>(multi);
+        const double bits = luma_mode_bits(index_of[joint], ctx) +
+                            (lines ? symbol_bits(line_cdf, line) + (line ? symbol_bits(multi_cdf, multi) : 0) : 0);
+        const double c = intra_rd_(joint) + kRdBitWeight * bits;
+        if (c < least) least = c, best = joint, rd_mrl_ = line, rd_multi_ = multi;
+      }
+  }
+  // --screen: the palette candidate (DC_PRED), its colour and map bits besides the mode's.
+  if (palette_src_ && xd_->tree_type != CHROMA_PART &&
+      av2_allow_palette(PLANE_TYPE_Y, cm->features.allow_screen_content_tools, mbmi->sb_type[PLANE_TYPE_Y])) {
+    PALETTE_MODE_INFO* const pmi = &mbmi->palette_mode_info;
+    const int n = palette_src_(pmi->palette_colors);
+    if (n >= PALETTE_MIN_SIZE) {
+      pmi->palette_size[0] = static_cast<uint8_t>(n);
+      mbmi->mrl_index = 0, mbmi->multi_line_mrl = 0;
+      const double bits = luma_mode_bits(index_of[DC_PRED], ctx) + symbol_bits(ec_ctx->palette_y_mode_cdf, 1) +
+                          symbol_bits(ec_ctx->palette_y_size_cdf, n - PALETTE_MIN_SIZE) + palette_colors(false) +
+                          color_map(false);
+      const double c = intra_rd_(DC_PRED) + kRdBitWeight * bits;
+      if (c < least) least = c, best = DC_PRED, rd_mrl_ = rd_multi_ = 0;
+      else pmi->palette_size[0] = 0;
+    }
+  }
+  mbmi->mrl_index = 0, mbmi->multi_line_mrl = 0;
   return best;
 }
+
+void BlockWriter::palette_mode_info() {
+  MB_MODE_INFO* const mbmi = xd_->mi[0];
+  FRAME_CONTEXT* const ec_ctx = xd_->tile_ctx;
+  if (mbmi->mode != DC_PRED || xd_->tree_type == CHROMA_PART) return;
+  const int n = mbmi->palette_mode_info.palette_size[0];
+  w_->symbol(n > 0, ec_ctx->palette_y_mode_cdf, 2);
+  if (!n) return;
+  w_->symbol(n - PALETTE_MIN_SIZE, ec_ctx->palette_y_size_cdf, PALETTE_SIZES);
+  palette_colors(true);
+}
+
+// read_palette_colors_y(): a flag per cache colour (the first of repeats can match) until all are
+// found, then the rest ascending: the first as a literal, the others as deltas less one.
+double BlockWriter::palette_colors(bool write) {
+  const PALETTE_MODE_INFO* const pmi = &xd_->mi[0]->palette_mode_info;
+  const int n = pmi->palette_size[0], bd = st_.cm()->seq_params.bit_depth;
+  uint16_t cache[2 * PALETTE_MAX_SIZE];
+  const int n_cache = av2_get_palette_cache(xd_, 0, cache);
+  bool used[PALETTE_MAX_SIZE] = {};
+  double bits = 0;
+  int in_cache = 0;
+  for (int i = 0; i < n_cache && in_cache < n; i++) {
+    bool repeat = false;
+    for (int j = 0; j < i; j++) repeat = repeat || cache[j] == cache[i];
+    int found = 0;
+    for (int j = 0; j < n && !repeat && !found; j++)
+      if (!used[j] && pmi->palette_colors[j] == cache[i]) used[j] = true, found = 1;
+    bits += 1;
+    if (write) w_->bit(found);
+    in_cache += found;
+  }
+  int rest[PALETTE_MAX_SIZE], m = 0;
+  for (int j = 0; j < n; j++)
+    if (!used[j]) rest[m++] = pmi->palette_colors[j];
+  if (!m) return bits;
+  bits += bd;
+  if (write) w_->literal(rest[0], bd);
+  if (m == 1) return bits;
+  // delta_encode_palette_colors() with min_val 1.
+  const int min_bits = bd - 3;
+  int max_delta = 0;
+  for (int i = 1; i < m; i++) max_delta = std::max(max_delta, rest[i] - rest[i - 1]);
+  int b = std::max(avm_ceil_log2(max_delta), min_bits);
+  int range = (1 << bd) - rest[0] - 1;
+  bits += 2;
+  if (write) w_->literal(b - min_bits, 2);
+  for (int i = 1; i < m; i++) {
+    const int d = rest[i] - rest[i - 1];
+    bits += b;
+    if (write) w_->literal(d - 1, b);
+    range -= d;
+    b = std::min(b, avm_ceil_log2(range));
+  }
+  return bits;
+}
+
+// decode_color_map_tokens(): the direction (where the block is under 64 both ways), then per line
+// (direction 0 rows, 1 columns) its identity flag (2 the line before repeated, 1 one colour, 0
+// coded) and its coded colours: the block's first uniform, the others by their context's order.
+double BlockWriter::map_pass(int direction, bool write) {
+  MB_MODE_INFO* const mbmi = xd_->mi[0];
+  FRAME_CONTEXT* const ec_ctx = xd_->tile_ctx;
+  const int n = mbmi->palette_mode_info.palette_size[0];
+  int width, height, rows, cols;
+  av2_get_block_dimensions(mbmi->sb_type[PLANE_TYPE_Y], 0, xd_, &width, &height, &rows, &cols);
+  uint8_t* const map = xd_->plane[0].color_index_map + xd_->color_index_map_offset[0];
+  auto at = [&](int y, int x) { return map[y * width + x]; };
+  double bits = 0;
+  if (width < 64 && height < 64) {
+    bits += 1;
+    if (write) w_->bit(direction);
+  }
+  const int lim1 = direction ? rows : cols, lim2 = direction ? cols : rows;
+  int prev = 0;
+  for (int a2 = 0; a2 < lim2; a2++) {
+    bool copy = a2 > 0;
+    for (int a1 = 0; a1 < lim1 && copy; a1++) {
+      const int y = direction ? a1 : a2, x = direction ? a2 : a1;
+      copy = direction ? at(y, x - 1) == at(y, x) : at(y - 1, x) == at(y, x);
+    }
+    int flag = copy ? 2 : 1;
+    for (int a1 = 1; a1 < lim1 && flag == 1; a1++) {
+      const int y = direction ? a1 : a2, x = direction ? a2 : a1;
+      if (direction ? at(y - 1, x) != at(y, x) : at(y, x - 1) != at(y, x)) flag = 0;
+    }
+    avm_cdf_prob* const row_cdf = ec_ctx->identity_row_cdf_y[a2 == 0 ? 3 : prev];
+    bits += symbol_bits(row_cdf, flag);
+    if (write) w_->symbol(flag, row_cdf, 3);
+    for (int a1 = 0; a1 < lim1; a1++) {
+      if (flag == 2 || (flag == 1 && a1 > 0)) continue;
+      const int y = direction ? a1 : a2, x = direction ? a2 : a1;
+      if (a2 == 0 && a1 == 0) {  // write_uniform()
+        const int v = at(0, 0), l = get_unsigned_bits(n), m = (1 << l) - n;
+        bits += l - 1 + (v >= m);
+        if (write) {
+          if (v < m) {
+            w_->literal(v, l - 1);
+          } else {
+            w_->literal(m + ((v - m) >> 1), l - 1);
+            w_->literal((v - m) & 1, 1);
+          }
+        }
+        continue;
+      }
+      uint8_t order[PALETTE_MAX_SIZE];
+      int idx = -1;
+      const int ctx = av2_get_palette_color_index_context(map, width, y, x, order, &idx);
+      avm_cdf_prob* const cdf = ec_ctx->palette_y_color_index_cdf[n - PALETTE_MIN_SIZE][ctx];
+      bits += symbol_bits(cdf, idx);
+      if (write) w_->symbol(idx, cdf, n);
+    }
+    prev = flag;
+  }
+  return bits;
+}
+
+double BlockWriter::color_map(bool write) {
+  int width, height;
+  av2_get_block_dimensions(xd_->mi[0]->sb_type[PLANE_TYPE_Y], 0, xd_, &width, &height, nullptr, nullptr);
+  const int direction = width < 64 && height < 64 && map_pass(1, false) < map_pass(0, false);
+  return map_pass(direction, write);
+}
+
+void BlockWriter::palette_tokens() { color_map(true); }
 
 // read_delta_qindex(): at the first block of a superblock (unless it is the whole superblock and
 // skipped), the step from the qindex so far to the superblock's (CodecState::sb_qindex()).
@@ -276,6 +496,9 @@ void BlockWriter::ccso() {
   AV2_COMMON* const cm = st_.cm();
   MACROBLOCKD* const xd = xd_;
   if (cm->features.coded_lossless) return;
+#ifdef CELV2_ORACLE
+  const celv2::oracle::Frame* const of = celv2::oracle::filters() ? celv2::oracle::frame(static_cast<int>(cm->current_frame.display_order_hint)) : nullptr;
+#endif
   const CommonModeInfoParams* const mi = &cm->mi_params;
   const int log2 = get_ccso_unit_size_log2_adaptive_tile(cm, cm->mib_size_log2 + MI_SIZE_LOG2, CCSO_BLK_SIZE);
   const int mask = (1 << (log2 - MI_SIZE_LOG2)) - 1;
@@ -288,7 +511,13 @@ void BlockWriter::ccso() {
     auto get = [p](const MB_MODE_INFO* m) { return p == 0 ? m->ccso_blk_y : p == 1 ? m->ccso_blk_u : m->ccso_blk_v; };
     auto set = [p](MB_MODE_INFO* m, int v) { (p == 0 ? void(m->ccso_blk_y = v) : p == 1 ? void(m->ccso_blk_u = v) : void(m->ccso_blk_v = v)); };
     if (unit_start) {
+#ifdef CELV2_ORACLE
+      const int f0 = 1 << log2 >> MI_SIZE_LOG2;
+      const int blk_idc = of ? of->ccso_flags[p][(mi_row / f0) * ((mi->mi_cols + f0 - 1) / f0) + mi_col / f0] : 1;
+      if (!of || !cm->ccso_info.sb_reuse_ccso[p])
+#else
       constexpr int blk_idc = 1;
+#endif
       w_->symbol(blk_idc, xd->tile_ctx->ccso_cdf[p][av2_get_ccso_context(cm, xd, p)], 2);
       (p == 0 ? xd->ccso_blk_y : p == 1 ? xd->ccso_blk_u : xd->ccso_blk_v) = blk_idc;
       set(first, blk_idc);
@@ -321,7 +550,11 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
     mbmi->fsc_mode[xd->tree_type == CHROMA_PART] = 0;
     mbmi->mrl_index = 0;
     mbmi->multi_line_mrl = 0;
+#ifdef CELV2_ORACLE
+    const int joint = d.imp ? d.imp->joint : intra_cost_ ? search_luma_mode(context) : joint_y_mode(d.intra);
+#else
     const int joint = intra_cost_ ? search_luma_mode(context) : joint_y_mode(d.intra);
+#endif
     int mode_idx = -1;
     for (int i = 0; i < LUMA_MODE_COUNT; i++)
       if (mbmi->y_intra_mode_list[i] == joint) mode_idx = i;
@@ -343,11 +576,17 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
     av2_set_y_mode_and_delta_angle(joint, mbmi);
     mbmi->y_mode_idx = mode_idx;
     // read_fsc_mode(): celv2 codes no intra block with forward skip coding.
+#ifdef CELV2_ORACLE
+    const int fsc = d.imp && celv2::oracle::level() >= 5 && allow_fsc_intra(cm, bsize, mbmi) ? d.imp->fsc : 0;
+#else
+    constexpr int fsc = 0;
+#endif
     mbmi->fsc_mode[xd->tree_type == CHROMA_PART] = 0;
     if (allow_fsc_intra(cm, bsize, mbmi))
-      w_->symbol(0,
+      w_->symbol(fsc,
                        get_fsc_mode_cdf(xd, bsize, frame_is_intra_only(cm) || mbmi->region_type == INTRA_REGION),
                        FSC_MODES);
+    mbmi->fsc_mode[xd->tree_type == CHROMA_PART] = fsc;
     // read_mrl_index() / read_multi_line_mrl(): the reference line of a directional mode (1-3 above
     // and left of the nearest), alone or averaged with line 0, by the search's cost.
     mbmi->mrl_index = 0;
@@ -356,7 +595,9 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
       avm_cdf_prob* const line_cdf = ec_ctx->mrl_index_cdf[get_mrl_index_ctx(xd->neighbors[0], xd->neighbors[1])];
       avm_cdf_prob* const multi_cdf =
           ec_ctx->multi_line_mrl_cdf[get_multi_line_mrl_index_ctx(xd->neighbors[0], xd->neighbors[1])];
-      if (intra_cost_) {
+      if (intra_rd_) {
+        mbmi->mrl_index = static_cast<uint8_t>(rd_mrl_), mbmi->multi_line_mrl = static_cast<uint8_t>(rd_multi_);
+      } else if (intra_cost_) {
         double best = 1e300;
         int best_line = 0, best_multi = 0;
         for (int line = 0; line < MRL_LINE_NUMBER; line++)
@@ -369,6 +610,9 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
         mbmi->mrl_index = static_cast<uint8_t>(best_line), mbmi->multi_line_mrl = best_multi;
         av2_set_y_mode_and_delta_angle(joint, mbmi);  // intra_cost_ set it too; keep the chosen one
       }
+#ifdef CELV2_ORACLE
+      if (d.imp) mbmi->mrl_index = d.imp->mrl, mbmi->multi_line_mrl = d.imp->multi_mrl != 0;
+#endif
       w_->symbol(mbmi->mrl_index, line_cdf, MRL_LINE_NUMBER);
       if (mbmi->mrl_index) w_->symbol(mbmi->multi_line_mrl, multi_cdf, 2);
     }
@@ -376,24 +620,152 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
 
   if (xd->tree_type != LUMA_PART) {
     if (!cm->seq_params.monochrome && xd->is_chroma_ref) {
-      // read_intra_uv_mode() with CfL/MHCCP not allowed.
-      if (is_cfl_allowed(cm->seq_params.enable_cfl_intra, xd) || is_mhccp_allowed(cm, xd))
-        throw std::runtime_error("CfL is disabled but reported allowed");
+      // read_intra_uv_mode() and the CfL index (CfL only with the derived scaling factors) or the
+      // MHCCP filter direction.
+      const bool cfl_ok = is_cfl_allowed(cm->seq_params.enable_cfl_intra, xd) != CFL_DISALLOWED;
+      const bool mh_ok = is_mhccp_allowed(cm, xd) != MHCCP_DISALLOWED;
+      // The CfL/MHCCP switch: coded where MHCCP is allowed and the sequence enables CfL.
+      const bool mh_switch = mh_ok && cm->seq_params.enable_cfl_intra;
+      avm_cdf_prob* const mh_dir_cdf = ec_ctx->filter_dir_cdf[size_group_lookup[bsize]];
       get_uv_intra_mode_set(mbmi);
       // The luma mode's chroma counterpart (the enums share their first 13 values).
-      const UV_PREDICTION_MODE uv = intra_cost_ ? static_cast<UV_PREDICTION_MODE>(mbmi->mode) : uv_mode_of(d.intra);
-      int idx = -1;
-      for (int i = 0; i < UV_INTRA_MODES - 1; i++)
-        if (mbmi->uv_intra_mode_list[i] == uv) idx = i;
-      if (idx < 0) throw std::runtime_error("chroma mode not in the mode list");
+      UV_PREDICTION_MODE uv = intra_cost_ ? static_cast<UV_PREDICTION_MODE>(mbmi->mode) : uv_mode_of(d.intra);
       const int context = av2_is_directional_mode(mbmi->mode) ? 1 : 0;
-      const int first = idx < CHROMA_INTRA_MODE_INDEX_COUNT - 1 ? idx
-                                                                : CHROMA_INTRA_MODE_INDEX_COUNT - 1;
-      w_->symbol(first, ec_ctx->uv_mode_cdf[context], CHROMA_INTRA_MODE_INDEX_COUNT);
-      if (first == CHROMA_INTRA_MODE_INDEX_COUNT - 1) w_->literal(idx - first, 3);
-      mbmi->uv_mode = uv;
-      mbmi->angle_delta[PLANE_TYPE_UV] =
-          mbmi->uv_mode == mbmi->mode ? mbmi->angle_delta[PLANE_TYPE_Y] : 0;
+      avm_cdf_prob* const cfl_cdf = cfl_ok || mh_ok ? ec_ctx->cfl_cdf[get_cfl_ctx(xd)] : nullptr;
+      // uv_mode_idx's bits: the index symbol, and 3 literal bits past the last indexed one.
+      auto uv_bits = [&](int i) {
+        const int first = AVMMIN(i, CHROMA_INTRA_MODE_INDEX_COUNT - 1);
+        return symbol_bits(ec_ctx->uv_mode_cdf[context], first) + (first == CHROMA_INTRA_MODE_INDEX_COUNT - 1 ? 3 : 0) +
+               (cfl_cdf ? symbol_bits(cfl_cdf, 0) : 0);
+      };
+      int cfl_idx = CFL_DERIVED_ALPHA, mh_dir = 0;
+      int8_t alpha_signs = 0;  // CFL_EXPLICIT's joint sign and index (read_cfl_alphas())
+      uint8_t alpha_idx = 0;
+#ifdef CELV2_ORACLE
+      if (d.imp) {
+        uv = static_cast<UV_PREDICTION_MODE>(d.imp->uv_mode), cfl_idx = d.imp->cfl_idx, mh_dir = d.imp->mh_dir;
+        alpha_signs = d.imp->cfl_alpha_signs, alpha_idx = d.imp->cfl_alpha_idx;
+        if (uv == UV_CFL_PRED && (cfl_idx == CFL_MULTI_PARAM ? !mh_ok : !cfl_ok)) uv = UV_DC_PRED, celv2::oracle::count(celv2::oracle::kCflLost, block_area());
+      }
+#endif
+      // --cfl-rd's shortlist: (SATD cost, mode, CfL type, MHCCP direction, bits).
+      struct Cand {
+        double c;
+        UV_PREDICTION_MODE m;
+        int cfl_idx, mh_dir;
+        double bits;
+      };
+      std::vector<Cand> shortlist;
+      if (intra_cost_ && uv_cost_) {
+        double best = 1e300;
+        for (int i = 0; i < UV_INTRA_MODES - 1; i++) {
+          const UV_PREDICTION_MODE m = static_cast<UV_PREDICTION_MODE>(mbmi->uv_intra_mode_list[i]);
+          const double c = static_cast<double>(uv_cost_(m)) * 256 + lambda_q8_ * uv_bits(i);
+          if (c < best) best = c, uv = m;
+          if (uv_rd_) shortlist.push_back(Cand{c, m, CFL_EXPLICIT, 0, uv_bits(i)});
+        }
+        if (uv_rd_) {
+          std::sort(shortlist.begin(), shortlist.end(), [](const Cand& a, const Cand& b) { return a.c < b.c; });
+          if (shortlist.size() > 4) shortlist.resize(4);
+        }
+        if (cfl_ok) {
+          mbmi->cfl_idx = CFL_DERIVED_ALPHA;
+          // The estimate predicts from the source luma (UvCost), better than the reconstruction it
+          // will be: x1.2 its SATD (33 frames 1080p q100-190, YUV 6:1:1 BD-rate AM / live action / AIR:
+          // x1 +0.65 / +1.78 / -7.39%, x1.2 0.00 / +1.22 / -6.42%, x1.5 +0.03 / +0.26 / -1.39%).
+          const double kc = cfl_factor_;
+          const double bits = symbol_bits(cfl_cdf, 1) + (mh_switch ? symbol_bits(ec_ctx->cfl_mhccp_cdf, 0) : 0) +
+                              symbol_bits(ec_ctx->cfl_index_cdf, CFL_DERIVED_ALPHA);
+          const double c = kc * static_cast<double>(uv_cost_(UV_CFL_PRED)) * 256 + lambda_q8_ * bits;
+          if (c < best) best = c, uv = UV_CFL_PRED, cfl_idx = CFL_DERIVED_ALPHA;
+          if (uv_rd_) shortlist.push_back(Cand{c, UV_CFL_PRED, CFL_DERIVED_ALPHA, 0, bits});
+        }
+        Cand mh_best{1e300, UV_CFL_PRED, CFL_MULTI_PARAM, 0, 0};
+        // MHCCP's filter, from the same source-luma estimate as CfL's, x1.2 likewise.
+        for (int dir = 0; mh_ok && dir < MHCCP_MODE_NUM; dir++) {
+          mbmi->cfl_idx = CFL_MULTI_PARAM;
+          mbmi->mh_dir = static_cast<uint8_t>(dir);
+          const double kc = cfl_factor_;
+          const double bits = symbol_bits(cfl_cdf, 1) + (mh_switch ? symbol_bits(ec_ctx->cfl_mhccp_cdf, 1) : 0) +
+                              symbol_bits(mh_dir_cdf, dir);
+          const double c = kc * static_cast<double>(uv_cost_(UV_CFL_PRED)) * 256 + lambda_q8_ * bits;
+          if (c < best) best = c, uv = UV_CFL_PRED, cfl_idx = CFL_MULTI_PARAM, mh_dir = dir;
+          if (c < mh_best.c) mh_best = Cand{c, UV_CFL_PRED, CFL_MULTI_PARAM, dir, bits};
+        }
+        if (uv_rd_ && mh_best.c < 1e300) shortlist.push_back(mh_best);
+        if (uv_rd_) {  // the shortlist by quantized cost (mbmi's CfL type set for each)
+          double least = 1e300;
+          for (const Cand& k : shortlist) {
+            mbmi->cfl_idx = static_cast<uint8_t>(k.cfl_idx), mbmi->mh_dir = static_cast<uint8_t>(k.mh_dir);
+            const double j = uv_rd_(k.m) + kRdBitWeight * k.bits;
+            if (j < least) least = j, uv = k.m, cfl_idx = k.m == UV_CFL_PRED ? k.cfl_idx : CFL_DERIVED_ALPHA, mh_dir = k.mh_dir;
+          }
+          // The signalled alpha: each plane's derived alpha (in eighths, q3 << CFL_ADD_BITS_ALPHA)
+          // rounded, and one step either side, U and V together.
+          if (cfl_ok) {
+            mbmi->cfl_idx = CFL_DERIVED_ALPHA;
+            uv_rd_(UV_CFL_PRED);  // sets cfl_implicit_alpha
+            auto eighths = [](int a) { return std::clamp(static_cast<int>(std::lround(a / static_cast<double>(1 << CFL_ADD_BITS_ALPHA))), -CFL_ALPHABET_SIZE, CFL_ALPHABET_SIZE); };
+            const int cu = eighths(mbmi->cfl_implicit_alpha[0]), cv = eighths(mbmi->cfl_implicit_alpha[1]);
+            const double head = symbol_bits(cfl_cdf, 1) + (mh_switch ? symbol_bits(ec_ctx->cfl_mhccp_cdf, 0) : 0) +
+                                symbol_bits(ec_ctx->cfl_index_cdf, CFL_EXPLICIT);
+            std::vector<std::pair<int, int>> tried;  // the clamp can repeat a pair
+            for (int du = -1; du <= 1; du++)
+              for (int dv = -1; dv <= 1; dv++) {
+                const int au = std::clamp(cu + du, -CFL_ALPHABET_SIZE, CFL_ALPHABET_SIZE);
+                const int av = std::clamp(cv + dv, -CFL_ALPHABET_SIZE, CFL_ALPHABET_SIZE);
+                if ((!au && !av) || std::find(tried.begin(), tried.end(), std::pair{au, av}) != tried.end()) continue;
+                tried.emplace_back(au, av);
+                const int su = au == 0 ? CFL_SIGN_ZERO : au < 0 ? CFL_SIGN_NEG : CFL_SIGN_POS;
+                const int sv = av == 0 ? CFL_SIGN_ZERO : av < 0 ? CFL_SIGN_NEG : CFL_SIGN_POS;
+                const int js = su * CFL_SIGNS + sv - 1;
+                const int idx = (au ? (std::abs(au) - 1) << CFL_ALPHABET_SIZE_LOG2 : 0) + (av ? std::abs(av) - 1 : 0);
+                double bits = head + symbol_bits(ec_ctx->cfl_sign_cdf, js);
+                if (au) bits += symbol_bits(ec_ctx->cfl_alpha_cdf[CFL_CONTEXT_U(js)], CFL_IDX_U(idx));
+                if (av) bits += symbol_bits(ec_ctx->cfl_alpha_cdf[CFL_CONTEXT_V(js)], CFL_IDX_V(idx));
+                mbmi->cfl_idx = CFL_EXPLICIT;
+                mbmi->cfl_alpha_signs = static_cast<int8_t>(js), mbmi->cfl_alpha_idx = static_cast<uint8_t>(idx);
+                const double j = uv_rd_(UV_CFL_PRED) + kRdBitWeight * bits;
+                if (j < least) least = j, uv = UV_CFL_PRED, cfl_idx = CFL_EXPLICIT, alpha_signs = static_cast<int8_t>(js), alpha_idx = static_cast<uint8_t>(idx);
+              }
+          }
+        }
+      }
+      if (cfl_cdf) w_->symbol(uv == UV_CFL_PRED, cfl_cdf, 2);
+      if (uv == UV_CFL_PRED) {
+        if (cfl_idx == CFL_MULTI_PARAM ? !mh_ok : !cfl_ok) throw std::runtime_error("CfL where it is not allowed");
+        if (mh_switch) w_->symbol(cfl_idx == CFL_MULTI_PARAM, ec_ctx->cfl_mhccp_cdf, CFL_MHCCP_SWITCH_NUM);
+        if (cfl_idx == CFL_MULTI_PARAM) {
+          w_->symbol(mh_dir, mh_dir_cdf, MHCCP_MODE_NUM);
+        } else {
+          w_->symbol(cfl_idx, ec_ctx->cfl_index_cdf, CFL_TYPE_COUNT - 1);
+          if (cfl_idx == CFL_EXPLICIT) {
+            w_->symbol(alpha_signs, ec_ctx->cfl_sign_cdf, CFL_JOINT_SIGNS);
+            if (CFL_SIGN_U(alpha_signs) != CFL_SIGN_ZERO)
+              w_->symbol(CFL_IDX_U(alpha_idx), ec_ctx->cfl_alpha_cdf[CFL_CONTEXT_U(alpha_signs)], CFL_ALPHABET_SIZE);
+            if (CFL_SIGN_V(alpha_signs) != CFL_SIGN_ZERO)
+              w_->symbol(CFL_IDX_V(alpha_idx), ec_ctx->cfl_alpha_cdf[CFL_CONTEXT_V(alpha_signs)], CFL_ALPHABET_SIZE);
+            mbmi->cfl_alpha_signs = alpha_signs, mbmi->cfl_alpha_idx = alpha_idx;
+          }
+        }
+        mbmi->uv_mode = UV_CFL_PRED;
+        mbmi->cfl_idx = static_cast<uint8_t>(cfl_idx);
+        mbmi->mh_dir = static_cast<uint8_t>(mh_dir);
+        mbmi->angle_delta[PLANE_TYPE_UV] = 0;
+      } else {
+        int idx = -1;
+        for (int i = 0; i < UV_INTRA_MODES - 1; i++)
+          if (mbmi->uv_intra_mode_list[i] == uv) idx = i;
+        if (idx < 0) throw std::runtime_error("chroma mode not in the mode list");
+        const int first = idx < CHROMA_INTRA_MODE_INDEX_COUNT - 1 ? idx
+                                                                  : CHROMA_INTRA_MODE_INDEX_COUNT - 1;
+        w_->symbol(first, ec_ctx->uv_mode_cdf[context], CHROMA_INTRA_MODE_INDEX_COUNT);
+        if (first == CHROMA_INTRA_MODE_INDEX_COUNT - 1) w_->literal(idx - first, 3);
+        mbmi->uv_mode = uv;
+        mbmi->cfl_idx = CFL_EXPLICIT;
+        mbmi->angle_delta[PLANE_TYPE_UV] =
+            mbmi->uv_mode == mbmi->mode ? mbmi->angle_delta[PLANE_TYPE_Y] : 0;
+      }
       mbmi->use_dpcm_uv = 0;
       mbmi->dpcm_mode_uv = 0;
     } else {
@@ -403,10 +775,13 @@ void BlockWriter::intra_modes(const BlockDecision& d) {
   } else {
     mbmi->uv_mode = UV_DC_PRED;
   }
-  if (xd->tree_type != CHROMA_PART) mbmi->palette_mode_info.palette_size[0] = 0;
+  // The luma palette search_luma_mode() chose (DC_PRED only), else none.
+  if (xd->tree_type != CHROMA_PART && mbmi->mode != DC_PRED) mbmi->palette_mode_info.palette_size[0] = 0;
   mbmi->palette_mode_info.palette_size[1] = 0;
   if (av2_allow_palette(PLANE_TYPE_Y, cm->features.allow_screen_content_tools, bsize))
-    throw std::runtime_error("palette is not supported");
+    palette_mode_info();
+  else if (xd->tree_type != CHROMA_PART)
+    mbmi->palette_mode_info.palette_size[0] = 0;
   if (xd->tree_type != CHROMA_PART) mbmi->use_intra_dip = 0;  // DIP disabled
 }
 
@@ -418,6 +793,9 @@ void BlockWriter::inter_frame_mode_info(const BlockDecision& d) {
   MB_MODE_INFO* const mbmi = xd->mi[0];
   FRAME_CONTEXT* ec_ctx = xd->tile_ctx;
   const BLOCK_SIZE bsize = mbmi->sb_type[PLANE_TYPE_Y];
+#ifdef CELV2_ORACLE
+  imp_ = d.imp;
+#endif
   mbmi->mv[0].as_int = 0;
   mbmi->mv[1].as_int = 0;
   xd->submi[0]->mv[0].as_int = xd->submi[0]->mv[1].as_int = 0;
@@ -446,6 +824,11 @@ void BlockWriter::inter_frame_mode_info(const BlockDecision& d) {
   // read_skip_mode(), decided once the fields above (which the prediction reads) are reset
   int skip_idx = -1;
   if (is_skip_mode_allowed(cm, xd)) {
+#ifdef CELV2_ORACLE
+    if (d.imp) {
+      if (d.imp->skip_mode && (skip_idx = choose_skip_mode(d)) < 0) celv2::oracle::count(celv2::oracle::kSkipLost, block_area());
+    } else
+#endif
     if (d.inter && rd_cost_) skip_idx = choose_skip_mode(d);
     w_->symbol(skip_idx >= 0, ec_ctx->skip_mode_cdfs[av2_get_skip_mode_context(xd)], 2);
   }
@@ -463,15 +846,25 @@ void BlockWriter::inter_frame_mode_info(const BlockDecision& d) {
     const int ctx = av2_get_intra_inter_context(xd);
     w_->symbol(inter, ec_ctx->intra_inter_cdf[ctx], 2);
   }
+  ibc_.on = !inter && !d.inter && choose_intrabc(d, mbmi->sb_type[xd->tree_type == CHROMA_PART]);
+  if (!inter) use_intrabc(mbmi->sb_type[xd->tree_type == CHROMA_PART]);
   // Where AV2 forces the choice: forced intra uses DC, forced inter codes NEARMV index 0.
   BlockDecision dd = d;
   if (!inter && d.inter) dd = BlockDecision{d.w4, d.h4, false, IntraMode::DC, 0, 0};
   const bool force_near = inter && !d.inter;
-  if (inter) {
+#ifdef CELV2_ORACLE
+  const int skip_txfm = inter && d.imp && d.imp->skip_txfm && celv2::oracle::level() >= 5;
+#else
+  constexpr int skip_txfm = 0;
+#endif
+  if (inter || ibc_.on) {
     // read_skip_txfm(): celv2 always codes the residual (all-zero blocks via the txb skip flags).
-    w_->symbol(0, ec_ctx->skip_txfm_cdfs[av2_get_skip_txfm_context(xd)], 2);
+    w_->symbol(skip_txfm, ec_ctx->skip_txfm_cdfs[av2_get_skip_txfm_context(xd)], 2);
   }
-  mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = 0;
+  mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = skip_txfm;
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::filters() && xd->tree_type != CHROMA_PART) import_cdef();
+#endif
   if (cm->seq_params.enable_ccso && xd->tree_type != CHROMA_PART) ccso();  // after read_cdef()
   if (xd->tree_type != CHROMA_PART) delta_qindex();
   mbmi->six_param_warp_model_flag = 0;
@@ -484,6 +877,15 @@ void BlockWriter::inter_frame_mode_info(const BlockDecision& d) {
   if (inter) {
     inter_block_mode_info(dd, force_near, skip_idx);
     // av2_read_mode_info()
+    if (cm->seq_params.enable_refmvbank) av2_update_ref_mv_bank(cm, xd, 1, mbmi);
+    av2_update_warp_param_bank(cm, xd, 0, mbmi);
+    return;
+  }
+  if (ibc_.on) {
+    mbmi->palette_mode_info.palette_size[0] = 0;
+    mbmi->palette_mode_info.palette_size[1] = 0;
+    intrabc_info();
+    // av2_read_mode_info(): an IntraBC block counts as inter.
     if (cm->seq_params.enable_refmvbank) av2_update_ref_mv_bank(cm, xd, 1, mbmi);
     av2_update_warp_param_bank(cm, xd, 0, mbmi);
     return;
@@ -645,7 +1047,7 @@ int BlockWriter::skip_levels_and_signs(int plane, TX_SIZE tx_size, TX_TYPE tx_ty
   return cul_level;
 }
 
-// decodetxb.c av2_read_coeffs_txb() with IST and parity hiding off.
+// decodetxb.c av2_read_coeffs_txb() with parity hiding off (the IST symbols: sec_tx_type()).
 int BlockWriter::levels_and_signs(int plane, TX_SIZE tx_size, const TXB_CTX& txb_ctx,
                                   const tran_low_t* qcoeff, int eob, int blk_row, int blk_col) {
   AV2_COMMON* const cm = st_.cm();
@@ -664,10 +1066,6 @@ int BlockWriter::levels_and_signs(int plane, TX_SIZE tx_size, const TXB_CTX& txb
                                           is_reduced_tx_set_used(cm, plane_type));
   const TX_CLASS tx_class = tx_type_to_class[get_primary_tx_type(tx_type)];
   const int16_t* const scan = get_scan(tx_size, tx_type)->scan;
-  if (plane == AVM_PLANE_Y &&
-      (is_inter_block(mbmi, xd->tree_type) ? (eob > 3 && cm->seq_params.enable_inter_ist)
-                                           : (eob != 1 && cm->seq_params.enable_ist)))
-    throw std::runtime_error("IST is disabled but signalled");
   const int tcq_mode =
       tcq_enable(cm->features.tcq_mode, xd->lossless[mbmi->segment_id], plane, tx_class);
   int state = tcq_init_state(tcq_mode);
@@ -832,7 +1230,7 @@ int BlockWriter::levels_and_signs(int plane, TX_SIZE tx_size, const TXB_CTX& txb
 }
 
 int BlockWriter::coeffs(int plane, int blk_row, int blk_col, TX_SIZE tx_size,
-                        const tran_low_t* qcoeff, int eob, TX_TYPE tx_type) {
+                        const tran_low_t* qcoeff, int eob, TX_TYPE tx_type, CctxType cctx) {
   AV2_COMMON* const cm = st_.cm();
   MACROBLOCKD* const xd = xd_;
   MB_MODE_INFO* const mbmi = xd->mi[0];
@@ -860,6 +1258,14 @@ int BlockWriter::coeffs(int plane, int blk_row, int blk_col, TX_SIZE tx_size,
   }
   if (plane == AVM_PLANE_U) xd->eob_u_flag = all_zero ? 0 : 1;
   pre_txb(plane, tx_size);
+  // av2_read_cctx_type(): coded after U's type unless U is all zero or an intra DC level alone.
+  const bool cctx_coded = plane == AVM_PLANE_U && is_cctx_allowed(cm, xd) && !all_zero && (is_inter || eob != 1);
+  if (cctx != CCTX_NONE && !cctx_coded) throw std::runtime_error("a cross-chroma type that cannot be coded");
+  if (plane == AVM_PLANE_U && is_cctx_allowed(cm, xd)) {
+    int row_offset, col_offset;
+    get_chroma_mi_offsets(xd, &row_offset, &col_offset);
+    update_cctx_array(xd, blk_row, blk_col, row_offset, col_offset, tx_size, cctx);
+  }
   int cul_level = 0;
   if (all_zero) {
     if (plane == 0) xd->tx_type_map[blk_row * xd->tx_type_map_stride + blk_col] = DCT_DCT;
@@ -876,19 +1282,25 @@ int BlockWriter::coeffs(int plane, int blk_row, int blk_col, TX_SIZE tx_size,
     eob_symbols(plane, tx_size, eob);
     // av2_read_tx_type(): luma only; intra with reduced_tx_set_used == 2 implies DCT_DCT.
     if (plane == PLANE_TYPE_Y) {
-      xd->tx_type_map[blk_row * xd->tx_type_map_stride + blk_col] = is_inter ? tx_type : DCT_DCT;
+      const TX_TYPE primary = get_primary_tx_type(tx_type);
+      xd->tx_type_map[blk_row * xd->tx_type_map_stride + blk_col] = is_inter ? primary : DCT_DCT;
       const bool dc_skip = !is_inter && eob == 1;
+#ifdef CELV2_ORACLE
+      if (mbmi->fsc_mode[PLANE_TYPE_Y]) {  // av2_read_tx_type(): IDTX, nothing coded
+      } else
+#endif
       if (is_inter)
-        inter_tx_type(tx_size, eob, tx_type);
+        inter_tx_type(tx_size, eob, primary);
       else if (!dc_skip && cm->features.reduced_tx_set_used != 2 &&
                get_ext_tx_types(tx_size, 0, cm->features.reduced_tx_set_used) > 1)
-        intra_tx_type(tx_size, tx_type);
-      else if (tx_type != DCT_DCT)
+        intra_tx_type(tx_size, primary);
+      else if (primary != DCT_DCT)
         throw std::runtime_error("an intra transform type that cannot be coded");
+      xd->tx_type_map[blk_row * xd->tx_type_map_stride + blk_col] = primary;
+      sec_tx_type(tx_size, eob, tx_type);
       xd->tx_type_map[blk_row * xd->tx_type_map_stride + blk_col] = tx_type;
     }
-    if (plane == AVM_PLANE_U && is_cctx_allowed(cm, xd))
-      throw std::runtime_error("CCTX is disabled but reported allowed");
+    if (cctx_coded) w_->symbol(cctx, ec_ctx->cctx_type_cdf, CCTX_TYPES);
     cul_level = fsc ? skip_levels_and_signs(plane, tx_size, tx_type, qcoeff, bob)
                     : levels_and_signs(plane, tx_size, txb_ctx, qcoeff, eob, blk_row, blk_col);
   }
@@ -932,7 +1344,15 @@ void write_mv_magnitude(SymbolLog* w, MV mv_diff, nmv_context* ctx, MvSubpelPrec
   const int shell_set = shell_class >= c0;
   w->symbol(shell_set, ctx->joint_shell_set_cdf, 2);
   if (shell_set) {
+#ifdef CELV2_ORACLE  // L2: avmenc's frames at 1/8 pel
+    if (precision == MV_PRECISION_ONE_EIGHTH_PEL) {
+      w->symbol(std::min(shell_class, MAX_NUM_SHELL_CLASS - 2) - c0, ctx->joint_shell_class_cdf_1[precision], c1 - 1);
+      if (shell_class >= MAX_NUM_SHELL_CLASS - 2)
+        w->symbol(shell_class - (MAX_NUM_SHELL_CLASS - 2), ctx->joint_shell_last_two_classes_cdf, 2);
+    } else
+#else
     if (precision == MV_PRECISION_ONE_EIGHTH_PEL) throw std::runtime_error("1/8-pel MVD unsupported");
+#endif
     w->symbol(shell_class - c0, ctx->joint_shell_class_cdf_1[precision], c1);
   } else {
     w->symbol(shell_class, ctx->joint_shell_class_cdf_0[precision], c0);
@@ -975,6 +1395,131 @@ void mv_clamp_to_integer(MV* mv) {
 }
 
 }  // namespace
+
+// read_intrabc_info()'s mode info before its predictors (av2_find_mv_refs() reads it).
+static void intrabc_defaults(AV2_COMMON* cm, MACROBLOCKD* xd, MB_MODE_INFO* mbmi, BLOCK_SIZE bsize) {
+  mbmi->use_intrabc[0] = 1;
+  mbmi->ref_frame[0] = INTRA_FRAME;
+  mbmi->ref_frame[1] = NONE_FRAME;
+  mbmi->mode = DC_PRED;
+  mbmi->fsc_mode[PLANE_TYPE_Y] = 0;
+  mbmi->fsc_mode[PLANE_TYPE_UV] = 0;
+  mbmi->uv_mode = UV_DC_PRED;
+  mbmi->interp_fltr = BILINEAR;
+  mbmi->motion_mode = SIMPLE_TRANSLATION;
+  set_default_max_mv_precision(mbmi, xd->sbi->sb_mv_precision);
+  set_default_intraBC_bv_precision(cm, mbmi);
+  set_default_precision_set(cm, mbmi, bsize);
+  set_most_probable_mv_precision(cm, mbmi, bsize);
+  mbmi->refinemv_flag = 0;
+  mbmi->bawp_flag[0] = 0;
+  mbmi->bawp_flag[1] = 0;
+}
+
+// Bits of an integer block vector difference (1/8 pel) in the shell MV coder, approximately; -1
+// where the difference is past its classes at whole-pel precision.
+static double dv_diff_bits(MV diff) {
+  const int row = std::abs(diff.row) >> 3, col = std::abs(diff.col) >> 3, shell = row + col;
+  int shell_class = 0;
+  while (shell >= (2 << shell_class)) shell_class++;
+  if (shell_class >= get_default_num_shell_class(MV_PRECISION_ONE_PEL)) return -1;
+  return 2 + shell_class + (shell > 1 ? std::log2(shell) : 0) + (row != 0) + (col != 0);
+}
+
+bool BlockWriter::choose_intrabc(const BlockDecision& d, BLOCK_SIZE bsize) {
+  AV2_COMMON* const cm = st_.cm();
+  MACROBLOCKD* const xd = xd_;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+  if (!ibc_search_ || !intra_rd_ || xd->tree_type == CHROMA_PART || !av2_allow_intrabc(cm, xd, bsize)) return false;
+  constexpr int kCandidates = 8;
+  MV dvs[kCandidates];
+  const int n = ibc_search_(dvs, kCandidates);
+  if (!n) return false;
+  // The decided mode as search_luma_mode() scores it, on its first reference line.
+  mbmi->ref_frame[0] = INTRA_FRAME;
+  mbmi->ref_frame[1] = NONE_FRAME;
+  mbmi->mrl_index = 0, mbmi->multi_line_mrl = 0;
+  mbmi->fsc_mode[PLANE_TYPE_Y] = 0;
+  mbmi->use_intra_dip = 0;
+  mbmi->palette_mode_info.palette_size[0] = 0;
+  const int ctx = get_intrabc_ctx(xd);
+  double best = intra_rd_(joint_y_mode(d.intra)) + kRdBitWeight * symbol_bits(ec_ctx->intrabc_cdf[ctx], 0);
+  const double ibc_bits = symbol_bits(ec_ctx->intrabc_cdf[ctx], 1);
+  intrabc_defaults(cm, xd, mbmi, bsize);
+  int_mv ref_mvs[INTRA_FRAME + 1][MAX_MV_REF_CANDIDATES];
+  av2_find_mv_refs(cm, xd, mbmi, INTRA_FRAME, ref_mv_count_, xd->ref_mv_stack, xd->weight, ref_mvs, nullptr, nullptr, 0,
+                   nullptr);
+  const int max_cnt = cm->features.max_bvp_drl_bits + 1;
+  bool on = false;
+  for (int i = 0; i < n; i++) {
+    const double pred = ibc_rd_(dvs[i]);
+    if (pred + kRdBitWeight * ibc_bits >= best) continue;
+    for (int drl = 0; drl < max_cnt; drl++) {
+      const MV stack = xd->ref_mv_stack[INTRA_FRAME][drl].this_mv.as_mv;
+      if (stack.row == 0 && stack.col == 0) continue;  // the decoder's assert: never a zero predictor
+      double bits = ibc_bits + (drl < max_cnt - 1 ? drl + 1 : drl);
+      MV ref = stack;
+      const int mode = dvs[i].row == stack.row && dvs[i].col == stack.col;
+      if (mode) {
+        bits += symbol_bits(ec_ctx->intrabc_mode_cdf, 1);
+      } else {
+        lower_mv_precision(&ref, MV_PRECISION_ONE_PEL);
+        const double b = dv_diff_bits(MV{static_cast<MV_COMP_DATA_TYPE>(dvs[i].row - ref.row), static_cast<MV_COMP_DATA_TYPE>(dvs[i].col - ref.col)});
+        if (b < 0) continue;
+        bits += symbol_bits(ec_ctx->intrabc_mode_cdf, 0) + b +
+                (is_intraBC_bv_precision_active(cm, 0) ? symbol_bits(ec_ctx->intrabc_bv_precision_cdf[0], 0) : 0);
+      }
+      const double c = pred + kRdBitWeight * bits;
+      if (c < best) best = c, on = true, ibc_ = IntraBc{true, dvs[i], mode, drl, ref};
+    }
+  }
+  if (!on) mbmi->use_intrabc[0] = 0;
+  return on;
+}
+
+void BlockWriter::intrabc_info() {
+  AV2_COMMON* const cm = st_.cm();
+  MACROBLOCKD* const xd = xd_;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+  intrabc_defaults(cm, xd, mbmi, mbmi->sb_type[PLANE_TYPE_Y]);
+  int_mv ref_mvs[INTRA_FRAME + 1][MAX_MV_REF_CANDIDATES];
+  av2_find_mv_refs(cm, xd, mbmi, INTRA_FRAME, ref_mv_count_, xd->ref_mv_stack, xd->weight, ref_mvs, nullptr, nullptr, 0,
+                   nullptr);
+  mbmi->intrabc_mode = static_cast<uint8_t>(ibc_.mode);
+  w_->symbol(ibc_.mode, ec_ctx->intrabc_mode_cdf, 2);
+  // read_intrabc_drl_idx(): unary, bypass bits.
+  const int max_cnt = cm->features.max_bvp_drl_bits + 1;
+  for (int idx = 0; idx < max_cnt - 1; ++idx) {
+    const int bit = ibc_.drl > idx;
+    w_->bit(bit);
+    if (!bit) break;
+  }
+  mbmi->intrabc_drl_idx = static_cast<uint8_t>(ibc_.drl);
+  const MV stack = xd->ref_mv_stack[INTRA_FRAME][ibc_.drl].this_mv.as_mv;
+  if (ibc_.mode ? stack.row != ibc_.dv.row || stack.col != ibc_.dv.col : stack.row == 0 && stack.col == 0)
+    throw std::logic_error("IntraBC predictors differ from the search's");
+  if (is_intraBC_bv_precision_active(cm, ibc_.mode)) {  // whole pels (index 0)
+    w_->symbol(0, ec_ctx->intrabc_bv_precision_cdf[0], av2_intraBc_precision_sets.num_precisions);
+    mbmi->pb_mv_precision = av2_intraBc_precision_sets.precision[0];
+  }
+  if (!ibc_.mode) {  // assign_dv(): the difference, then its signs
+    const MV diff{static_cast<MV_COMP_DATA_TYPE>(ibc_.dv.row - ibc_.ref.row), static_cast<MV_COMP_DATA_TYPE>(ibc_.dv.col - ibc_.ref.col)};
+    write_mv_magnitude(w_, diff, &ec_ctx->ndvc, mbmi->pb_mv_precision);
+    if (diff.row) w_->literal(diff.row < 0, 1);
+    if (diff.col) w_->literal(diff.col < 0, 1);
+  }
+  mbmi->mv[0].as_mv = ibc_.dv;
+  mbmi->mv[1].as_int = 0;
+  if (!av2_is_dv_valid(ibc_.dv, cm, xd, xd->mi_row, xd->mi_col, mbmi->sb_type[PLANE_TYPE_Y], cm->mib_size_log2))
+    throw std::logic_error("IntraBC vector not valid");
+  mbmi->morph_pred = 0;
+  if (av2_allow_intrabc_morph_pred(cm)) w_->symbol(0, ec_ctx->morph_pred_cdf[get_morph_pred_ctx(xd)], 2);
+  mbmi->use_dpcm_y = 0;
+  mbmi->dpcm_mode_y = 0;
+  mbmi->use_amvd = 0;
+}
 
 bool BlockWriter::compound_codable(int r0, int r1) const {
   const RefFramesInfo& info = st_.cm()->ref_frames_info;
@@ -1043,6 +1588,118 @@ static bool bawp_template_inside(const MACROBLOCKD* xd, BLOCK_SIZE bsize, MV mv)
         x + w + dx + kSlack > pd->dst.width || y + h + dy + kSlack > pd->dst.height)
       return false;
   }
+  return true;
+}
+
+// WARP_NEWMV with WARP_DELTA against *best, the block's best cost so far: an MV coded as for NEWMV (c,
+// the DRL candidate new_idx), the prediction warped by a model from the warp candidate list, index 0
+// with coded steps on its two terms. Tried: the rotation / zoom fitted to the engine's MVs under the
+// block, its terms and MV one step either way, and the neighbours' models as they are.
+bool BlockWriter::choose_warp(int ref, MV c, MV wanted, int new_idx, int16_t mode_ctx, double* best, WarpChoice* out) {
+  AV2_COMMON* const cm = st_.cm();
+  MACROBLOCKD* const xd = xd_;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+  const BLOCK_SIZE bsize = mbmi->sb_type[PLANE_TYPE_Y];
+  const MV_REFERENCE_FRAME ref_frame = av2_ref_frame_type(mbmi->ref_frame);
+  mbmi->mode = WARP_NEWMV;
+  if (motion_mode_allowed(cm, xd, xd->ref_mv_stack[ref_frame], mbmi) != (1 << WARP_DELTA)) {
+    mbmi->mode = NEWMV;
+    return false;
+  }
+  const int step = 1 << (MV_PRECISION_ONE_EIGHTH_PEL - mbmi->max_mv_precision);
+  auto on_grid = [&](double row, double col) {
+    MV m;
+    m.row = static_cast<int16_t>(c.row + std::lround((row - c.row) / step) * step);
+    m.col = static_cast<int16_t>(c.col + std::lround((col - c.col) / step) * step);
+    return m;
+  };
+  xd->block_ref_scale_factors[0] = get_ref_scale_factors_const(cm, mbmi->ref_frame[0]);
+  WARP_CANDIDATE stack[MAX_WARP_REF_CANDIDATES];
+  mbmi->max_num_warp_candidates = MAX_WARP_REF_CANDIDATES;
+  av2_find_warp_delta_base_candidates(xd, mbmi, stack, xd->warp_param_stack[ref_frame],
+                                      xd->valid_num_warp_candidates[ref_frame], nullptr);
+  // The mode symbols against NEWMV's, then the DRL index and MV difference (as NEWMV's).
+  avm_cdf_prob* const warp_cdf = ec_ctx->inter_warp_mode_cdf[inter_warpmv_mode_ctx(cm, xd, mbmi)];
+  // kWarpBias: extra bits on a warp, whose luma cost leaves out chroma and what its model does to
+  // later blocks' MV and warp candidates (branch feat/warp's best of 2 / 5 / 8 / 11 / 16).
+  constexpr int kWarpBias = 8;
+  const double base_bits = symbol_bits(warp_cdf, 1) + symbol_bits(ec_ctx->is_warpmv_or_warp_newmv_cdf, 0) -
+                           symbol_bits(warp_cdf, 0) -
+                           symbol_bits(ec_ctx->inter_single_mode_cdf[inter_single_mode_ctx(mode_ctx)], NEWMV - SINGLE_INTER_MODE_START) +
+                           new_idx + 1 + kWarpBias;
+  auto ref_bits = [&](int k) {
+    double b = 0;
+    for (int i = 0; i < MAX_WARP_REF_CANDIDATES - 1; i++) {
+      b += symbol_bits(av2_get_warp_ref_idx_cdf(ec_ctx, i), k > i);
+      if (k <= i) break;
+    }
+    return b;
+  };
+  auto delta_bits = [&](int v, int type, int p) {
+    constexpr int kEsc = WARP_DELTA_NUMSYMBOLS_LOW - 1;
+    const int a = std::abs(v);
+    return symbol_bits(ec_ctx->warp_delta_param_cdf[type], std::min(a, kEsc)) +
+           (p && a >= kEsc ? symbol_bits(ec_ctx->warp_delta_param_high_cdf[type], a - kEsc) : 0) +
+           (v ? symbol_bits(ec_ctx->warp_param_sign_cdf, v < 0) : 0);
+  };
+  auto bits_of = [&](const WarpChoice& w) {
+    double b = base_bits + ref_bits(w.k) + mvd_comp_bits(w.mv.row - c.row) + mvd_comp_bits(w.mv.col - c.col);
+    if (w.k == 0) b += symbol_bits(ec_ctx->warp_precision_idx_cdf[bsize], w.p) + delta_bits(w.d[0], 0, w.p) + delta_bits(w.d[1], 1, w.p);
+    return b * kRdBitWeight;
+  };
+  const MB_MODE_INFO keep = *mbmi;
+  mbmi->motion_mode = WARP_DELTA;
+  double wbest = 1e300;
+  auto trial = [&](const WarpChoice& w) {
+    const double bits = bits_of(w);
+    mbmi->warp_ref_idx = w.k;
+    mbmi->warp_precision_idx = w.p;
+    mbmi->mv[0].as_mv = w.mv;
+    mbmi->wm_params[0] = warp_delta_model(cm, mbmi, stack[w.k].wm_params, w.k == 0, w.p, w.d[0], w.d[1], w.mv, bsize,
+                                          xd->mi_row, xd->mi_col);
+    const double j = rd_cost_(std::min(wbest, *best) - bits) + bits;
+    if (j < wbest) wbest = j, *out = w;
+  };
+  const int x0 = xd->mi_col * MI_SIZE, y0 = xd->mi_row * MI_SIZE;
+  const int bw = block_size_wide[bsize], bh = block_size_high[bsize];
+  std::vector<std::array<double, 4>> cells;
+  if (field_)
+    for (int y = y0; y < std::min(y0 + bh, cm->height); y += 8)
+      for (int x = x0; x < std::min(x0 + bw, cm->width); x += 8) {
+        MV f;
+        if (field_(ref, x, y, &f)) cells.push_back({x + 4 - (x0 + bw / 2.0), y + 4 - (y0 + bh / 2.0), double(f.col), double(f.row)});
+      }
+  celv2::RotZoom rz;
+  if (celv2::fit_rotzoom(cells, &rz)) {
+    // Its zoom / rotation as steps on index 0's base at the finer precision (the coarser, cheaper one
+    // where both fall on its grid).
+    const WarpedMotionParams& base = stack[0].wm_params;
+    constexpr double kFine = 1 << 10;
+    auto steps = [](double v) { return std::clamp(static_cast<int>(std::lround(v)), -14, 14); };
+    WarpChoice w{0, 1, {steps(((1 + rz.a) * (1 << WARPEDMODEL_PREC_BITS) - base.wmmat[2]) / kFine),
+                        steps((rz.b * (1 << WARPEDMODEL_PREC_BITS) - base.wmmat[3]) / kFine)}, on_grid(rz.t1, rz.t0)};
+    if (w.d[0] % 2 == 0 && w.d[1] % 2 == 0) w.p = 0, w.d[0] /= 2, w.d[1] /= 2;
+    if (w.d[0] || w.d[1]) {
+      trial(w);
+      const int lim = w.p ? 14 : 7;
+      for (int s = 0; s < 8; s++) {
+        WarpChoice t = *out;
+        const int sign = s & 1 ? -1 : 1;
+        if (s < 2) t.d[0] += sign;
+        else if (s < 4) t.d[1] += sign;
+        else if (s < 6) t.mv.row = static_cast<int16_t>(t.mv.row + sign * step);
+        else t.mv.col = static_cast<int16_t>(t.mv.col + sign * step);
+        if (std::abs(t.d[0]) <= lim && std::abs(t.d[1]) <= lim) trial(t);
+      }
+    }
+  }
+  const MV mv0 = on_grid(wanted.row, wanted.col);
+  for (int k = std::max<int>(1, xd->valid_num_warp_candidates[ref_frame]) - 1; k >= 0; k--) trial(WarpChoice{k, 0, {0, 0}, mv0});
+  *mbmi = keep;
+  mbmi->mode = NEWMV;
+  if (wbest >= *best) return false;
+  *best = wbest;
   return true;
 }
 
@@ -1129,6 +1786,13 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
   mbmi->warp_inter_intra = 0;
 
   if (compound) {
+#ifdef CELV2_ORACLE
+    if (d.imp) {
+      import_compound(d, r0, ref_frame, inter_mode_ctx, ref_mvs, pts0, pts0_inref);
+      inter_block_tail();
+      return;
+    }
+#endif
     // NEW_NEWMV: read_inter_compound_mode() (not joint, non-joint type NEW_NEWMV), one DRL index
     // for the pair, assign_mv() with both differences. Masked / weighted compound, optical flow
     // and MV refinement are off in the sequence, so the average is implied.
@@ -1333,8 +1997,10 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
     const WarpedMotionParams& gm = cm->global_motion[ref_frame];
     const MV gmv =
         get_warp_motion_vector(xd, &gm, cm->features.fr_mv_precision, bsize, xd->mi_col, xd->mi_row).as_mv;
-    bool global = false, amvd = false;
+    bool global = false, amvd = false, warp = false;
+    WarpChoice wc;
     MvSubpelPrecision new_prec = mbmi->max_mv_precision;  // NEWMV's coded precision (--flexmv)
+    const bool warp_allowed = is_warpmv_mode_allowed(cm, mbmi, bsize) && is_warp_newmv_allowed(cm, xd, mbmi, bsize);
     if (near_idx < 0 && rd_cost_) {
       const auto comp_bits = mvd_comp_bits;
       const MV c = xd->ref_mv_stack[ref_frame][new_idx].this_mv.as_mv;
@@ -1480,8 +2146,22 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
         mbmi->mv[0] = keep;
         if (j < best) best = j, global = true, near_idx = -1;
       }
+      if (warp_allowed && choose_warp(ref, c, wanted, new_idx, av2_mode_context_analyzer(inter_mode_ctx, mbmi->ref_frame), &best, &wc))
+        warp = true, global = false, near_idx = -1, wanted = wc.mv, new_prec = mbmi->max_mv_precision;
+    } else if (rd_cost_ && !force_near && warp_allowed) {
+      // The decision's MV is a candidate's: only the warp is left to try against it.
+      const int_mv keep = mbmi->mv[0];
+      mbmi->mv[0].as_mv = wanted;
+      double best = rd_cost_(1e300) + kRdBitWeight * (near_idx + 1);
+      mbmi->mv[0] = keep;
+      if (choose_warp(ref, xd->ref_mv_stack[ref_frame][new_idx].this_mv.as_mv, wanted, new_idx,
+                      av2_mode_context_analyzer(inter_mode_ctx, mbmi->ref_frame), &best, &wc))
+        warp = true, near_idx = -1, wanted = wc.mv;
     }
-    const PREDICTION_MODE mode = global ? GLOBALMV : near_idx >= 0 ? NEARMV : NEWMV;
+#ifdef CELV2_ORACLE
+    if (d.imp) import_single(d, ref_frame, gmv, wanted, near_idx, new_idx, global, amvd, new_prec);
+#endif
+    const PREDICTION_MODE mode = warp ? WARP_NEWMV : global ? GLOBALMV : near_idx >= 0 ? NEARMV : NEWMV;
     mbmi->mode = mode;
     // BAWP (fades, light changes): the NEARMV / NEWMV prediction scaled and offset to fit the
     // reconstructed rows above and columns left of the block against the reference's there
@@ -1506,17 +2186,24 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
     }
 
     // read_inter_mode()
-    if (is_warpmv_mode_allowed(cm, mbmi, bsize)) throw std::runtime_error("warp modes unsupported");
+    if (is_warpmv_mode_allowed(cm, mbmi, bsize)) {
+      w_->symbol(mode == WARP_NEWMV, ec_ctx->inter_warp_mode_cdf[inter_warpmv_mode_ctx(cm, xd, mbmi)], 2);
+      if (mode == WARP_NEWMV) w_->symbol(0, ec_ctx->is_warpmv_or_warp_newmv_cdf, 2);  // not WARPMV
+    }
     const int16_t mode_ctx = av2_mode_context_analyzer(inter_mode_ctx, mbmi->ref_frame);
-    w_->symbol(mode - SINGLE_INTER_MODE_START,
-                     ec_ctx->inter_single_mode_cdf[inter_single_mode_ctx(mode_ctx)],
-                     INTER_SINGLE_MODES);
+    if (mode != WARP_NEWMV)
+      w_->symbol(mode - SINGLE_INTER_MODE_START,
+                 ec_ctx->inter_single_mode_cdf[inter_single_mode_ctx(mode_ctx)],
+                 INTER_SINGLE_MODES);
     mbmi->use_amvd = amvd && mode == NEWMV;
     if (cm->seq_params.enable_adaptive_mvd && allow_amvd_mode(mode))
       w_->symbol(mbmi->use_amvd, ec_ctx->amvd_mode_cdf[amvd_mode_to_index(mode)][get_amvd_context(xd)], 2);
     av2_find_mv_refs(cm, xd, mbmi, ref_frame, ref_mv_count_, xd->ref_mv_stack, xd->weight, ref_mvs,
                      nullptr, xd->warp_param_stack, MAX_WARP_REF_CANDIDATES,
                      xd->valid_num_warp_candidates);
+#ifdef CELV2_ORACLE
+    if (d.imp) import_bawp(*d.imp); else {
+#endif
     // bawp_flag luma (implicit: explicit_bawp_flag 0), then chroma with it.
     mbmi->bawp_flag[0] = mbmi->bawp_flag[1] = 0;
     if (cm->features.enable_bawp && av2_allow_bawp(cm, mbmi, xd->mi_row, xd->mi_col)) {
@@ -1531,24 +2218,77 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
       w_->symbol(1, ec_ctx->bawp_cdf[1], 2);
       mbmi->bawp_flag[1] = 1;
     }
+#ifdef CELV2_ORACLE
+    }
+#endif
     xd->block_ref_scale_factors[0] = get_ref_scale_factors_const(cm, mbmi->ref_frame[0]);
     if (is_motion_variation_allowed_bsize(bsize, xd->mi_row, xd->mi_col) &&
         !is_tip_ref_frame(mbmi->ref_frame[0]))
       mbmi->num_proj_ref[0] = av2_findSamples(cm, xd, pts0, pts0_inref, 0);
-    // read_motion_mode(): translation only.
+    // read_motion_mode(): translation, or inter-intra (the prediction blended with a DC / V / H /
+    // SMOOTH intra prediction, no wedge) where its RD cost with the mode bits is less.
     mbmi->max_num_warp_candidates = 0;
     mbmi->six_param_warp_model_flag = 0;
     mbmi->warp_precision_idx = 0;
-    if (motion_mode_allowed(cm, xd, xd->ref_mv_stack[mbmi->ref_frame[0]], mbmi) !=
-        (1 << SIMPLE_TRANSLATION))
-      throw std::runtime_error("only translation is supported");
+    const int allowed = motion_mode_allowed(cm, xd, xd->ref_mv_stack[mbmi->ref_frame[0]], mbmi);
+    if (allowed & ~(1 << SIMPLE_TRANSLATION | 1 << INTERINTRA | (mode == WARP_NEWMV ? 1 << WARP_DELTA : 0)))
+      throw std::runtime_error("only translation, inter-intra and warp-delta are supported");
     mbmi->use_wedge_interintra = 0;
     mbmi->motion_mode = SIMPLE_TRANSLATION;
+    // WARP_DELTA (warp causal and extend are off in the sequence: no symbol), then read_warp_ref_idx().
+    WARP_CANDIDATE warp_stack[MAX_WARP_REF_CANDIDATES];
+    if (mode == WARP_NEWMV) {
+      mbmi->motion_mode = WARP_DELTA;
+      mbmi->max_num_warp_candidates = MAX_WARP_REF_CANDIDATES;
+      av2_find_warp_delta_base_candidates(xd, mbmi, warp_stack, xd->warp_param_stack[ref_frame],
+                                          xd->valid_num_warp_candidates[ref_frame], nullptr);
+      for (int i = 0; i < mbmi->max_num_warp_candidates - 1; i++) {
+        w_->symbol(wc.k > i, av2_get_warp_ref_idx_cdf(ec_ctx, i), 2);
+        if (wc.k <= i) break;
+      }
+      mbmi->warp_ref_idx = wc.k;
+    }
+    if (allowed & (1 << INTERINTRA)) {
+      const int group = size_group_lookup[bsize];
+      const bool wedge = av2_is_wedge_used(bsize);
+      // What the decoder sets with use_interintra.
+      auto set_interintra = [&](int m) {
+        mbmi->motion_mode = INTERINTRA;
+        mbmi->interintra_mode = static_cast<INTERINTRA_MODE>(m);
+        mbmi->angle_delta[PLANE_TYPE_Y] = mbmi->angle_delta[PLANE_TYPE_UV] = 0;
+        mbmi->use_dpcm_y = mbmi->dpcm_mode_y = mbmi->use_dpcm_uv = mbmi->dpcm_mode_uv = 0;
+        mbmi->use_intra_dip = 0;
+      };
+      int ii = -1;
+      if (rd_cost_ && !force_near) {
+        const MB_MODE_INFO keep = *mbmi;
+        mbmi->mv[0].as_mv = mode == GLOBALMV ? gmv
+                            : mode == NEARMV ? xd->ref_mv_stack[ref_frame][near_idx].this_mv.as_mv
+                                             : wanted;
+        const double off = symbol_bits(ec_ctx->interintra_cdf[group], 0);
+        double best = rd_cost_(1e300);
+        for (int m = 0; m < INTERINTRA_MODES; m++) {
+          set_interintra(m);
+          const double bits = kRdBitWeight * (symbol_bits(ec_ctx->interintra_cdf[group], 1) - off +
+                                              symbol_bits(ec_ctx->interintra_mode_cdf[group], m) +
+                                              (wedge ? symbol_bits(ec_ctx->wedge_interintra_cdf, 0) : 0));
+          const double c = rd_cost_(best - bits) + bits;
+          if (c < best) best = c, ii = m;
+        }
+        *mbmi = keep;
+      }
+      w_->symbol(ii >= 0, ec_ctx->interintra_cdf[group], 2);
+      if (ii >= 0) {
+        w_->symbol(ii, ec_ctx->interintra_mode_cdf[group], INTERINTRA_MODES);
+        set_interintra(ii);
+        if (wedge) w_->symbol(0, ec_ctx->wedge_interintra_cdf, 2);
+      }
+    }
     if (allow_warpmv_with_mvd_coding(cm, mbmi)) throw std::runtime_error("warp MVD unsupported");
     mbmi->warpmv_with_mvd_flag = 0;
     mbmi->jmvd_scale_mode = 0;  // not a joint MVD mode
     // read_drl_idx()
-    const int idx = mode == NEARMV ? near_idx : mode == NEWMV ? new_idx : 0;
+    const int idx = mode == NEARMV ? near_idx : mode == NEWMV || mode == WARP_NEWMV ? new_idx : 0;
     if (have_drl_index(mbmi->mode)) {
       const int16_t pristine = av2_mode_context_pristine(inter_mode_ctx, mbmi->ref_frame);
       for (int i = 0; i < max_drl_bits; ++i) {
@@ -1598,6 +2338,27 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
       mbmi->mv[0].as_mv.col = static_cast<int16_t>(base.col + diff.col);
     }
     mv_clamp_to_integer(&mbmi->mv[0].as_mv);
+    if (mbmi->motion_mode == WARP_DELTA) {
+      // read_warp_delta(): the precision index, the two steps (magnitude, an escape from 7 at
+      // precision 1, then the sign).
+      const bool signal = allow_warp_parameter_signaling(cm, mbmi);
+      if (signal) {
+        w_->symbol(wc.p, ec_ctx->warp_precision_idx_cdf[bsize], NUM_WARP_PRECISION_MODES);
+        mbmi->warp_precision_idx = wc.p;
+        constexpr int kEsc = WARP_DELTA_NUMSYMBOLS_LOW - 1;
+        for (int t = 0; t < 2; t++) {
+          const int a = std::abs(wc.d[t]);
+          w_->symbol(std::min(a, kEsc), ec_ctx->warp_delta_param_cdf[t], WARP_DELTA_NUMSYMBOLS_LOW);
+          if (wc.p && a >= kEsc) w_->symbol(a - kEsc, ec_ctx->warp_delta_param_high_cdf[t], WARP_DELTA_NUMSYMBOLS_HIGH);
+          if (wc.d[t]) w_->symbol(wc.d[t] < 0, ec_ctx->warp_param_sign_cdf, 2);
+        }
+      } else if (wc.p || wc.d[0] || wc.d[1]) {
+        throw std::runtime_error("warp steps on a candidate that codes none");
+      }
+      mbmi->wm_params[0] = warp_delta_model(cm, mbmi, warp_stack[wc.k].wm_params, signal, wc.p, wc.d[0], wc.d[1],
+                                            mbmi->mv[0].as_mv, bsize, xd->mi_row, xd->mi_col);
+      assign_warpmv(cm, xd->submi, bsize, &mbmi->wm_params[0], xd->mi_row, xd->mi_col, 0);
+    }
   }
   inter_block_tail();
 }
@@ -1618,6 +2379,12 @@ void BlockWriter::inter_block_tail() {
   // read_mb_interp_filter(): frame filter, not switchable.
   if (!av2_is_interp_needed(cm, xd))
     set_default_interp_filters(mbmi, cm, xd, cm->features.interp_filter);
+#ifdef CELV2_ORACLE
+  else if (cm->features.interp_filter == SWITCHABLE) {
+    w_->symbol(imp_->interp, xd->tile_ctx->switchable_interp_cdf[av2_get_pred_context_switchable_interp(xd, 0)], SWITCHABLE_FILTERS);
+    mbmi->interp_fltr = imp_->interp;
+  }
+#endif
   else
     mbmi->interp_fltr = cm->features.interp_filter;
   if (xd->tree_type != LUMA_PART) xd->cfl.store_y = store_cfl_required(cm, xd);
@@ -1711,7 +2478,11 @@ int BlockWriter::choose_skip_mode(const BlockDecision& d) {
   // 8 and 12 (with a NEAR bias of 2) gave the same mean BD-rate over anime A, two more 1080p anime
   // sources and the anime clips; 4 lost 10% in bytes on anime A at +0.1 dB.
   constexpr int kDecisionBits = 8;
+#ifdef CELV2_ORACLE
+  double best = d.imp ? 0 : rd_cost_(1e300) + kRdBitWeight * kDecisionBits;
+#else
   double best = rd_cost_(1e300) + kRdBitWeight * kDecisionBits;
+#endif
   int skip_idx = -1;
   // Skip-mode candidates.
   int_mv ref_mvs[MODE_CTX_REF_FRAMES][MAX_MV_REF_CANDIDATES] = {};
@@ -1736,6 +2507,17 @@ int BlockWriter::choose_skip_mode(const BlockDecision& d) {
                b.col == mbmi->mv[1].as_mv.col;
     }
     if (repeat) continue;
+#ifdef CELV2_ORACLE
+    if (d.imp) {  // L2: the candidate with avmenc's pair
+      const bool in_order = mbmi->ref_frame[0] == d.ref;
+      const MV w0 = in_order ? m : m2, w1 = in_order ? m2 : m;
+      if (mbmi->mv[0].as_mv.row == w0.row && mbmi->mv[0].as_mv.col == w0.col && mbmi->mv[1].as_mv.row == w1.row && mbmi->mv[1].as_mv.col == w1.col) {
+        skip_idx = i;
+        break;
+      }
+      continue;
+    }
+#endif
     const double bits = kRdBitWeight * (i + 1);
     const double c = rd_cost_(best - bits) + bits;
     if (c < best) best = c, skip_idx = i;
@@ -1754,14 +2536,15 @@ void BlockWriter::tx_partition(TX_SIZE max_tx, int blk_row, int blk_col, TX_PART
   if (is_inter && (blk_row >= max_block_high(xd, bsize, 0) || blk_col >= max_block_wide(xd, bsize, 0))) return;
   const int allow_horz = allow_tx_horz_split(bsize, max_tx), allow_vert = allow_tx_vert_split(bsize, max_tx);
   const int h_and_v = get_vert_and_horz_group(bsize), h_or_v = get_vert_or_horz_group(bsize);
+  const int is_fsc = mbmi->fsc_mode[PLANE_TYPE_Y];  // 0 but in the replay
   if (!allow_horz && !allow_vert) {
     if (p != TX_PARTITION_NONE) throw std::runtime_error("transform partition not allowed");
   } else {
     w_->symbol(p != TX_PARTITION_NONE,
-                     ec_ctx->txfm_do_partition_cdf[0][is_inter][size_to_tx_part_group_lookup[bsize]], 2);
+                     ec_ctx->txfm_do_partition_cdf[is_fsc][is_inter][size_to_tx_part_group_lookup[bsize]], 2);
     if (p != TX_PARTITION_NONE) {
       if (allow_horz && allow_vert) {
-        w_->symbol(p - 1, ec_ctx->txfm_4way_partition_type_cdf[0][is_inter][h_and_v], TX_PARTITION_TYPE_NUM);
+        w_->symbol(p - 1, ec_ctx->txfm_4way_partition_type_cdf[is_fsc][is_inter][h_and_v], TX_PARTITION_TYPE_NUM);
       } else {
         const bool four = p == TX_PARTITION_HORZ4 || p == TX_PARTITION_VERT4;
         const TX_PARTITION_TYPE two = allow_horz ? TX_PARTITION_HORZ : TX_PARTITION_VERT;
@@ -1769,7 +2552,7 @@ void BlockWriter::tx_partition(TX_SIZE max_tx, int blk_row, int blk_col, TX_PART
             (four && (!h_or_v || xd->reduced_tx_part_set)))
           throw std::runtime_error("transform partition not codable here");
         if (h_or_v && !xd->reduced_tx_part_set)
-          w_->symbol(four, ec_ctx->txfm_2or3_way_partition_type_cdf[0][is_inter][h_or_v - 1], 2);
+          w_->symbol(four, ec_ctx->txfm_2or3_way_partition_type_cdf[is_fsc][is_inter][h_or_v - 1], 2);
       }
     }
   }
@@ -1777,6 +2560,69 @@ void BlockWriter::tx_partition(TX_SIZE max_tx, int blk_row, int blk_col, TX_PART
   const int n = get_tx_partition_sizes(p, max_tx, &mbmi->txb_pos, sub_txs, xd->error_info);
   mbmi->tx_size = sub_txs[n - 1];
   mbmi->tx_partition_type[is_inter ? av2_get_txb_size_index(bsize, blk_row, blk_col) : 0] = p;
+}
+
+// loop_restoration_read_sb_coeffs() with a PC_WIENER or WIENER_NONSEP frame (frame filters, so no
+// side information): one flag per unit, indexed as CodecState::lr_flags() holds them.
+void BlockWriter::lr_units(int mi_row, int mi_col, BLOCK_SIZE bsize) {
+  AV2_COMMON* const cm = st_.cm();
+  int base = 0;
+  for (int plane = 0; plane < av2_num_planes(cm); plane++) {
+    int rcol0, rcol1, rrow0, rrow1;
+    const RestorationInfo& rsi = cm->rst_info[plane];
+    if (rsi.frame_restoration_type == RESTORE_NONE) continue;
+    if (av2_loop_restoration_corners_in_sb(cm, plane, mi_row, mi_col, bsize, &rcol0, &rcol1, &rrow0, &rrow1)) {
+#ifdef CELV2_ORACLE
+      if (celv2::oracle::filters()) {
+        for (int rrow = rrow0; rrow < rrow1; rrow++)
+          for (int rcol = rcol0; rcol < rcol1; rcol++) import_lr_unit(plane, rcol + rrow * rsi.horz_units_per_frame);
+        continue;
+      }
+#endif
+      const bool pc = rsi.frame_restoration_type == RESTORE_PC_WIENER;
+      if (!pc && (rsi.frame_restoration_type != RESTORE_WIENER_NONSEP || !rsi.frame_filters_on))
+        throw std::logic_error("loop restoration other than PC_WIENER or frame-filter WIENER_NONSEP");
+      avm_cdf_prob* const cdf = pc ? xd_->tile_ctx->pc_wiener_restore_cdf : xd_->tile_ctx->wienerns_restore_cdf;
+      for (int rrow = rrow0; rrow < rrow1; rrow++)
+        for (int rcol = rcol0; rcol < rcol1; rcol++) w_->deferred(base + rcol + rrow * rsi.horz_units_per_frame, cdf, 2);
+    }
+    base += rsi.horz_units_per_frame * rsi.vert_units_per_frame;
+  }
+}
+
+// decodemv.c av2_read_sec_tx_type() where av2_read_coeffs_txb() reads it, and read_secondary_tx_set().
+void BlockWriter::sec_tx_type(TX_SIZE tx_size, int eob, TX_TYPE tx_type) {
+  AV2_COMMON* const cm = st_.cm();
+  MACROBLOCKD* const xd = xd_;
+  FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  const int inter = is_inter_block(mbmi, xd->tree_type);
+  const int part = xd->tree_type == CHROMA_PART;
+  const TX_TYPE primary = get_primary_tx_type(tx_type);
+  const int stx = get_secondary_tx_type(tx_type);
+  const bool coded = (inter ? eob > 3 && cm->seq_params.enable_inter_ist
+                            : eob != 1 && cm->seq_params.enable_ist && !mbmi->fsc_mode[part]) &&
+                     !mbmi->skip_txfm[part] && !segfeature_active(&cm->seg, mbmi->segment_id, SEG_LVL_SKIP) &&
+                     !xd->lossless[mbmi->segment_id] && block_signals_sec_tx_type(xd, tx_size, primary, eob);
+  if (!coded) {
+    if (stx) throw std::runtime_error("a secondary transform this block cannot code");
+    return;
+  }
+  w_->symbol(stx, ec_ctx->stx_cdf[inter][txsize_sqr_map[tx_size]], STX_TYPES);
+  if (!stx) return;
+  const int set = get_secondary_tx_set(tx_type) - (primary == ADST_ADST ? IST_SET_SIZE : 0);
+  if (inter) {  // the decoder takes set 0
+    if (set != 0) throw std::runtime_error("an inter block with a secondary transform set other than 0");
+    return;
+  }
+  const uint8_t mode = get_intra_mode(mbmi, PLANE_TYPE_Y);
+  if (primary == ADST_ADST && tx_size_wide[tx_size] >= 8 && tx_size_high[tx_size] >= 8) {
+    if (set >= IST_REDUCED_SET_SIZE) throw std::runtime_error("an ADST_ADST secondary transform set past the reduced ones");
+    w_->symbol(most_probable_stx_mapping_ADST_ADST[mode][set], ec_ctx->most_probable_stx_set_cdf_ADST_ADST,
+               IST_REDUCED_SET_SIZE);
+  } else {
+    w_->symbol(most_probable_stx_mapping[mode][set], ec_ctx->most_probable_stx_set_cdf, IST_SET_SIZE);
+  }
 }
 
 // decodemv.c av2_read_tx_type(), intra luma (reduced_tx_set_used != 2, a set with a choice).
@@ -1845,11 +2691,24 @@ void BlockWriter::inter_tx_type(TX_SIZE tx_size, int eob, TX_TYPE tx_type) {
                        av2_num_ext_tx_set[set]);
     }
   } else {
+#ifdef CELV2_ORACLE  // L3: avmenc's long side may be other than DCT, as intra_tx_type()
+    int idx = -1, long_dct = 1;
+    for (long_dct = 1; long_dct >= 0 && idx < 0; long_dct -= idx < 0)
+      for (int i = 0; i < 4 && idx < 0; i++)
+        if (get_txtype_from_idx_for_large_txfm(tx_size, set, i, long_dct) == tx_type) idx = i;
+    if (idx >= 0 && txsize_sqr_up_map[tx_size] == TX_32X32) w_->symbol(long_dct, ec_ctx->tx_ext_32_cdf[1], 2);
+    else if (idx >= 0 && !long_dct) throw std::runtime_error("a 64-sample long side is DCT only");
+#else
     if (txsize_sqr_up_map[tx_size] == TX_32X32) w_->symbol(1, ec_ctx->tx_ext_32_cdf[1], 2);
     int idx = -1;
     for (int i = 3; i >= 0; i--)
       if (get_txtype_from_idx_for_large_txfm(tx_size, set, i, true) == tx_type) idx = i;
+#endif
     if (idx < 0) throw std::runtime_error("transform type not in the long-side transform set");
     w_->symbol(idx, ec_ctx->inter_ext_tx_short_side_cdf[eob_tx_ctx][square], 4);
   }
 }
+
+#ifdef CELV2_ORACLE
+#include "block_import.inc"
+#endif

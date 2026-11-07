@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "core/profile.h"
+
 namespace celv2 {
 
 // fn(k) for k in [0, n) on threads kept for the process (hardware_concurrency - 1 of them, started
@@ -26,6 +28,7 @@ class ThreadPool {
     if (n == 1) return fn(0);
     Job j;
     j.n = n;
+    j.stage = current_stage();  // CELV2_PROFILE: the helpers' time counts as the caller's stage
     j.fn = [&fn](int k) { fn(k); };
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -47,6 +50,7 @@ class ThreadPool {
     int n = 0;
     std::atomic<int> next{0}, done{0};
     int helpers = 0;  // pool threads inside work() on it (under mu_)
+    Stage stage = Stage::None;
     std::exception_ptr err;
     std::mutex err_mu;
   };

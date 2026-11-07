@@ -31,6 +31,23 @@ class DecisionEngine {
   // threads: an engine may decide the runs' first rows first, then their second ones, and so on,
   // so every tile can start at once. 1 (the default): top to bottom.
   virtual void set_row_streams(int n) { (void)n; }
+#ifdef CELV2_ORACLE
+  // L1: the tree 64x64 superblock sb must keep (tools/oracle/oracle.h), nullptr for the RD pass's own.
+  virtual const celv2::oracle::Sb* forced(size_t sb) const { (void)sb; return nullptr; }
+#endif
+
+  // A launch and its collect, for the tests.
+  DecisionMap decide_inter(const Frame420& src, const std::vector<const Frame420*>& refs, int qindex) {
+    DecisionMap dm;
+    RowGate gate;
+    launch(src, refs, qindex, dm);
+    collect(dm, gate);
+    return dm;
+  }
+  DecisionMap decide_inter(const Frame420& src, const Frame420& prev, int qindex) {
+    return decide_inter(src, std::vector<const Frame420*>{&prev}, qindex);
+  }
+  DecisionMap decide_intra(const Frame420& src, int qindex) { return decide_inter(src, std::vector<const Frame420*>{}, qindex); }
 };
 
 // Result of probe_gpu(): the device name and compute capability, or why it is unusable.

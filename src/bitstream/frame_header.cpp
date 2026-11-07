@@ -2,6 +2,9 @@
 // Copyright (c) 2021, Alliance for Open Media, under the BSD 3-Clause Clear License
 // and the Alliance for Open Media Patent License 1.0: see third_party/avm/.
 
+#ifdef CELV2_ORACLE
+#include "oracle.h"
+#endif
 #include "bitstream/frame_header.h"
 
 #include <stdexcept>
@@ -10,6 +13,7 @@ extern "C" {
 #include "av2/common/ccso.h"
 #include "av2/common/cdef.h"
 #include "av2/common/filter.h"
+#include "av2/common/restoration.h"
 #include "av2/common/warped_motion.h"
 #include "avm_dsp/bitwriter_buffer.h"
 }
@@ -55,6 +59,13 @@ void write_global_motion(avm_write_bit_buffer* wb, const AV2_COMMON* cm, const i
 
 }  // namespace
 
+void write_film_grain(avm_write_bit_buffer* wb, const avm_film_grain_t& g) {
+  avm_wb_write_bit(wb, g.apply_grain);
+  if (!g.apply_grain) return;
+  avm_wb_write_literal(wb, 0, FGM_ID_BITS);
+  avm_wb_write_literal(wb, g.random_seed, 16);
+}
+
 std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool key) {
   (void)c;
   AV2_COMMON* const cm = st.cm();
@@ -84,15 +95,37 @@ std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool
     if (f->allow_ref_frame_mvs && cm->ref_frames_info.num_total_refs > 1 && block_size_high[seq->sb_size] > 64)
       avm_wb_write_bit(&wb, cm->tmvp_sample_step - 1);
   }
-  // Screen content tools fixed off.
+  // read_screen_content_params(): the frame's choice where the sequence leaves it to frames, then (on)
+  // no forced integer MVs; read_intrabc_params(): key frames global (then local) IntraBC, inter
+  // frames local, the sequence's BVP DRL bits.
+  if (seq->force_screen_content_tools == 2) avm_wb_write_bit(&wb, f->allow_screen_content_tools);
+  else if (f->allow_screen_content_tools != seq->force_screen_content_tools)
+    throw std::runtime_error("screen content tools against the sequence header");
+  if (f->allow_screen_content_tools) avm_wb_write_bit(&wb, f->cur_frame_force_integer_mv);
+  if (f->allow_intrabc && (!f->allow_local_intrabc || seq->allow_frame_max_bvp_drl_bits))
+    throw std::runtime_error("IntraBC without local, or with per-frame BVP DRL bits");
   avm_wb_write_bit(&wb, f->allow_intrabc);
+  if (f->allow_intrabc && frame_is_intra_only(cm)) {
+    avm_wb_write_bit(&wb, f->allow_global_intrabc);
+    if (f->allow_global_intrabc) avm_wb_write_bit(&wb, f->allow_local_intrabc);
+  }
   if (!key) {
     // read_frame_max_drl_bits(): nothing. MV precision, interpolation filter.
+#ifdef CELV2_ORACLE  // L2: avmenc's
+    avm_wb_write_bit(&wb, f->fr_mv_precision == MV_PRECISION_QTR_PEL);
+    if (f->fr_mv_precision != MV_PRECISION_QTR_PEL) avm_wb_write_bit(&wb, f->fr_mv_precision == MV_PRECISION_ONE_EIGHTH_PEL);
+    avm_wb_write_bit(&wb, f->interp_filter == SWITCHABLE);
+    if (f->interp_filter != SWITCHABLE) avm_wb_write_literal(&wb, f->interp_filter, LOG_SWITCHABLE_FILTERS);
+#else
     if (f->fr_mv_precision != MV_PRECISION_QTR_PEL || f->interp_filter > 3)
       throw std::runtime_error("unsupported inter frame parameters");
     avm_wb_write_bit(&wb, 1);  // MV_PRECISION_QTR_PEL
     avm_wb_write_bit(&wb, 0);  // not switchable
     avm_wb_write_literal(&wb, f->interp_filter, LOG_SWITCHABLE_FILTERS);
+#endif
+    if (seq->seq_frame_motion_modes_present_flag)
+      for (int mm = INTERINTRA; mm < MOTION_MODES; mm++)
+        if (seq->seq_enabled_motion_modes & (1 << mm)) avm_wb_write_bit(&wb, (f->enabled_motion_modes >> mm) & 1);
   }
   avm_wb_write_bit(&wb, f->disable_cdf_update);
   // read_tile_info_max_tile(): uniform spacing, one increment bit per step above the minimum.
@@ -147,12 +180,98 @@ std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool
         }
     }
   }
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::filters() && seq->enable_restoration) {  // decode_restoration_mode(), all of it
+    bool luma = false, chroma = false;
+    for (int p = 0; p < av2_num_planes(cm); p++) {
+      const FeatureFlags& f = cm->features;
+      const RestorationInfo& rsi = cm->rst_info[p];
+      int ndx = 0;
+      for (int r = RESTORE_NONE; r < rsi.frame_restoration_type; r++) ndx += !((f.lr_tools_disable_mask[p] >> r) & 1);
+      const int n = f.lr_frame_tools_count[p], l = get_unsigned_bits(n), m = (1 << l) - n;
+      if (ndx < m) {
+        avm_wb_write_literal(&wb, ndx, l - 1);
+      } else {
+        avm_wb_write_literal(&wb, m + ((ndx - m) >> 1), l - 1);
+        avm_wb_write_bit(&wb, (ndx - m) & 1);
+      }
+      if (rsi.frame_restoration_type != RESTORE_NONE) (p ? chroma : luma) = true;
+      if ((rsi.frame_restoration_type == RESTORE_WIENER_NONSEP || rsi.frame_restoration_type == RESTORE_SWITCHABLE) && is_frame_filters_enabled(p)) {
+        avm_wb_write_bit(&wb, rsi.frame_filters_on);
+        if (rsi.frame_filters_on) {
+          const int refs = frame_is_intra_only(cm) || frame_is_sframe(cm) ? 0 : cm->ref_frames_info.num_total_refs;
+          if (refs > 0) avm_wb_write_bit(&wb, rsi.temporal_pred_flag);
+          if (rsi.temporal_pred_flag && refs > 1) avm_wb_write_literal(&wb, rsi.rst_ref_pic_idx, avm_ceil_log2(refs));
+          if (!rsi.temporal_pred_flag && max_num_classes(p) > 1)
+            avm_wb_write_literal(&wb, encode_num_filter_classes(rsi.num_filter_classes), NUM_FILTER_CLASSES_BITS);
+        }
+      }
+    }
+    if (cm->mib_size != 32) throw std::logic_error("restoration units under superblocks other than 128x128");
+    for (int k = 0; k < 2; k++) {
+      if (!(k ? chroma : luma)) continue;
+      const int size = RESTORATION_UNITSIZE_MAX >> k, u = cm->rst_info[k].restoration_unit_size;
+      avm_wb_write_bit(&wb, u == size >> 1);
+      if (u != size >> 1) avm_wb_write_bit(&wb, u == size);
+    }
+    for (int p = 0; p < av2_num_planes(cm); p++)
+      if (is_frame_filters_enabled(p) && to_readwrite_framefilters(&cm->rst_info[p], 0, 0))
+        for (const uint8_t bit : st.lr_filter_bits(p)) avm_wb_write_bit(&wb, bit);
+  } else
+#endif
+  if (seq->enable_restoration) {  // decode_restoration_mode(): CodecState::begin_frame() set the tools
+    for (int p = 0; p < av2_num_planes(cm); p++) {
+      const FeatureFlags& f = cm->features;
+      int ndx = 0;  // the inverse of index_to_frame_restoration_type()
+      for (int r = RESTORE_NONE; r < cm->rst_info[p].frame_restoration_type; r++) ndx += !((f.lr_tools_disable_mask[p] >> r) & 1);
+      // rb_read_uniform()
+      const int n = f.lr_frame_tools_count[p], l = get_unsigned_bits(n), m = (1 << l) - n;
+      if (ndx < m) {
+        avm_wb_write_literal(&wb, ndx, l - 1);
+      } else {
+        avm_wb_write_literal(&wb, m + ((ndx - m) >> 1), l - 1);
+        avm_wb_write_bit(&wb, (ndx - m) & 1);
+      }
+      const RestorationInfo& rsi = cm->rst_info[p];
+      if (rsi.frame_restoration_type == RESTORE_WIENER_NONSEP) {  // one filter for the frame, not a reference's
+        if (!rsi.frame_filters_on || rsi.temporal_pred_flag || rsi.num_filter_classes != 1 || p == 0)
+          throw std::logic_error("Wiener-nonsep other than one chroma frame filter");
+        avm_wb_write_bit(&wb, 1);  // frame_filters_on
+        if (!frame_is_intra_only(cm) && !frame_is_sframe(cm) && cm->ref_frames_info.num_total_refs > 0)
+          avm_wb_write_bit(&wb, 0);  // temporal_pred_flag
+      }
+    }
+    if (cm->mib_size != 32) throw std::logic_error("restoration units under superblocks other than 128x128");
+    if (cm->rst_info[0].frame_restoration_type != RESTORE_NONE) {  // 128x128 luma units
+      if (cm->rst_info[0].restoration_unit_size != RESTORATION_UNITSIZE_MAX >> 2)
+        throw std::logic_error("luma restoration units other than 128x128");
+      avm_wb_write_bit(&wb, 0);  // not 256
+      avm_wb_write_bit(&wb, 0);  // not 512
+    }
+    if (cm->rst_info[1].frame_restoration_type != RESTORE_NONE || cm->rst_info[2].frame_restoration_type != RESTORE_NONE) {
+      if (cm->rst_info[1].restoration_unit_size != RESTORATION_UNITSIZE_MAX >> 3)  // 64x64 at 4:2:0
+        throw std::logic_error("chroma restoration units other than 64x64");
+      avm_wb_write_bit(&wb, 0);  // not 128
+      avm_wb_write_bit(&wb, 0);  // not 256
+    }
+    for (int p = 1; p < av2_num_planes(cm); p++)  // read_wienerns_framefilters_hdr(), from CodecState::restore()
+      if (cm->rst_info[p].frame_restoration_type == RESTORE_WIENER_NONSEP)
+        for (const uint8_t bit : st.lr_filter_bits(p)) avm_wb_write_bit(&wb, bit);
+  }
   if (seq->enable_ccso) {  // setup_ccso(): no reuse of a reference's filters
     const CcsoInfo* const ci = &cm->ccso_info;
     avm_wb_write_bit(&wb, ci->ccso_frame_flag);
     for (int p = 0; ci->ccso_frame_flag && p < 3; p++) {
       avm_wb_write_bit(&wb, ci->ccso_enable[p]);
       if (!ci->ccso_enable[p]) continue;
+#ifdef CELV2_ORACLE
+      if (celv2::oracle::filters()) {
+        if (!frame_is_intra_only(cm)) avm_wb_write_bit(&wb, ci->reuse_ccso[p]), avm_wb_write_bit(&wb, ci->sb_reuse_ccso[p]);
+        const int refs = frame_is_intra_only(cm) || frame_is_sframe(cm) ? 0 : cm->ref_frames_info.num_total_refs;
+        if ((ci->reuse_ccso[p] || ci->sb_reuse_ccso[p]) && refs > 1) avm_wb_write_literal(&wb, ci->ccso_ref_idx[p], avm_ceil_log2(refs));
+        if (ci->reuse_ccso[p]) continue;
+      } else
+#endif
       if (!frame_is_intra_only(cm)) avm_wb_write_bit(&wb, 0), avm_wb_write_bit(&wb, 0);  // reuse_ccso, sb_reuse_ccso
       avm_wb_write_bit(&wb, ci->ccso_bo_only[p]);
       avm_wb_write_literal(&wb, ci->scale_idx[p], 2);
@@ -185,9 +304,12 @@ std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool
     if (cm->current_frame.skip_mode_info.skip_mode_allowed)
       avm_wb_write_bit(&wb, cm->current_frame.skip_mode_info.skip_mode_flag);
     if (seq->enable_bawp) avm_wb_write_bit(&wb, f->enable_bawp);
+    if (f->enabled_motion_modes & (1 << WARP_DELTA)) avm_wb_write_bit(&wb, f->allow_warpmv_mode);
   }
   avm_wb_write_literal(&wb, f->reduced_tx_set_used, 2);
   if (!key && seq->enable_global_motion) write_global_motion(&wb, cm, st.gm_ref_dist);
+  if (seq->film_grain_params_present && (cm->immediate_output_picture || cm->implicit_output_picture))
+    write_film_grain(&wb, cm->cur_frame->film_grain_params);
   // read_tile_indices_in_tilegroup(): all tiles in this one tile group.
   if (multi_tile) avm_wb_write_bit(&wb, 0);  // tile_start_and_end_present_flag
   buf.resize(avm_wb_bytes_written(&wb));  // byte alignment with zero bits

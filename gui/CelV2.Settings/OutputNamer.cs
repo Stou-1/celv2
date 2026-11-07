@@ -21,6 +21,18 @@ namespace CelV2.Settings
             }
         }
 
+        // <folder>\<stem><ext> for one new file, "<stem> (2)<ext>" ... while that exists (name as in Stem).
+        public static string FreeFile(string folder, string inputPath, string ext, string name = null)
+        {
+            string clean = Clean(name);
+            if (clean.Length == 0) clean = Path.GetFileNameWithoutExtension(inputPath);
+            for (int n = 1; ; n++)
+            {
+                string path = Path.Combine(folder, (n == 1 ? clean : clean + " (" + n + ")") + ext);
+                if (!File.Exists(path)) return path;
+            }
+        }
+
         // Why a user's output name cannot be a Windows file name, or null when it can (blank = the input's name, also fine).
         public static string BadName(string name)
         {

@@ -2,8 +2,11 @@
 #pragma once
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
+
+struct GrainParams;  // core/film_grain.h
 
 struct Frame420 {
   int width = 0, height = 0;     // visible size (may be odd)
@@ -13,6 +16,8 @@ struct Frame420 {
   // 8 bits for the decisions (the engines, the RD pass, scene cuts). At 8 bits hy..hv are empty.
   int bit_depth = 8;
   std::vector<uint16_t> hy, hu, hv;
+  // --grain: the film grain the decoder adds to this frame (the source, denoised; null: none).
+  std::shared_ptr<const GrainParams> grain;
   int stride_y() const { return pw; }
   int stride_uv() const { return pw / 2; }
 };

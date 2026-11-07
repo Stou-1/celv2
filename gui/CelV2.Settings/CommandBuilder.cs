@@ -80,8 +80,8 @@ namespace CelV2.Settings
             return a.ToArray();
         }
 
-        // pass: celv2enc --pass 1 / 2 for the target size (null: one pass).
-        public static string[] EncodeArgs(EncodeSettings s, InputInfo i, string outputIvf, PassArgs pass = null)
+        // pass: celv2enc --pass 1 / 2 for the target size (null: one pass). ffmpeg: the one --target-vmaf scores with.
+        public static string[] EncodeArgs(EncodeSettings s, InputInfo i, string outputIvf, PassArgs pass = null, string ffmpeg = null)
         {
             PixelFormatFor(i, s.Output); // the same depth check as the decode side
             var a = new List<string> { "-i", "-", "-o", outputIvf, "--qindex", Inv(s.QIndex) };
@@ -108,6 +108,7 @@ namespace CelV2.Settings
             if (s.KQ != 0) { a.Add("--kq"); a.Add(Inv(s.KQ)); }
             if (s.DeblockDelta != 2) { a.Add("--deblock-delta"); a.Add(Inv(Math.Max(-16, Math.Min(15, s.DeblockDelta)))); }
             if (!s.Cdef) { a.Add("--cdef"); a.Add("0"); }
+            if (s.Grain >= 0) { a.Add("--grain"); a.Add(Inv(Math.Min(50, s.Grain))); }
             if (s.ParallelB != ParallelMode.Auto) { a.Add("--parallel-b"); a.Add(s.ParallelB == ParallelMode.On ? "1" : "0"); }
             if (s.Tune != TuneKind.None) { a.Add("--tune"); a.Add(s.Tune.ToString().ToLowerInvariant()); }
             if (s.MaxEffort) { a.Add("--preset"); a.Add("max"); }
@@ -118,6 +119,11 @@ namespace CelV2.Settings
                 a.AddRange(new[] { "--pass", Inv(pass.Pass), "--stats", pass.Stats });
                 if (pass.Pass == 2) { a.Add("--target-size"); a.Add(pass.TargetBytes.ToString(CultureInfo.InvariantCulture)); }
             }
+            else if (s.TargetVmaf > 0)
+            {
+                a.Add("--target-vmaf"); a.Add(s.TargetVmaf.ToString("0.##", CultureInfo.InvariantCulture));
+                if (ffmpeg != null) { a.Add("--ffmpeg"); a.Add(ffmpeg); }
+            }
             return a.ToArray();
         }
 
@@ -125,6 +131,42 @@ namespace CelV2.Settings
         public static long VideoBudget(long targetBytes, long audioBytes, long frames, bool mp4)
         {
             return targetBytes - audioBytes - ContainerBytes(frames, mp4);
+        }
+
+        // サイズ指定: the audio bitrate that keeps it to 1/8 of targetBytes over seconds, at least floor (AAC 32, HE-AACv2
+        // 12). 0 when kbps (the setting) is already within it: the audio is made as set, copied where it can be.
+        // shortcut: 1/8 is fixed, not weighed against the video; make it a setting if a target ever wants more audio.
+        public static int AudioKbpsForSize(long targetBytes, double seconds, int kbps, int floor)
+        {
+            if (seconds <= 0) return 0;
+            int cap = (int)(targetBytes / seconds / 1000);  // bytes / 8 x 8 bits
+            return cap >= kbps ? 0 : Math.Max(floor, cap);
+        }
+
+        // The IVF's bytes at qindex 255 by celv2enc's own model (src/core/size_control.cpp: pass-1 payload x
+        // 2^(-(q - pass-1 qindex) / 24), 32 + 12 a frame of IVF headers) from its --pass 1 stats; -1 unreadable.
+        // The model shrinks too fast so far from the pass-1 qindex, so over the budget here is over for real.
+        public static long CoarsestBytes(string stats)
+        {
+            string[] t = stats.Split(new[] { ' ', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            int q, n;
+            if (t.Length < 6 || t[0] != "celv2-stats" || !int.TryParse(t[4], out q) || !int.TryParse(t[5], out n) || t.Length < 6 + n)
+                return -1;
+            double sum = 0;
+            for (int i = 0; i < n; i++)
+            {
+                long b;
+                if (!long.TryParse(t[6 + i], NumberStyles.None, CultureInfo.InvariantCulture, out b)) return -1;
+                sum += b;
+            }
+            return 32 + 12L * n + (long)Math.Round(sum * Math.Pow(2, -(255 - q) / 24.0));
+        }
+
+        // The budget of the next pass 2 after one over by `over` bytes: the excess and 1% less, but at least 3% less,
+        // about 1 qindex (2^(1/24)), so the start qindex moves and the try is not the last one again.
+        public static long RetryBudget(long budget, long over)
+        {
+            return budget - Math.Max(over + budget / 100, budget * 3 / 100);
         }
 
         // MP4's boxes beyond the video and audio data; separate files have none (the IVF's own headers

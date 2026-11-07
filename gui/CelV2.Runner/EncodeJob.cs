@@ -36,10 +36,13 @@ namespace CelV2.Runner
         EncodeSettings settings;
         IMuxStep mux;
         long framesCoded;                       // last `progress frame=N` seen
+        int sizeKbps;                           // サイズ指定's audio bitrate (CommandBuilder.AudioKbpsForSize), 0 = as set
 
         public event Action<JobProgress> Progress;            // raised on the thread that calls Run
         public event Action<string> EngineLine;               // "celv2: decisions on ..." once
         public event Action<string> Stage;                    // what runs before the encode (QualityProbe)
+        public event Action<string> Log;                      // tool command lines, their messages, the result; any thread
+        public event Action<FrameInfo> FrameCoded;            // each `progress frame=` line, on the thread that calls Run
 
         // mux == null: MP4 settings get an Mp4Mux named after the output stem, anything else SeparateFilesMux.
         // outputName: the file name without extension (OutputNamer.Stem); null uses the input's name.
@@ -68,7 +71,7 @@ namespace CelV2.Runner
         [DllImport("ntdll.dll")] static extern int RtlGetVersion(ref OsVersionInfo v);
 
         // Environment.OSVersion reports 6.2 to an exe without a compatibility manifest.
-        static int OsBuild()
+        internal static int OsBuild()
         {
             var v = new OsVersionInfo { Size = Marshal.SizeOf(typeof(OsVersionInfo)) };
             return RtlGetVersion(ref v) == 0 ? v.Build : 0;
@@ -80,6 +83,9 @@ namespace CelV2.Runner
         {
             var result = new JobResult();
             var partial = new List<string>();
+            var outerLog = Proc.Log;
+            Proc.Log = l => { var h = Log; if (h != null) h(l); };
+            Proc.Log("入力: " + input);
             try
             {
                 RunCore(cancel, result, partial);
@@ -90,13 +96,15 @@ namespace CelV2.Runner
             catch (Exception e)
             {
                 if (cancel.IsCancellationRequested) result.Cancelled = true; // a tool killed by the cancel failed on purpose
-                else result.Error = e.Message;
+                else result.Error = result.Note == null ? e.Message : e.Message + "（" + result.Note + "）";
             }
             if (!result.Ok)
             {
                 foreach (string p in partial) DeleteWithRetry(p);
                 result.Outputs = new string[0];
             }
+            Proc.Log(result.Ok ? "結果: 成功 " + string.Join(", ", result.Outputs) : result.Cancelled ? "結果: 中止" : "結果: 失敗: " + result.Error);
+            Proc.Log = outerLog;
             return result;
         }
 
@@ -118,7 +126,13 @@ namespace CelV2.Runner
             bool heAac = settings.HeAacV2 && info.AudioCodec != null && tools.Fdkaac != null;
             if (settings.HeAacV2 && info.AudioCodec != null && tools.Fdkaac == null)
                 result.Note = (result.Note == null ? "" : result.Note + "、") + "fdkaac が見つからないため、音声は HE-AACv2 にせず通常どおり保存しました";
-            string audioExt = info.AudioCodec == null ? null : mp4 || heAac ? ".m4a" : CommandBuilder.AudioExtensionFor(info.AudioCodec);
+            sizeKbps = settings.TargetSizeMB > 0 && info.AudioCodec != null
+                ? CommandBuilder.AudioKbpsForSize((long)Math.Floor(settings.TargetSizeMB * 1e6), info.DurationSeconds,
+                                                  heAac ? settings.HeAacKbps : settings.AudioKbps, heAac ? 12 : 32)
+                : 0;
+            if (sizeKbps > 0)
+                result.Note = (result.Note == null ? "" : result.Note + "、") + "音声 " + sizeKbps + " kbps（サイズ指定に合わせて）";
+            string audioExt = info.AudioCodec == null ? null : mp4 || heAac || sizeKbps > 0 ? ".m4a" : CommandBuilder.AudioExtensionFor(info.AudioCodec);
             string badName = OutputNamer.BadName(outputName);
             if (badName != null) throw new InvalidOperationException("出力名「" + outputName + "」: " + badName);
             Directory.CreateDirectory(outputFolder);
@@ -133,7 +147,7 @@ namespace CelV2.Runner
             if (mp4) partial.Add(stem + ".mp4");
             partial.Add(ivf);
 
-            if (settings.KeepUnderSource && settings.TargetSizeMB <= 0) // a target size is the stronger limit
+            if (settings.KeepUnderSource && settings.TargetSizeMB <= 0 && settings.TargetVmaf <= 0) // a target size or VMAF is the stronger limit
             {
                 int q = QualityProbe.Pick(tools, input, info, settings, cancel, m => { var h = Stage; if (h != null) h(m); });
                 if (q != settings.QIndex)
@@ -157,7 +171,7 @@ namespace CelV2.Runner
         }
 
         // サイズ指定: pass 1 into %TEMP%, the audio, then pass 2 at the video's budget. Over the target (celv2enc's
-        // exit 3, or the muxed whole) the budget goes down by the excess and 1% and pass 2 runs again, 3 times at most.
+        // exit 3, or the muxed whole) the budget goes down (CommandBuilder.RetryBudget) and pass 2 runs again, 3 times at most.
         IReadOnlyList<string> EncodeToSize(CancellationToken cancel, JobResult result, List<string> partial, string ivf, string audio, bool mp4, bool heAac)
         {
             long target = (long)Math.Floor(settings.TargetSizeMB * 1e6);
@@ -178,6 +192,11 @@ namespace CelV2.Runner
                 if (audioBytes >= target)
                     throw new InvalidOperationException("音声だけで指定サイズを超えます（音声 " + audioBytes + " バイト、指定 " + target + " バイト）");
                 long budget = CommandBuilder.VideoBudget(target, audioBytes, frames, mp4), last = 0;
+                long coarsest = CommandBuilder.CoarsestBytes(File.ReadAllText(stats));
+                if (coarsest > budget)  // pass 2 would only find it out at the end
+                    throw new InvalidOperationException("指定サイズに収まりません: いちばん粗い画質（qindex 255）でも映像が約 " +
+                        (coarsest / 1e6).ToString("0.00", CultureInfo.InvariantCulture) + " MB になる見込みで、映像に使える " +
+                        (budget / 1e6).ToString("0.00", CultureInfo.InvariantCulture) + " MB を超えます。指定サイズを大きくするか、動画を短くしてください");
                 for (int retry = 0; retry <= 3 && budget > 0; retry++)
                 {
                     RaiseStage(retry == 0 ? "本番（2 回目）" : "本番（2 回目、やり直し " + retry + "）");
@@ -207,7 +226,7 @@ namespace CelV2.Runner
                         over = last - target;
                         foreach (string o in outputs) DeleteWithRetry(o);
                     }
-                    budget -= over + budget / 100;
+                    budget = CommandBuilder.RetryBudget(budget, over);
                 }
                 throw new InvalidOperationException("指定サイズに収まりませんでした（最後: " + last + " バイト、指定 " + target + " バイト）");
             }
@@ -228,8 +247,11 @@ namespace CelV2.Runner
                 EncodeHeAac(cancel, mp4 ? seconds : (double?)null, audio);
                 return;
             }
-            var args = mp4 ? CommandBuilder.Mp4AudioArgs(input, info.AudioCodec, seconds, audio, settings.AudioKbps)
-                           : CommandBuilder.AudioArgs(input, info.AudioCodec, audio, settings.AudioKbps);
+            // With sizeKbps no codec: never copied, AAC at that bitrate.
+            string codec = sizeKbps > 0 ? null : info.AudioCodec;
+            int kbps = sizeKbps > 0 ? sizeKbps : settings.AudioKbps;
+            var args = mp4 ? CommandBuilder.Mp4AudioArgs(input, codec, seconds, audio, kbps)
+                           : CommandBuilder.AudioArgs(input, codec, audio, kbps);
             var r = Proc.Capture(tools.Ffmpeg, args, cancel);
             if (cancel.IsCancellationRequested) throw new Cancelled();
             if (r.ExitCode != 0)
@@ -259,7 +281,7 @@ namespace CelV2.Runner
                 if (cancel.IsCancellationRequested) throw new Cancelled();
                 if (r.ExitCode != 0)
                     throw new InvalidOperationException("音声の取り出しに失敗しました: " + Proc.Tail(r.Err, 4));
-                r = Proc.Capture(tools.Fdkaac, CommandBuilder.FdkaacArgs(wav, m4a, settings.HeAacKbps), cancel);
+                r = Proc.Capture(tools.Fdkaac, CommandBuilder.FdkaacArgs(wav, m4a, sizeKbps > 0 ? sizeKbps : settings.HeAacKbps), cancel);
                 if (cancel.IsCancellationRequested) throw new Cancelled();
                 if (r.ExitCode != 0)
                     throw new InvalidOperationException("HE-AACv2 への変換に失敗しました: " + Proc.Tail(r.Err, 4));
@@ -289,15 +311,16 @@ namespace CelV2.Runner
             Process ff = null, enc = null;
             Thread copier = null;
             bool killedFf = false;
+            var log = Proc.Log ?? (l => { });  // the handlers below run on other threads
             try
             {
                 framesCoded = 0;
                 ff = Proc.Start(tools.Ffmpeg, CommandBuilder.DecodeArgs(input, info, settings.Output), false, true, true);
                 // ffmpeg's stderr must be drained or a chatty ffmpeg blocks on a full pipe
-                ff.ErrorDataReceived += (s, e) => { if (e.Data != null) Keep(ffTail, e.Data); };
+                ff.ErrorDataReceived += (s, e) => { if (e.Data != null) { Keep(ffTail, e.Data); log("[ffmpeg] " + e.Data); } };
                 ff.BeginErrorReadLine();
-                enc = Proc.Start(tools.CelV2enc, CommandBuilder.EncodeArgs(settings, info, ivf, pass), true, true, true);
-                enc.OutputDataReceived += (s, e) => { if (e.Data != null) Keep(encTail, e.Data); };
+                enc = Proc.Start(tools.CelV2enc, CommandBuilder.EncodeArgs(settings, info, ivf, pass, tools.Ffmpeg), true, true, true);
+                enc.OutputDataReceived += (s, e) => { if (e.Data != null) { Keep(encTail, e.Data); log(e.Data); } };
                 enc.BeginOutputReadLine();
 
                 var ffRef = ff; var encRef = enc;
@@ -311,14 +334,16 @@ namespace CelV2.Runner
                     string line;
                     while ((line = enc.StandardError.ReadLine()) != null)
                     {
-                        int frame;
-                        if (line.StartsWith("progress frame=", StringComparison.Ordinal)
-                            && int.TryParse(line.Substring(15), out frame))
+                        var fi = ProgressLine.Parse(line);
+                        if (fi != null)
                         {
-                            framesCoded = frame;
-                            RaiseProgress(frame, clock.Elapsed.TotalSeconds);
+                            framesCoded = fi.Frame;
+                            RaiseProgress(fi.Frame, clock.Elapsed.TotalSeconds);
+                            var fc = FrameCoded; if (fc != null) fc(fi);
+                            continue;  // one per frame: not logged
                         }
-                        else if (line.StartsWith(EngineMarker, StringComparison.Ordinal) && result.EngineLine == null)
+                        log(line);
+                        if (line.StartsWith(EngineMarker, StringComparison.Ordinal) && result.EngineLine == null)
                         {
                             result.EngineLine = line;
                             var h = EngineLine; if (h != null) h(line);
@@ -340,6 +365,7 @@ namespace CelV2.Runner
                 if (cancel.IsCancellationRequested) throw new Cancelled();
 
                 OverKind over;
+                log("(celv2enc 終了コード " + enc.ExitCode + "、ffmpeg 終了コード " + (killedFf ? "止めた" : ff.ExitCode.ToString()) + "、" + framesCoded + " フレーム)");
                 lock (encTail) over = Pass2Over(pass, enc.ExitCode, encTail.ToList());
                 var why = new List<string>();
                 if (!killedFf && ff.ExitCode != 0) why.Add(Describe("ffmpeg", ff.ExitCode, ffTail));

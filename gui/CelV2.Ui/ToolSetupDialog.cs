@@ -7,7 +7,7 @@ using System.Windows.Forms;
 
 namespace CelV2.Ui
 {
-    // Shown when ffmpeg / ffprobe cannot be found; also lets the user point at MP4Box.
+    // Shown when ffmpeg / ffprobe cannot be found; also lets the user point at MP4Box and fdkaac.
     public sealed class ToolSetupDialog : Form
     {
         const string FfmpegUrl = "https://ffmpeg.org/download.html";
@@ -15,13 +15,16 @@ namespace CelV2.Ui
 
         readonly Label ffmpegState = new Label { Name = "ffmpegState", AutoSize = true };
         readonly Label mp4boxState = new Label { Name = "mp4boxState", AutoSize = true };
+        readonly Label fdkaacState = new Label { Name = "fdkaacState", AutoSize = true };
 
         // Folders the user picked; null while nothing was picked.
         public string FfmpegFolder { get; private set; }
         public string Mp4BoxFolder { get; private set; }
+        public string FdkaacFolder { get; private set; }
 
-        public ToolSetupDialog(string currentFfmpegFolder, string currentMp4BoxFolder)
+        public ToolSetupDialog(string currentFfmpegFolder, string currentMp4BoxFolder, string currentFdkaacFolder = null)
         {
+            FdkaacFolder = currentFdkaacFolder;
             FfmpegFolder = currentFfmpegFolder;
             Mp4BoxFolder = currentMp4BoxFolder;
             Text = "必要なツールの設定";
@@ -45,6 +48,10 @@ namespace CelV2.Ui
             panel.Controls.Add(Link("GPAC（MP4Box）の入手先: " + GpacUrl, GpacUrl));
             panel.Controls.Add(Pick("mp4box.exe を選ぶ", "MP4Box.exe", mp4boxState, f => Mp4BoxFolder = f, false));
             panel.Controls.Add(mp4boxState);
+            panel.Controls.Add(Text_("fdkaac（任意）", true));
+            panel.Controls.Add(Text_("「HE-AACv2 に変換する」に使います（libfdk-aac を組み込んだ fdkaac.exe。このアプリには同梱していません）。選ばないときは ffmpeg のフォルダとこのアプリのフォルダを探します。", false));
+            panel.Controls.Add(Pick("fdkaac.exe を選ぶ", "fdkaac.exe", fdkaacState, f => FdkaacFolder = f, false));
+            panel.Controls.Add(fdkaacState);
             var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, Margin = new Padding(3, 14, 3, 3) };
             var cancel = new Button { Text = "キャンセル", DialogResult = DialogResult.Cancel, AutoSize = true, Margin = new Padding(3, 14, 3, 3) };
             var row = new FlowLayoutPanel { AutoSize = true };
@@ -55,6 +62,7 @@ namespace CelV2.Ui
             CancelButton = cancel;
             ShowState(ffmpegState, FfmpegFolder, "ffmpeg.exe");
             ShowState(mp4boxState, Mp4BoxFolder, "MP4Box.exe");
+            ShowState(fdkaacState, FdkaacFolder, "fdkaac.exe");
         }
 
         static Label Text_(string text, bool bold)

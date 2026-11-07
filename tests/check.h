@@ -23,10 +23,14 @@
     }                                                                           \
   } while (0)
 
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 
 // Runs one test case; an escaping exception counts as a failure and prints its message.
+// CHECK_ONLY=<name> runs only the case of that name.
 inline int run_test(const char* name, int (*fn)()) {
+  if (const char* only = std::getenv("CHECK_ONLY"); only && std::strcmp(only, name) != 0) return 0;
   try {
     const int r = fn();
     if (r) std::fprintf(stderr, "FAILED: %s\n", name);

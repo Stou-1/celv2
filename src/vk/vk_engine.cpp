@@ -1,6 +1,7 @@
 #include "vk/vk_engine.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -90,16 +91,24 @@ struct VulkanEngine::Impl {
     b = ctx.host_buffer(n);
   }
 
+  char layout = '1';  // vk_phase_layout()'s
+  static constexpr uint64_t kOnDemand = 1ull << 63, kHalf = 1ull << 62;
+
   // GpuEngine::Impl::upload, recorded in the open batch: the padded luma plane and its pyramid; a
   // reference's level 0 also gets its quarter-pel phases.
   void upload(const Frame420& f, Pyramid& p, bool phases) {
     const size_t n = f.y.size();
-    ensure(p.lv[0], phases ? n * celv2::kSubpelPhases : n);
+    ensure(p.lv[0], !phases || layout == 'A' ? n : layout == 'B' ? n * 4 : n * celv2::kSubpelPhases);
     ensure(p.stage, n);
     std::memcpy(p.stage.map, f.y.data(), n);
     ctx.copy(p.lv[0], 0, p.stage, 0, n);
     p.plane[0] = {&p.lv[0], f.stride_y(), f.pw, f.ph};
-    if (phases) {
+    if (phases && layout == 'A') {
+      p.plane[0].phase = kOnDemand;
+    } else if (phases && layout == 'B') {
+      k.subpel(p.plane[0], p.lv[0], n, true);
+      p.plane[0].phase = n | kHalf;
+    } else if (phases) {
       k.subpel(p.plane[0], p.lv[0], n);
       p.plane[0].phase = n;
     }
@@ -112,10 +121,27 @@ struct VulkanEngine::Impl {
   }
 };
 
-VulkanEngine::VulkanEngine(int width, int height, int sb_size, int device) {
+// How a reference's quarter-pel phases are held (the speed budget spec), by frame size: whole encode, 16 planes
+// against 4, 2026-11-05 (under load): 1080p 9.44 / 5.42 fps on the RTX 5090, 1.40 / 0.78 on the Arc Pro B50; 4K 2.09 /
+// 1.80, 0.42 / 0.26; 8K 1.90 / 1.95 s a frame, 4.6 / 5.4; 16K 7.3 / 7.1, 23.1 / 19.4. Between 8K and 16K is not
+// measured. Then by free VRAM: seven references' planes, and the rest, 4.6 GB at 16K (2026-11-04-vram-16k.md).
+char vk_phase_layout(int64_t pixels, uint64_t free_vram, int engines) {
+  free_vram /= static_cast<uint64_t>(std::max(engines, 1));
+  constexpr int64_t kHalfPlanesFrom = 8192ll * 8192;
+  constexpr uint64_t kOtherPerPixel = 35;
+  auto fits = [&](int planes) { return static_cast<uint64_t>(pixels) * (planes * 7 + kOtherPerPixel) <= free_vram; };
+  if (pixels < kHalfPlanesFrom && fits(celv2::kSubpelPhases)) return '1';
+  return fits(4) ? 'B' : fits(1) ? 'A' : 0;
+}
+
+VulkanEngine::VulkanEngine(int width, int height, int sb_size, int device, int engines) {
   if (width <= 0 || height <= 0) throw std::runtime_error("VulkanEngine: frame size must be positive");
   if (sb_size != 64) throw std::runtime_error("VulkanEngine: only 64x64 superblocks are supported");
   impl_ = std::make_unique<Impl>(width, height, sb_size, device);
+  const char* const e = std::getenv("CELV2_VK_PHASES");  // A, B or 16: that layout (tests)
+  impl_->layout = e && (*e == 'A' || *e == 'B') ? *e : e ? '1'
+                  : vk_phase_layout(static_cast<int64_t>(width) * height, impl_->ctx.free_vram(), engines);
+  if (!impl_->layout) throw std::runtime_error("VulkanEngine: not enough free VRAM");
 }
 
 VulkanEngine::~VulkanEngine() = default;
@@ -192,6 +218,7 @@ void VulkanEngine::launch(const Frame420& src, const std::vector<const Frame420*
         slot->key = key;
       }
       slot->used = now;
+      celv2::vk::DevPlane p0 = slot->p.plane[0];
       int cols = 0, rows = 0;
       for (int l = celv2::kMeLevels - 1; l >= 0; l--) {  // GpuEngine::launch's motion search
         const int pcols = cols, prows = rows;
@@ -199,11 +226,11 @@ void VulkanEngine::launch(const Frame420& src, const std::vector<const Frame420*
         const size_t n = static_cast<size_t>(cols) * rows * sizeof(int);
         m.ensure(m.mvx[ri][l], n), m.ensure(m.mvy[ri][l], n);
         const bool top = l == celv2::kMeLevels - 1;
-        m.k.me_level(cs.p.plane[l], slot->p.plane[l], top ? nullptr : &m.mvx[ri][l + 1],
+        m.k.me_level(cs.p.plane[l], l == 0 ? p0 : slot->p.plane[l], top ? nullptr : &m.mvx[ri][l + 1],
                      top ? nullptr : &m.mvy[ri][l + 1], top ? 0 : pcols, top ? 0 : prows, m.mvx[ri][l], m.mvy[ri][l],
                      cols, rows, l == 0);
       }
-      vr.plane[ri] = slot->p.plane[0];
+      vr.plane[ri] = p0;
       vr.mvx[ri] = &m.mvx[ri][0], vr.mvy[ri] = &m.mvy[ri][0];
       vr.mv_cols = cols, vr.mv_rows = rows;
     }

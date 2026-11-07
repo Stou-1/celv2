@@ -42,12 +42,14 @@ namespace CelV2.Settings
         [DataMember] public int KQ;                         // --kq: qindex offset of keyframes
         [DataMember] public int DeblockDelta;               // --deblock-delta, -16..15
         [DataMember] public bool Cdef;                      // --cdef
+        [DataMember] public int Grain;                      // --grain: noise removed and sent as film grain, 1..50; 0 = off; -1 = celv2enc default (--tune film: 25, else off)
         [DataMember] public ParallelMode ParallelB;         // --parallel-b
         [DataMember] public int AudioKbps;                  // AAC bitrate when the audio is re-encoded
         [DataMember] public bool HeAacV2;                   // always re-encode the audio to stereo HE-AACv2 (fdkaac)
         [DataMember] public int HeAacKbps;                  // its bitrate, 12..96
         [DataMember] public int Workers;                    // celv2enc --workers: scene chunks coded at once; 0 = auto
         [DataMember] public double TargetSizeMB;            // the whole output at most this (1 MB = 1,000,000 bytes), 2 passes; 0 = off
+        [DataMember] public double TargetVmaf;              // each scene at about this VMAF (celv2enc --target-vmaf); 0 = off; not with TargetSizeMB
         [DataMember] public TuneKind Tune;                  // --tune: settings by content
         [DataMember] public bool MaxEffort;                 // --preset max: speed ignored for quality and size
 
@@ -76,6 +78,7 @@ namespace CelV2.Settings
             KQ = 0;
             DeblockDelta = 2;
             Cdef = true;
+            Grain = -1;
             ParallelB = ParallelMode.Auto;
             AudioKbps = 192;
             HeAacKbps = 32;

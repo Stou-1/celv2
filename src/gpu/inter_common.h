@@ -33,10 +33,15 @@ CELV2_HD int subpel_px(const Plane& src, int y, int x, int qy, int qx) {
 }
 
 constexpr int kMeRange = 8;
-// Level 0 (full resolution) searches +-4 around the coarser level's MV: 16K 1.52 -> 1.70 fps, BD-rate
-// +0.0 / -0.2% on anime clips (+-2: 1.74 fps, +0.1 / -0.2%).
-constexpr int kMeRange0 = 4;
-constexpr int kMeLevels = 3;
+// Level 0 (full resolution) searches +-8 around the coarser level's MV. 2026-11-02, with 5 levels and
+// kSubpelPenalty 16, 120 frames 1080p q100-190 against +-4 / 32, global PSNR-Y: Angel Beats -0.80%,
+// Dragon Maid -0.66%, 吉村 -0.61%, AIR -0.40%, chika -0.30%, AM -0.14%, crowd_run -0.10%, park_joy
+// -0.06%; Dragon Maid q130 about 4% slower. (With 3 levels, +-4 against +-8: 16K 1.52 -> 1.70 fps.)
+constexpr int kMeRange0 = 8;
+// 5 levels reach about +-250 px (3 reached +-52). 120 frames 1080p q100-190 against 3, global PSNR-Y: Dragon
+// Maid -10.0%, Angel Beats -5.1%, park_joy -1.3%, AM -1.2%, chika -0.9%, crowd_run -0.2%, 吉村 +0.1%, AIR +0.8%;
+// 4 levels at +-16 a level: -2.2% on average too, with more loss on AIR (+1.2%).
+constexpr int kMeLevels = 5;
 constexpr int kInterBits = 3;  // bits charged for an inter (NEWMV) block
 constexpr int kMaxRefs = 7;    // AV2's INTER_REFS_PER_FRAME
 // Bits added to intra blocks of inter frames: their coded cost runs well above their SATD's (anime,
@@ -98,9 +103,10 @@ CELV2_HD int sad8(const Plane& cur, int x, int y, const Plane& ref, int mvx, int
   return sad;
 }
 
-// Best MV of the 8x8 block (bx, by) of one pyramid level around the predictor (px, py).
-CELV2_HD void me_search(const Plane& cur, const Plane& ref, int bx, int by, int px, int py, int range,
-                       int* mvx, int* mvy) {
+// Best MV of the 8x8 block (bx, by) of one pyramid level around the predictor (px, py); returns its
+// cost (SAD plus the distance penalty).
+CELV2_HD int me_search(const Plane& cur, const Plane& ref, int bx, int by, int px, int py, int range,
+                      int* mvx, int* mvy) {
   int best = 0x7fffffff;
   *mvx = px, *mvy = py;
   for (int dy = -range; dy <= range; dy++)
@@ -109,6 +115,7 @@ CELV2_HD void me_search(const Plane& cur, const Plane& ref, int bx, int by, int 
                     kMePenalty * ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy));
       if (s < best) best = s, *mvx = px + dx, *mvy = py + dy;
     }
+  return best;
 }
 
 // SATD of the 8x8 block at (x, y) predicted from ref with a quarter-pel MV.
@@ -128,8 +135,9 @@ CELV2_HD int satd8_q(const Plane& cur, int x, int y, const Plane& ref, int qmx, 
 // Quarter-pel MV of level-0 block (bx, by) from its integer one (ref has its phases): the best by
 // SATD (first strict minimum, the centre first) of it and its 8 half-pel neighbours, then of that
 // and its 8 quarter-pel neighbours. A move must save kSubpelPenalty: neighbouring cells then share
-// more MVs, which AV2 codes as NEARMV instead of a difference (16 / 32: -0.4 / -0.5% BD-rate).
-constexpr int kSubpelPenalty = 32;
+// more MVs, which AV2 codes as NEARMV instead of a difference (16 / 32: -0.4 / -0.5% BD-rate with 3
+// levels; with 5, 16 beats 32 on all five sources tried, 8 and 64 do worse; see kMeRange0).
+constexpr int kSubpelPenalty = 16;
 CELV2_HD void me_refine(const Plane& cur, const Plane& ref, int bx, int by, int* mvx, int* mvy) {
   int cx = *mvx * 4, cy = *mvy * 4;
   for (int step = 2; step >= 1; step--) {
@@ -146,14 +154,18 @@ CELV2_HD void me_refine(const Plane& cur, const Plane& ref, int bx, int by, int*
 }
 
 // Motion search of 8x8 block (bx, by) of one level. (pmx, pmy) is the coarser level's field of
-// pcols x prows (nullptr at the top): the search centre is the best (by SAD) of its MV under this
-// block, its 4 neighbours and zero, all scaled to this level.
+// pcols x prows (nullptr at the top): the search runs around the two best different centres (by SAD)
+// of its MV under this block, its 4 neighbours and zero, all scaled to this level, and keeps the
+// cheaper result (2026-11-02, 120 frames 1080p q100-190 against the best centre only, global PSNR-Y:
+// Dragon Maid -1.80%, Angel Beats -0.79%, chika -0.62%, AM -0.52%, crowd_run -0.13%, AIR -0.08%,
+// park_joy +0.05%, 吉村 +0.15%; Dragon Maid q130 about 5% slower).
 CELV2_HD void me_cell(const Plane& cur, const Plane& ref, int bx, int by, const int* pmx, const int* pmy,
                      int pcols, int prows, int* mvx, int* mvy, bool level0 = false) {
-  int px = 0, py = 0;
+  int px = 0, py = 0, px2 = 0, py2 = 0;
+  bool two = false;
   if (pmx) {
     const int ox[5] = {0, -1, 1, 0, 0}, oy[5] = {0, 0, 0, -1, 1};
-    int best = 0x7fffffff;
+    int best = 0x7fffffff, second = 0x7fffffff;
     for (int k = 0; k < 6; k++) {
       int cx = 0, cy = 0;  // k == 5: zero
       if (k < 5) {
@@ -162,11 +174,22 @@ CELV2_HD void me_cell(const Plane& cur, const Plane& ref, int bx, int by, const 
         qy = qy < 0 ? 0 : qy >= prows ? prows - 1 : qy;
         cx = 2 * pmx[qy * pcols + qx], cy = 2 * pmy[qy * pcols + qx];
       }
+      if ((k > 0 && cx == px && cy == py) || (two && cx == px2 && cy == py2)) continue;  // each centre once
       const int s = sad8(cur, bx * 8, by * 8, ref, cx, cy);
-      if (s < best) best = s, px = cx, py = cy;
+      if (s < best) {
+        if (k > 0) second = best, px2 = px, py2 = py, two = true;
+        best = s, px = cx, py = cy;
+      } else if (s < second) {
+        second = s, px2 = cx, py2 = cy, two = true;
+      }
     }
   }
-  me_search(cur, ref, bx, by, px, py, level0 ? kMeRange0 : kMeRange, mvx, mvy);
+  const int range = level0 ? kMeRange0 : kMeRange;
+  const int cost = me_search(cur, ref, bx, by, px, py, range, mvx, mvy);
+  if (two) {
+    int mx2, my2;
+    if (me_search(cur, ref, bx, by, px2, py2, range, &mx2, &my2) < cost) *mvx = mx2, *mvy = my2;
+  }
 }
 
 // Compound candidates: the best single candidate of the two best references, averaged. AV2 codes a

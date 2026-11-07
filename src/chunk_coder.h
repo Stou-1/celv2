@@ -20,6 +20,7 @@ struct ChunkFrame {
   Frame420 f;
   int display = 0;
   bool key = false;
+  double change = 0;  // ChangeMeter's share of 16x16 blocks changed from the previous frame
 };
 
 // The frames read ahead of the coders, at most `limit` (the reader waits for room).
@@ -52,6 +53,7 @@ class FrameQueue {
   // chunk, re-coded when the whole file is over --target-size.
   void keep();
   void rewind();
+  void release();  // drops the kept frames (their budget back) and stops keeping
 
  private:
   FrameBudget& budget_;
@@ -70,6 +72,13 @@ struct CodedFrame {
   int display = 0;
   double psnr[3] = {0, 0, 0};
   std::vector<uint8_t> recon;
+  // For --progress: K keyframe, P lone frame, A a mini-GOP's anchor, B the others (mids too); the
+  // qindex the frame was coded at (0-255, its pipeline's offset included).
+  char type = 'P';
+  int qindex = 0;
+  // The frame's own bytes: tu's, less the hidden frames it carries, plus its own hidden frame's
+  // when tu only shows it (an anchor, a mid). Over a stream they add up to the units' sizes.
+  size_t bytes = 0;
 };
 
 // celv2enc's options the frame loop reads, and what main derives from them.
@@ -79,9 +88,17 @@ struct LoopConfig {
   bool psnr = false, recon = false;
   bool pyramid = true, deltaq = false;
   int tplq = 0, bq = 16, aq = -16, mq = 0, kq = 0;
-  int key_boost = 48, anchor_boost = 24, level_step = 8, level_step16 = -1;
+  bool key_filter = false;  // --key-filter
+  int key_boost = 48, anchor_boost = 0, level_step = 8, level_step16 = -1;
   double gop_still = 0;
   bool gop_trial = false;
+  double paq = 0;  // --paq strength (0: off)
+  double psy_rd = 0;  // --psy-rd strength (0: off): the frame's importance map built for it too
+  double psy_trellis = 0;  // --psy-trellis strength (0: off): likewise
+  // --gop-change: a mini-GOP ends at a frame whose share of changed blocks passes this, 4 frames at
+  // least after the last one (that frame its anchor; 0: off).
+  double gop_change = 0;
+  int screen = 0;  // --screen: 0 off, 1 every frame, 2 (auto) the per-frame gate (core/screen_gate.h)
 };
 
 class ChunkCoder {

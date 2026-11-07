@@ -10,21 +10,21 @@
 #include "core/encoder.h"
 #include "gpu/decision_engine.h"
 
-// Vulkan / Vulkan2: the Vulkan engine on the first / second discrete GPU.
-enum class Device { Auto, Gpu, Cpu, Vulkan, Vulkan2 };
+// Vulkan / Vulkan2: the Vulkan engine on the first / second discrete GPU. Gpu: Vulkan under the name
+// saved settings and scripts use. Cuda: the CUDA engine, kept for one release to compare with.
+enum class Device { Auto, Gpu, Cuda, Cpu, Vulkan, Vulkan2 };
 
-// Auto: GpuEngine if probe() succeeds, else the Vulkan engine on the first discrete GPU (in a
-// build with Vulkan), else CpuEngine. Gpu: GpuEngine, or std::runtime_error
-// ("no usable GPU: <reason>") if probe() fails. Cpu: CpuEngine, without calling probe.
-// description receives the one-line choice ("decisions on GPU / Vulkan / CPU (...)").
+// Auto: the Vulkan engine on the first discrete GPU, else CpuEngine. Gpu: that engine, or
+// std::runtime_error ("no usable GPU: <reason>"). Cuda: GpuEngine, or std::runtime_error ("no usable
+// CUDA GPU: <reason>") if probe() fails; only Cuda calls probe. Cpu: CpuEngine.
+// description receives the one-line choice ("decisions on Vulkan / CUDA / CPU (...)").
 std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height, int tile_threads,
                                             const std::function<ProbeResult()>& probe,
-                                            std::string* description);
+                                            std::string* description, int engines = 1);
 
-// The decision devices this machine can use, as (--device value, name): the CUDA GPU if probe()
-// passes ("gpu", "<name> (CUDA)"), the first two Vulkan GPUs ("vulkan", "vulkan2", "<name>
-// (Vulkan)") in a build with Vulkan, then ("cpu", "CPU").
-std::vector<std::pair<std::string, std::string>> list_devices(const std::function<ProbeResult()>& probe);
+// The decision devices this machine can use, as (--device value, name): the first two Vulkan GPUs
+// ("vulkan", "vulkan2", "<name> (Vulkan)") in a build with Vulkan, then ("cpu", "CPU").
+std::vector<std::pair<std::string, std::string>> list_devices();
 
 class Pipeline {
  public:
@@ -90,5 +90,6 @@ class Pipeline {
   // engine_->collect(dm, gate), with the CPU RD pass (core/rd_pass.h) on every superblock before
   // its row reaches gate when cfg_.rd_pass is on, each superblock at qindex plus its sb_dq offset.
   void collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
-               int qindex, const std::vector<int>& sb_dq);
+               int qindex, const std::vector<int>& sb_dq, const celv2::AqMap* map = nullptr, bool screen = false,
+               const celv2::IntrabcIndex* ibc = nullptr);
 };

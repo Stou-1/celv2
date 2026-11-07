@@ -25,7 +25,11 @@ namespace CelV2.Ui
             public bool Done;
             public ListViewItem Row;
             public string OutputName;       // null: the input's file name
+            public bool MuxOnly;            // a dropped .ivf: put into an MP4 with its audio, not re-encoded
+            public bool Ready { get { return Info != null || MuxOnly; } }
         }
+
+        const string MuxOnlyNote = "MP4 にまとめる（再変換なし）";
 
         const int ColSize = 1, ColFps = 2, ColLength = 3, ColAudio = 4, ColNote = 5, ColStatus = 6;
 
@@ -45,6 +49,8 @@ namespace CelV2.Ui
         string engine = "";
         JobProgress latest;
         int progressPosted;
+        readonly EncodeDetails details = new EncodeDetails();  // what 「詳細...」 shows: the running or last encode
+        DetailsForm detailsForm;
 
         readonly Panel dropZone = new Panel { BorderStyle = BorderStyle.FixedSingle, Dock = DockStyle.Fill, AllowDrop = true };
         readonly Button pickButton = new Button { Name = "pickButton", Text = "ファイルを選ぶ", AutoSize = true };
@@ -55,9 +61,14 @@ namespace CelV2.Ui
         readonly ComboBox presetBox = new ComboBox { Name = "presetBox", DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
         // celv2enc --tune, in TuneKind's order; kept when the preset changes.
         readonly ComboBox tuneBox = new ComboBox { Name = "tuneBox", DropDownStyle = ComboBoxStyle.DropDownList, Width = 120 };
-        readonly CheckBox maxBox = new CheckBox { Name = "maxBox", Text = "とても遅いが最高画質", AutoSize = true };
+        // 標準, or とても遅い: --preset max, speed ignored for the smallest file at the same quality.
+        readonly ComboBox speedBox = new ComboBox { Name = "speedBox", DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
+        // With サイズ指定 on: the preset's qindex is not used (pass 2 takes the size's); its other settings are.
+        readonly Label targetSizeNote = new Label { Name = "targetSizeNote", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = SystemColors.GrayText };
         // The whole output at most this many MB (1 MB = 1,000,000 bytes), in 2 passes; 0 = off. Per session.
         readonly NumericUpDown targetSize = new NumericUpDown { Name = "targetSize", Minimum = 0, Maximum = 100000, DecimalPlaces = 1, Width = 80 };
+        // Each scene at about this VMAF (celv2enc --target-vmaf); 0 = off; it and targetSize exclude each other. Per session.
+        readonly NumericUpDown targetVmaf = new NumericUpDown { Name = "targetVmaf", Minimum = 0, Maximum = 100, DecimalPlaces = 1, Increment = 0.5m, Width = 60 };
         readonly Label customLabel = new Label { Name = "customLabel", Text = "（詳細設定で変更中）", AutoSize = true, Visible = false, Anchor = AnchorStyles.Left };
         readonly Button advancedButton = new Button { Name = "advancedButton", Text = "詳細設定...", AutoSize = true };
         readonly TextBox outputBox = new TextBox { Name = "outputBox", ReadOnly = true, Width = 330 };
@@ -69,6 +80,7 @@ namespace CelV2.Ui
         readonly Button cancelButton = new Button { Name = "cancelButton", Text = "中止", AutoSize = true, Enabled = false };
         readonly Button clearButton = new Button { Name = "clearButton", Text = "一覧を空にする", AutoSize = true };
         readonly Button toolsButton = new Button { Name = "toolsButton", Text = "ツール設定...", AutoSize = true };
+        readonly Button detailsButton = new Button { Name = "detailsButton", Text = "詳細...", AutoSize = true };
         readonly Label resultLabel = new Label { Name = "resultLabel", AutoSize = true, Anchor = AnchorStyles.Left, Visible = false };
         readonly Button openFolderButton = new Button { Name = "openFolderButton", Text = "フォルダを開く", AutoSize = true, Visible = false };
 
@@ -91,7 +103,8 @@ namespace CelV2.Ui
             tuneBox.Items.AddRange(new object[] { "なし", "アニメ", "実写", "静止画多め" });
             tuneBox.SelectedIndex = (int)app.LastTune >= 0 && (int)app.LastTune < tuneBox.Items.Count ? (int)app.LastTune : 0;
             BuildLayout();
-            maxBox.Checked = app.LastMaxEffort;  // before ReloadPresets, which copies it into the settings
+            speedBox.Items.AddRange(new object[] { "標準", "とても遅い（小さく）" });
+            speedBox.SelectedIndex = app.LastMaxEffort ? 1 : 0;  // before ReloadPresets, which copies it into the settings
             ReloadPresets(app.LastPreset);
             ShowOutputFolder();
             UpdateButtons();
@@ -100,9 +113,21 @@ namespace CelV2.Ui
             pickButton.Click += (a, b) => PickFiles();
             presetBox.SelectedIndexChanged += (a, b) => OnPresetChanged();
             tuneBox.SelectedIndexChanged += (a, b) => { current.Tune = SelectedTune; app.LastTune = SelectedTune; SaveSettings(); };
-            maxBox.CheckedChanged += (a, b) => { current.MaxEffort = maxBox.Checked; app.LastMaxEffort = maxBox.Checked; SaveSettings(); };
-            targetSize.ValueChanged += (a, b) => current.TargetSizeMB = (double)targetSize.Value;
+            speedBox.SelectedIndexChanged += (a, b) => { current.MaxEffort = MaxEffort; app.LastMaxEffort = MaxEffort; SaveSettings(); };
+            targetSize.ValueChanged += (a, b) =>
+            {
+                if (targetSize.Value > 0) targetVmaf.Value = 0;
+                current.TargetSizeMB = (double)targetSize.Value;
+                UpdateTargetNote();
+            };
+            targetVmaf.ValueChanged += (a, b) =>
+            {
+                if (targetVmaf.Value > 0) targetSize.Value = 0;
+                current.TargetVmaf = (double)targetVmaf.Value;
+                UpdateTargetNote();
+            };
             advancedButton.Click += (a, b) => OpenAdvanced();
+            detailsButton.Click += (a, b) => OpenDetails();
             outputButton.Click += (a, b) => PickOutputFolder();
             outputResetButton.Click += (a, b) => { app.OutputFolder = null; ShowOutputFolder(); SaveSettings(); };
             startButton.Click += (a, b) => StartEncode();
@@ -121,6 +146,7 @@ namespace CelV2.Ui
 
         public IReadOnlyList<string> PresetNames { get { return presets.Select(p => p.Name).ToList(); } }
         public string SelectedPresetName { get { return presetBox.SelectedItem as string; } }
+        bool MaxEffort { get { return speedBox.SelectedIndex == 1; } }
         public EncodeSettings EncodeSettingsForTest { get { return current.Clone(); } }
         public TuneKind SelectedTune { get { return tuneBox.SelectedIndex > 0 ? (TuneKind)tuneBox.SelectedIndex : TuneKind.None; } }
         public bool IsBusy { get { return busy; } }
@@ -135,6 +161,16 @@ namespace CelV2.Ui
             {
                 // a file still waiting is not added twice; a converted one can be added again (another name or settings)
                 if (items.Any(i => !i.Done && string.Equals(i.Path, path, StringComparison.OrdinalIgnoreCase))) continue;
+                if (string.Equals(System.IO.Path.GetExtension(path), ".ivf", StringComparison.OrdinalIgnoreCase))
+                {
+                    string audio = MuxOnly.FindAudio(path);
+                    var mux = new Item { Path = path, MuxOnly = true };
+                    mux.Row = new ListViewItem(new[] { System.IO.Path.GetFileName(path), "", "", "",
+                        audio == null ? "なし" : System.IO.Path.GetFileName(audio), MuxOnlyNote, "待機" });
+                    items.Add(mux);
+                    list.Items.Add(mux.Row);
+                    continue;
+                }
                 var item = new Item { Path = path };
                 item.Row = new ListViewItem(new[] { System.IO.Path.GetFileName(path), "", "", "", "", "", "調べ中" });
                 items.Add(item);
@@ -160,8 +196,12 @@ namespace CelV2.Ui
                     Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
-            var queue = items.Where(i => i.Info != null && !i.Done).ToList();
+            var queue = items.Where(i => i.Ready && !i.Done).ToList();
             if (queue.Count == 0) return;
+            string warning = queue.Any(i => !i.MuxOnly) ? MuxWarning(tools, current) : null;
+            if (warning != null && !(ConfirmMuxWarning != null ? ConfirmMuxWarning(warning)
+                    : MessageBox.Show(this, warning, Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes))
+                return;
             var unused = Handle; // make sure BeginInvoke has a window to post to
             busy = true;
             cts = new CancellationTokenSource();
@@ -171,6 +211,22 @@ namespace CelV2.Ui
             worker = new Thread(() => RunQueue(queue, t, settings, outFolder, token)) { IsBackground = true, Name = "celv2 encode queue" };
             worker.Start();
         }
+
+        // Asked before an MP4 run whose muxing tools are missing (null: nothing to ask); the job then saves the
+        // video and the audio as separate files instead.
+        public static string MuxWarning(ToolPaths t, EncodeSettings s)
+        {
+            if (s.Container != ContainerKind.Mp4) return null;
+            var missing = new List<string>();
+            if (t.Mp4Box == null) missing.Add("MP4Box");
+            if (t.Av2Mux == null) missing.Add("av2_mux");
+            if (missing.Count == 0) return null;
+            return string.Join(" と ", missing) + " が見つからないため、MP4 にまとめられません。映像（.ivf）と音声は別ファイルで保存します。\n\n" +
+                   "このまま変換しますか？" + (t.Mp4Box == null ? "\n（「いいえ」で戻り、「ツール設定...」で MP4Box.exe を選べます）" : "");
+        }
+
+        // Replaceable so a test can answer the muxer warning without a message box.
+        public Func<string, bool> ConfirmMuxWarning;
 
         public void CancelEncode()
         {
@@ -226,12 +282,14 @@ namespace CelV2.Ui
             middle.Controls.Add(side, 1, 0);
             root.Controls.Add(middle, 0, 1);
 
-            root.Controls.Add(Row(Caption("画質"), presetBox, Caption("内容"), tuneBox, maxBox, Caption("サイズ指定（MB、0 = オフ）"), targetSize, advancedButton, customLabel), 0, 2);
+            var settingsRow = Row(Caption("画質"), presetBox, Caption("内容"), tuneBox, Caption("速度"), speedBox, Caption("サイズ指定（MB、0 = オフ）"), targetSize, Caption("画質指定（VMAF、0 = オフ）"), targetVmaf, targetSizeNote, advancedButton, customLabel);
+            settingsRow.WrapContents = true;  // onto a second line in a narrow window, not cut off
+            root.Controls.Add(settingsRow, 0, 2);
             root.Controls.Add(Row(Caption("出力先"), outputBox, outputButton, outputResetButton), 0, 3);
             bar.Height = Dp(20);
             root.Controls.Add(bar, 0, 4);
             root.Controls.Add(progressLabel, 0, 5);
-            root.Controls.Add(Row(startButton, cancelButton, clearButton, toolsButton, resultLabel, openFolderButton), 0, 6);
+            root.Controls.Add(Row(startButton, cancelButton, clearButton, toolsButton, detailsButton, resultLabel, openFolderButton), 0, 6);
             Controls.Add(root);
         }
 
@@ -335,8 +393,16 @@ namespace CelV2.Ui
         void ApplyBoxes()
         {
             current.Tune = SelectedTune;
-            current.MaxEffort = maxBox.Checked;
+            current.MaxEffort = MaxEffort;
             current.TargetSizeMB = (double)targetSize.Value;
+            current.TargetVmaf = (double)targetVmaf.Value;
+        }
+
+        // How the qindex is chosen when サイズ指定 or 画質指定 is on.
+        void UpdateTargetNote()
+        {
+            targetSizeNote.Text = targetSize.Value > 0 ? "画質の qindex はサイズで決めます"
+                : targetVmaf.Value > 0 ? "qindex はシーンごとに VMAF で決めます（時間は約 4 倍）" : "";
         }
 
         void OnPresetChanged()
@@ -348,6 +414,18 @@ namespace CelV2.Ui
             app.LastPreset = presets[presetBox.SelectedIndex].Name;
             SaveSettings();
             ShowName();
+        }
+
+        // One details window, beside this one (not modal): brought to the front when already open.
+        void OpenDetails()
+        {
+            if (detailsForm == null || detailsForm.IsDisposed)
+            {
+                detailsForm = new DetailsForm(details) { Owner = this, StartPosition = FormStartPosition.Manual };
+                detailsForm.Location = new Point(Math.Max(0, Right - detailsForm.Width / 2), Top);
+                detailsForm.Show();
+            }
+            else detailsForm.Activate();
         }
 
         void OpenAdvanced()
@@ -373,16 +451,17 @@ namespace CelV2.Ui
 
         ToolPaths FindTools()
         {
-            return ToolLocator.Find(app.FfmpegFolder, app.Mp4BoxFolder, toolsFolder, toolsFolder);
+            return ToolLocator.Find(app.FfmpegFolder, app.Mp4BoxFolder, toolsFolder, toolsFolder, app.FdkaacFolder);
         }
 
         void ShowToolSetup()
         {
-            using (var d = new ToolSetupDialog(app.FfmpegFolder, app.Mp4BoxFolder))
+            using (var d = new ToolSetupDialog(app.FfmpegFolder, app.Mp4BoxFolder, app.FdkaacFolder))
             {
                 if (d.ShowDialog(this) != DialogResult.OK) return;
                 app.FfmpegFolder = d.FfmpegFolder;
                 app.Mp4BoxFolder = d.Mp4BoxFolder;
+                app.FdkaacFolder = d.FdkaacFolder;
                 SaveSettings();
             }
         }
@@ -469,12 +548,12 @@ namespace CelV2.Ui
 
         void UpdateButtons()
         {
-            startButton.Enabled = !busy && pendingProbes == 0 && items.Any(i => i.Info != null && !i.Done)
-                                  && items.Where(i => i.Info != null && !i.Done).All(i => OutputNamer.BadName(i.OutputName) == null);
+            startButton.Enabled = !busy && pendingProbes == 0 && items.Any(i => i.Ready && !i.Done)
+                                  && items.Where(i => i.Ready && !i.Done).All(i => OutputNamer.BadName(i.OutputName) == null);
             nameBox.Enabled = !busy && Selected() != null;
             cancelButton.Enabled = busy;
             clearButton.Enabled = !busy;
-            presetBox.Enabled = tuneBox.Enabled = maxBox.Enabled = advancedButton.Enabled = outputButton.Enabled = outputResetButton.Enabled = pickButton.Enabled = !busy;
+            presetBox.Enabled = tuneBox.Enabled = speedBox.Enabled = advancedButton.Enabled = outputButton.Enabled = outputResetButton.Enabled = pickButton.Enabled = !busy;
         }
 
         // ---- the queue ----
@@ -489,6 +568,7 @@ namespace CelV2.Ui
         {
             int ok = 0, failed = 0;
             bool cancelled = false;
+            using (var log = new EncodeLog(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(settingsPath)), "last_encode.log")))
             foreach (var item in queue)
             {
                 if (cancel.IsCancellationRequested) { cancelled = true; break; }
@@ -496,8 +576,8 @@ namespace CelV2.Ui
                 {
                     engine = "";
                     item.Error = null; // a retry starts clean
-                    item.Row.SubItems[ColNote].Text = NotesFor(item.Info, settings.Output, null);
-                    item.Row.SubItems[ColStatus].Text = "変換中";
+                    item.Row.SubItems[ColNote].Text = item.MuxOnly ? MuxOnlyNote : NotesFor(item.Info, settings.Output, null);
+                    item.Row.SubItems[ColStatus].Text = item.MuxOnly ? "まとめ中" : "変換中";
                     item.Row.EnsureVisible();
                     progressLabel.Text = item.Row.Text;
                     bar.Style = ProgressBarStyle.Marquee;
@@ -505,18 +585,32 @@ namespace CelV2.Ui
                 JobResult r;
                 try
                 {
-                    var job = new EncodeJob(t, item.Path, item.Info, settings.Clone(), outFolder ?? System.IO.Path.GetDirectoryName(item.Path), null, item.OutputName);
-                    job.Progress += p =>
+                    var info = item.Info;
+                    details.Begin(System.IO.Path.GetFileName(item.Path), info != null ? info.FrameCount : 0, info != null ? info.FpsNum : 0, info != null ? info.FpsDen : 0);
+                    Action<string> logLine = l => { log.Line(l); details.AddLog(l); };
+                    if (item.MuxOnly)
                     {
-                        latest = p; // the window shows the newest value; older ones are dropped
-                        if (Interlocked.Exchange(ref progressPosted, 1) == 0)
-                            Ui(() => { Interlocked.Exchange(ref progressPosted, 0); ShowProgress(item, latest); });
-                    };
-                    job.EngineLine += l => Ui(() => ShowEngine(l));
-                    job.Stage += st => Ui(() => { bar.Style = ProgressBarStyle.Marquee; progressLabel.Text = item.Row.Text + "　" + st; });
-                    r = job.Run(cancel);
+                        details.SetStage("まとめ中");
+                        r = MuxOnly.Run(t, item.Path, outFolder ?? System.IO.Path.GetDirectoryName(item.Path), item.OutputName, cancel, logLine);
+                    }
+                    else
+                    {
+                        var job = new EncodeJob(t, item.Path, item.Info, settings.Clone(), outFolder ?? System.IO.Path.GetDirectoryName(item.Path), null, item.OutputName);
+                        job.FrameCoded += details.AddFrame;
+                        job.Progress += p =>
+                        {
+                            latest = p; // the window shows the newest value; older ones are dropped
+                            if (Interlocked.Exchange(ref progressPosted, 1) == 0)
+                                Ui(() => { Interlocked.Exchange(ref progressPosted, 0); ShowProgress(item, latest); });
+                        };
+                        job.EngineLine += l => { details.SetEngine(l); Ui(() => ShowEngine(l)); };
+                        job.Stage += st => { details.SetStage(st); Ui(() => { bar.Style = ProgressBarStyle.Marquee; progressLabel.Text = item.Row.Text + "　" + st; }); };
+                        job.Log += logLine;
+                        r = job.Run(cancel);
+                    }
                 }
-                catch (Exception e) { r = new JobResult { Error = e.Message }; } // keep the queue going
+                catch (Exception e) { r = new JobResult { Error = e.Message }; log.Line("結果: 失敗: " + e.Message); details.AddLog("結果: 失敗: " + e.Message); } // keep the queue going
+                details.End();
                 var res = r;
                 if (res.Cancelled)
                 {
@@ -535,7 +629,7 @@ namespace CelV2.Ui
                     item.Row.SubItems[ColStatus].Text = res.Ok ? "完了" : "失敗";
                     item.Done = res.Ok;
                     if (!res.Ok) { item.Error = res.Error; item.Row.SubItems[ColNote].Text = ShortReason(res.Error, item.Path); }
-                    else item.Row.SubItems[ColNote].Text = NotesFor(item.Info, settings.Output, res.Note);
+                    else item.Row.SubItems[ColNote].Text = item.MuxOnly ? res.Note : NotesFor(item.Info, settings.Output, res.Note);
                 });
             }
             Ui(() => Finished(ok, failed, cancelled));
@@ -543,7 +637,7 @@ namespace CelV2.Ui
 
         void ShowEngine(string line)
         {
-            engine = line.Contains("decisions on GPU") ? "GPU" : line.Contains("decisions on CPU") ? "CPU" : "";
+            engine = line.Contains("decisions on CPU") ? "CPU" : line.Contains("decisions on") ? "GPU" : "";
         }
 
         void ShowProgress(Item item, JobProgress p)

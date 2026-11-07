@@ -4,3 +4,4 @@ build_dbg/
 gui/bin/
 dist/
 build_prof/
+build_dev/

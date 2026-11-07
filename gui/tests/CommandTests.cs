@@ -27,7 +27,11 @@ namespace CelV2.Tests
             ("audio_extensions", AudioExtensions),
             ("he_aac_v2_args", HeAacV2Args),
             ("target_size_args", TargetSizeArgs),
+            ("target_vmaf_args", TargetVmafArgs),
             ("video_budget", VideoBudget),
+            ("retry_budget_moves_a_qindex_step", RetryBudget),
+            ("audio_kbps_for_size", AudioKbpsForSize),
+            ("coarsest_bytes_from_stats", CoarsestBytes),
             ("quotes_paths_with_spaces_and_japanese", QuotesRoundTrip),
             ("namer_avoids_existing_files", NamerAvoidsExisting),
             ("namer_uses_given_name", NamerUsesGivenName),
@@ -189,12 +193,13 @@ namespace CelV2.Tests
             var none = CommandBuilder.EncodeArgs(new EncodeSettings { BFrames = 0 }, Sdr(), "o.ivf");
             Check.Equal("0", none[Array.IndexOf(none, "--bframes") + 1], "0 B-frames passed explicitly");
             Check.That(!CommandBuilder.EncodeArgs(new EncodeSettings { BFrames = -1 }, Sdr(), "o.ivf").Contains("--bframes"), "auto B-frames omitted");
-            foreach (var k in new[] { "--tile-rows", "--scenecut", "--bq", "--aq", "--kq", "--deblock-delta", "--cdef", "--parallel-b" })
+            foreach (var k in new[] { "--tile-rows", "--scenecut", "--bq", "--aq", "--kq", "--deblock-delta", "--cdef", "--grain", "--parallel-b" })
                 Check.That(!d.Contains(k), "default omits " + k);
             var all = new EncodeSettings { Workers = 2, TileRows = TileMode.Four, SceneCut = false, BQ = 10, AQ = -20, KQ = -8, DeblockDelta = 40,
-                                           Cdef = false, ParallelB = ParallelMode.On };
+                                           Cdef = false, Grain = 25, ParallelB = ParallelMode.On };
             Check.Equal("-i - -o o.ivf --qindex 170 --tile-rows 2 --bframes 3 --scenecut 0 --bq 10 --aq -20 --kq -8 --deblock-delta 15 " +
-                        "--cdef 0 --parallel-b 1 --workers 2 --progress", string.Join(" ", CommandBuilder.EncodeArgs(all, Sdr(), "o.ivf")), "every option");
+                        "--cdef 0 --grain 25 --parallel-b 1 --workers 2 --progress", string.Join(" ", CommandBuilder.EncodeArgs(all, Sdr(), "o.ivf")), "every option");
+            Check.Equal("0", CommandBuilder.EncodeArgs(new EncodeSettings { Grain = 0 }, Sdr(), "o.ivf").SkipWhile(x => x != "--grain").ElementAt(1), "film grain off passed explicitly");
             all.ParallelB = ParallelMode.Off;
             var off = CommandBuilder.EncodeArgs(all, Sdr(), "o.ivf");
             Check.Equal("0", off[Array.IndexOf(off, "--parallel-b") + 1], "parallel off");
@@ -211,15 +216,15 @@ namespace CelV2.Tests
 
         static void DeviceListAndArgs()
         {
-            var l = DeviceList.Parse("gpu\tNVIDIA GeForce RTX 5090 (CUDA)\r\nvulkan\tNVIDIA GeForce RTX 5090 (Vulkan)\r\n" +
+            var l = DeviceList.Parse("vulkan\tNVIDIA GeForce RTX 5090 (Vulkan)\r\n" +
                                      "vulkan2\tIntel(R) Arc(TM) Pro B50 Graphics (Vulkan)\r\ncpu\tCPU\r\nnoise without a tab\r\n");
-            Check.Equal(5, l.Count, "auto + 4 devices");
+            Check.Equal(4, l.Count, "auto + 3 devices");
             Check.Equal("auto", l[0].Arg, "auto first");
             Check.Equal("自動", l[0].Label, "auto label");
-            Check.Equal("NVIDIA GeForce RTX 5090（CUDA）", l[1].Label, "cuda label");
-            Check.Equal("vulkan2", l[3].Arg, "second Vulkan GPU");
-            Check.Equal("Intel(R) Arc(TM) Pro B50 Graphics（Vulkan）", l[3].Label, "only the last bracket is the API");
-            Check.Equal("CPU", l[4].Label, "cpu label");
+            Check.Equal("NVIDIA GeForce RTX 5090（Vulkan）", l[1].Label, "gpu label");
+            Check.Equal("vulkan2", l[2].Arg, "second Vulkan GPU");
+            Check.Equal("Intel(R) Arc(TM) Pro B50 Graphics（Vulkan）", l[2].Label, "only the last bracket is the API");
+            Check.Equal("CPU", l[3].Label, "cpu label");
             Check.Equal(1, DeviceList.Parse("").Count, "empty output: auto only");
             Check.Equal(3, DeviceList.Fallback().Count, "fallback");
 
@@ -295,11 +300,46 @@ namespace CelV2.Tests
                 string.Join(" ", CommandBuilder.EncodeArgs(s, Sdr(), "o.ivf", new PassArgs { Pass = 2, Stats = "s.txt", TargetBytes = 9000000 })), "pass 2");
         }
 
+        // 画質指定（VMAF）: --target-vmaf with the GUI's ffmpeg after the rest; not with a pass (サイズ指定 wins).
+        static void TargetVmafArgs()
+        {
+            var s = new EncodeSettings();
+            var plain = CommandBuilder.EncodeArgs(s, Sdr(), "o.ivf");
+            s.TargetVmaf = 93.5;
+            var a = CommandBuilder.EncodeArgs(s, Sdr(), "o.ivf", null, @"C:\t o\ffmpeg.exe");
+            Check.Equal(string.Join("|", plain) + @"|--target-vmaf|93.5|--ffmpeg|C:\t o\ffmpeg.exe", string.Join("|", a), "target vmaf");
+            Check.That(!CommandBuilder.EncodeArgs(s, Sdr(), "o.ivf", new PassArgs { Pass = 1, Stats = "s.txt" }, "ff.exe").Contains("--target-vmaf"), "no vmaf with a pass");
+        }
+
         static void VideoBudget()
         {
             Check.Equal(9000000L, CommandBuilder.VideoBudget(10000000, 1000000, 300, false), "separate files: size less the audio");
             Check.Equal(10000000L - 1000000 - CommandBuilder.ContainerBytes(300, true), CommandBuilder.VideoBudget(10000000, 1000000, 300, true), "mp4: less its boxes too");
             Check.That(CommandBuilder.ContainerBytes(300, true) > 0 && CommandBuilder.ContainerBytes(300, false) == 0, "only mp4 has boxes");
+        }
+
+        // サイズ指定: the audio at most 1/8 of the target, never under the codec's floor; 0 = as set.
+        static void AudioKbpsForSize()
+        {
+            Check.Equal(32, CommandBuilder.AudioKbpsForSize(1400000, 60, 192, 32), "1.4 MB for a minute: AAC's floor");
+            Check.Equal(46, CommandBuilder.AudioKbpsForSize(1400000, 30, 192, 32), "1.4 MB for 30 s: 1/8 of it");
+            Check.Equal(12, CommandBuilder.AudioKbpsForSize(1400000, 600, 48, 12), "HE-AACv2's floor");
+            Check.Equal(0, CommandBuilder.AudioKbpsForSize(100000000, 60, 192, 32), "a large target keeps the setting");
+            Check.Equal(0, CommandBuilder.AudioKbpsForSize(1400000, 0, 192, 32), "no duration: as set");
+        }
+
+        // The IVF's bytes at qindex 255 by celv2enc's model: pass-1 bytes x 2^(-(255 - q) / 24), plus the IVF headers.
+        static void CoarsestBytes()
+        {
+            Check.Equal(32L + 24 + 1000, CommandBuilder.CoarsestBytes("celv2-stats 1 64 64 231 2\n600\n1400\n"), "two frames, 1 step of 24 below");
+            Check.Equal(-1L, CommandBuilder.CoarsestBytes("garbage"), "unreadable: unknown");
+        }
+
+        // A retry under 1 qindex step (~2.9%) smaller gave pass 2 the same start qindex, so the same bytes again.
+        static void RetryBudget()
+        {
+            Check.Equal(1000000L - 30000, CommandBuilder.RetryBudget(1000000, 2000), "a small excess: 3% less");
+            Check.Equal(1000000L - 50000 - 10000, CommandBuilder.RetryBudget(1000000, 50000), "a large one: the excess and 1% less");
         }
 
         static void HeAacV2Args()

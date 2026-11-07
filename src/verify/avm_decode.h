@@ -19,6 +19,8 @@ std::string i420_md5(const uint8_t* y, int ys, const uint8_t* u, const uint8_t* 
 // samples as 16-bit little-endian bytes.
 std::string frame_md5(const Frame420& f);
 // Decoded output frames (visible area, padded like y4m input). Same errors as decode_frame_md5s.
-std::vector<Frame420> decode_frames(const std::vector<std::vector<uint8_t>>& temporal_units);
+// The film grain the stream signals is skipped (the frames as the references hold them) unless
+// film_grain.
+std::vector<Frame420> decode_frames(const std::vector<std::vector<uint8_t>>& temporal_units, bool film_grain = false);
 // Empty if the visible areas match, else the first differing plane, 4x4 block and pixel.
 std::string first_diff(const Frame420& a, const Frame420& b);

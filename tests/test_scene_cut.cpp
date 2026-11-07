@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -80,6 +81,34 @@ static int tiny_frames() {
   return 0;
 }
 
+// A halftone field: dots of radius 2 (luma 40) on 200 at period p, shifted by `phase` pixels, plus
+// noise of +-amp.
+static Frame420 halftone(int w, int h, int p, int phase, int amp, uint32_t seed) {
+  Frame420 f = make_frame(w, h);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      const int dx = (x + phase) % p - p / 2, dy = y % p - p / 2;
+      seed = seed * 1664525u + 1013904223u;
+      const int n = amp ? static_cast<int>(seed >> 24) % (2 * amp + 1) - amp : 0;
+      const int v = (dx * dx + dy * dy <= 4 ? 40 : 200) + n;
+      f.y[y * f.stride_y() + x] = static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+  for (auto& c : f.u) c = 128;
+  for (auto& c : f.v) c = 128;
+  pad_frame(f);
+  return f;
+}
+
+// ChangeMeter: a halftone field replaced by another of about the same mean colour (a coarser period)
+// is changed nearly everywhere; the same field with a little noise is not.
+static int change_meter_sees_halftone() {
+  ChangeMeter m;
+  CHECK(m.push(halftone(256, 128, 6, 0, 0, 1)) == 0);  // the first frame
+  CHECK(m.push(halftone(256, 128, 6, 0, 1, 2)) < 0.1);
+  CHECK(m.push(halftone(256, 128, 8, 3, 0, 3)) > 0.5);
+  return 0;
+}
+
 int main() {
   int fails = 0;
   fails += RUN(cut_on_new_scene_only);
@@ -87,6 +116,7 @@ int main() {
   fails += RUN(black_frame_between_shots);
   fails += RUN(held_drawing_change_is_not_a_cut);
   fails += RUN(tiny_frames);
+  fails += RUN(change_meter_sees_halftone);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;
 }

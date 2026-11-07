@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -11,7 +12,7 @@ namespace celv2::vk {
 #define CELV2_VK_INSTANCE_FNS(X)                                                                          \
   X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties)                    \
   X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkCreateDevice)   \
-  X(vkGetDeviceProcAddr) X(vkGetPhysicalDeviceProperties2)
+  X(vkGetDeviceProcAddr) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties2)
 #define CELV2_VK_DEVICE_FNS(X)                                                                            \
   X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer)                            \
   X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory)             \
@@ -62,7 +63,9 @@ std::unique_ptr<Fns> open_instance(VkInstance* inst) {
   return f;
 }
 
+// CELV2_NO_VULKAN: as on a machine without a GPU, for the tests.
 std::vector<VkPhysicalDevice> discrete(const Fns& f, VkInstance inst) {
+  if (std::getenv("CELV2_NO_VULKAN")) return {};
   uint32_t n = 0;
   f.vkEnumeratePhysicalDevices(inst, &n, nullptr);
   std::vector<VkPhysicalDevice> all(n), out;
@@ -89,6 +92,20 @@ std::vector<std::string> Context::devices() {
   }
   f->vkDestroyInstance(inst, nullptr);
   return names;
+}
+
+uint64_t Context::free_vram() const {
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+  f_->vkGetPhysicalDeviceMemoryProperties2(pd_, &props);
+  uint64_t best = 0, size = 0;
+  for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; i++) {
+    const VkMemoryHeap& h = props.memoryProperties.memoryHeaps[i];
+    if (!(h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || h.size <= size) continue;
+    size = h.size;
+    best = budget.heapBudget[i] ? budget.heapBudget[i] - std::min(budget.heapBudget[i], budget.heapUsage[i]) : h.size;
+  }
+  return best;
 }
 
 Context::Context(int index) {

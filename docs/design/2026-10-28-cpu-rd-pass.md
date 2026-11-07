@@ -102,3 +102,9 @@ same bytes (test_ippp cpu_pipeline_matches_gpu).
   q190); 1.2 / 36 is the one that gains everywhere. 120 frames against HEAD: anime B
   -1.21 / -1.31% (30 s / 60 s), live action -2.32%, anime C -0.03%, anime D -0.17%, anime A
   (240 frames) -0.08%; anime A q130 7.7 -> 6.9 fps.
+- 2026-11-02, DC fix (a886385): intra_cost() took intra_pred()'s -1 (it leaves DC to its caller) as
+  the DC prediction, so every DC block was scored against a flat -1. Fixed (tests/test_rd_pass.cpp). 120 frames
+  1080p q100-190, global PSNR-Y against e535cda: am30 -0.27%, Dragon Maid -0.13%, AIR +0.07%, chika -0.15%,
+  Angel Beats -0.21%, live action -0.07%, crowd_run / park_joy -0.03%. Small: one keyframe per clip. The
+  intra-in-inter charge stays 32 bits (16 / 48 are worse, tried-not-kept). Intra results measured before
+  the fix (every intra mode in the pass) are re-run.

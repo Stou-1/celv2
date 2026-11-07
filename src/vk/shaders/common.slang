@@ -6,7 +6,10 @@ public struct Plane {
   public uint8_t* p;
   public int stride, w, h;  // padded size
   // A reference's level 0 also holds its 16 quarter-pel phases: phase (qy & 3) * 4 + (qx & 3) at
-  // p + that * phase (0: no phases, at_q() only at whole pels).
+  // p + that * phase (0: no phases, at_q() only at whole pels). The top bits pick a VRAM-saving
+  // layout (the speed budget spec's): kPhasesOnDemand, none kept, each interpolated when read (A);
+  // kPhasesHalf, the 4 half-pel ones kept, (qy >> 1) * 2 + (qx >> 1) apart, the rest interpolated (B).
+  // Every layout reads the same values.
   public uint64_t phase;
   public int at(int y, int x) {
     y = y < 0 ? 0 : (y >= h ? h - 1 : y);
@@ -15,8 +18,19 @@ public struct Plane {
   }
   // The sample at (y + qy / 4, x + qx / 4), qy and qx in quarter pels.
   public int at_q(int y, int x, int qy, int qx) {
+    const int fy = qy & 3, fx = qx & 3;
     Plane q = this;
-    q.p = p + uint64_t((qy & 3) * 4 + (qx & 3)) * phase;
+    q.phase = 0;
+    const uint64_t spacing = phase & kPhaseSpacing;
+    if ((phase & kPhasesOnDemand) != 0 || ((phase & kPhasesHalf) != 0 && ((fy | fx) & 1) != 0)) {
+      if ((fy | fx) == 0) return q.at(y + (qy >> 2), x + (qx >> 2));
+      int yy = y + (qy >> 2), xx = x + (qx >> 2);  // the phase planes hold the clamped position's value
+      yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy);
+      xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx);
+      return subpel_px(q, yy, xx, fy, fx);
+    }
+    if ((phase & kPhasesHalf) != 0) q.p = p + uint64_t((fy >> 1) * 2 + (fx >> 1)) * spacing;
+    else q.p = p + uint64_t(fy * 4 + fx) * spacing;
     return q.at(y + (qy >> 2), x + (qx >> 2));
   }
 };
@@ -39,6 +53,8 @@ public int hadamard4x4(int d[16]) {
 }
 
 public static const int kSubpelPhases = 16;
+public static const uint64_t kPhasesOnDemand = 1ull << 63, kPhasesHalf = 1ull << 62;
+public static const uint64_t kPhaseSpacing = (1ull << 62) - 1;
 static const int kSubpelTaps[4][8] = { { 0, 0, 0, 128, 0, 0, 0, 0 },
                                        { 0, 2, -14, 110, 38, -10, 2, 0 },
                                        { 0, 2, -14, 76, 76, -14, 2, 0 },
@@ -58,9 +74,9 @@ public int subpel_px(Plane src, int y, int x, int qy, int qx) {
 }
 
 public static const int kMeRange = 8;
-public static const int kMeRange0 = 4;
+public static const int kMeRange0 = 8;
 static const int kMePenalty = 4;
-static const int kSubpelPenalty = 32;
+static const int kSubpelPenalty = 16;
 
 public int downsample_px(Plane s, int y, int x) {
   return (s.at(2 * y, 2 * x) + s.at(2 * y, 2 * x + 1) + s.at(2 * y + 1, 2 * x) + s.at(2 * y + 1, 2 * x + 1) + 2) >> 2;
@@ -76,7 +92,7 @@ public int sad8(Plane cur, int x, int y, Plane ref, int mvx, int mvy) {
   return sad;
 }
 
-public void me_search(Plane cur, Plane ref, int bx, int by, int px, int py, int range, out int mvx, out int mvy) {
+public int me_search(Plane cur, Plane ref, int bx, int by, int px, int py, int range, out int mvx, out int mvy) {
   int best = 0x7fffffff;
   mvx = px; mvy = py;
   for (int dy = -range; dy <= range; dy++)
@@ -84,6 +100,7 @@ public void me_search(Plane cur, Plane ref, int bx, int by, int px, int py, int 
       const int s = sad8(cur, bx * 8, by * 8, ref, px + dx, py + dy) + kMePenalty * ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy));
       if (s < best) { best = s; mvx = px + dx; mvy = py + dy; }
     }
+  return best;
 }
 
 public int satd8_q(Plane cur, int x, int y, Plane ref, int qmx, int qmy) {
@@ -116,10 +133,11 @@ public void me_refine(Plane cur, Plane ref, int bx, int by, inout int mvx, inout
 // pmx / pmy: the coarser level's field of pcols x prows (null at the top level).
 public void me_cell(Plane cur, Plane ref, int bx, int by, int* pmx, int* pmy, int pcols, int prows, out int mvx,
                     out int mvy, bool level0) {
-  int px = 0, py = 0;
+  int px = 0, py = 0, px2 = 0, py2 = 0;
+  bool two = false;
   if (pmx != nullptr) {
     const int ox[5] = { 0, -1, 1, 0, 0 }, oy[5] = { 0, 0, 0, -1, 1 };
-    int best = 0x7fffffff;
+    int best = 0x7fffffff, second = 0x7fffffff;
     for (int k = 0; k < 6; k++) {
       int cx = 0, cy = 0;  // k == 5: zero
       if (k < 5) {
@@ -128,11 +146,22 @@ public void me_cell(Plane cur, Plane ref, int bx, int by, int* pmx, int* pmy, in
         qy = qy < 0 ? 0 : qy >= prows ? prows - 1 : qy;
         cx = 2 * pmx[qy * pcols + qx]; cy = 2 * pmy[qy * pcols + qx];
       }
+      if ((k > 0 && cx == px && cy == py) || (two && cx == px2 && cy == py2)) continue;  // each centre once
       const int s = sad8(cur, bx * 8, by * 8, ref, cx, cy);
-      if (s < best) { best = s; px = cx; py = cy; }
+      if (s < best) {
+        if (k > 0) { second = best; px2 = px; py2 = py; two = true; }
+        best = s; px = cx; py = cy;
+      } else if (s < second) {
+        second = s; px2 = cx; py2 = cy; two = true;
+      }
     }
   }
-  me_search(cur, ref, bx, by, px, py, level0 ? kMeRange0 : kMeRange, mvx, mvy);
+  const int range = level0 ? kMeRange0 : kMeRange;
+  const int cost = me_search(cur, ref, bx, by, px, py, range, mvx, mvy);
+  if (two) {
+    int mx2, my2;
+    if (me_search(cur, ref, bx, by, px2, py2, range, mx2, my2) < cost) { mvx = mx2; mvy = my2; }
+  }
 }
 
 // ---- gpu/intra_common.h: intra prediction from the source, block limits and bit charges.

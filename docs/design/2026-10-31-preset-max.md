@@ -8,11 +8,11 @@ passes `--preset max`.
 
 Defaults only: an option given on the command line wins, as with `--tune`.
 
-| `--tune` | `--gop-trial` | `--gop-still` | `--deblock-search` |
-|---|---|---|---|
-| none | on | 0.5 | on |
-| `animation` | on | 0.5 | off |
-| `film` | off | film's 0.7 | on |
+| `--tune` | `--gop-trial` | `--gop-still` | `--deblock-search` | `--rd-intra` |
+|---|---|---|---|---|
+| none | on | 0.5 | on | on |
+| `animation` | on | 0.5 | off | on |
+| `film` | off | film's 0.7 | on | on |
 
 - `--gop-trial`: a mini-GOP that passes the still threshold is coded both as one 16-frame mini-GOP
   and as two of 8; the one of lower J = SSE (Y+U+V, 10-bit values) + 0.025·step²·bits is kept. The
@@ -20,6 +20,10 @@ Defaults only: an option given on the command line wins, as with `--tune`.
   them one after the other).
 - `--deblock-search`: per frame, the deblocking delta in {-4, -2, 0, +2, +4} of the lowest squared
   error (Y, U, V), chosen before CDEF and CCSO search.
+- `--rd-intra` (2026-11-02): the RD pass scores every intra mode on each intra block, not only the
+  engine's best. 120 frames 1080p q100-190 without the preset, global PSNR-Y against off: AM +0.17%,
+  Dragon Maid -0.15%, AIR -0.25%, Angel Beats -0.56%, 吉村 -0.11% (-0.18% on average); AM q130
+  about 60% slower. On keyframes only: -0.12% on average, mixed.
 
 ## Measurements
 

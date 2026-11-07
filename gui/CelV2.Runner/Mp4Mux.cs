@@ -6,15 +6,16 @@ using CelV2.Settings;
 
 namespace CelV2.Runner
 {
-    // av2_mux for the video, then MP4Box -add when there is audio.
+    // av2_mux for the video, then MP4Box -add when there is audio. The inputs are removed afterwards unless keepInputs.
     public sealed class Mp4Mux : IMuxStep
     {
         readonly ToolPaths tools;
         readonly string colr, outputMp4;
+        readonly bool keepInputs;
 
-        public Mp4Mux(ToolPaths tools, string colrOrNull, string outputMp4)
+        public Mp4Mux(ToolPaths tools, string colrOrNull, string outputMp4, bool keepInputs = false)
         {
-            this.tools = tools; colr = colrOrNull; this.outputMp4 = outputMp4;
+            this.tools = tools; colr = colrOrNull; this.outputMp4 = outputMp4; this.keepInputs = keepInputs;
         }
 
         public IReadOnlyList<string> Finish(string videoIvf, string audioOrNull, CancellationToken cancel)
@@ -34,7 +35,9 @@ namespace CelV2.Runner
                 Delete(outputMp4); Delete(obu);
                 throw;
             }
-            Delete(obu); Delete(videoIvf);
+            Delete(obu);
+            if (keepInputs) return new[] { outputMp4 };
+            Delete(videoIvf);
             if (audioOrNull != null) Delete(audioOrNull);
             return new[] { outputMp4 };
         }

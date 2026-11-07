@@ -57,12 +57,14 @@ static DecisionMap random_dm(int w, int h, bool inter, int mv_range_px, int min_
   return dm;
 }
 
-// Encodes `frames` frames with random decisions; every frame must decode bit-exactly.
+// Encodes `frames` frames with random decisions; every frame must decode bit-exactly. recon
+// (optional) gets the frames' MD5s.
 static int run(int w, int h, int q, int frames, int keyint, bool inter, int mv_range, int min_size,
-               int refs = 1, bool mv_tools = false) {
+               int refs = 1, bool mv_tools = false, bool ist = false, std::vector<std::string>* recon = nullptr) {
   SeqConfig c{w, h, 30, 1, q};
   c.refs = refs;
   c.tmv = mv_tools;  // temporal MVs (block MV precision is on by default)
+  c.ist = ist;
   Encoder enc(c);
   std::vector<std::vector<uint8_t>> tus;
   std::vector<std::string> md5;
@@ -77,6 +79,22 @@ static int run(int w, int h, int q, int frames, int keyint, bool inter, int mv_r
   for (size_t i = 0; i < md5.size(); i++) {
     if (dec[i] != md5[i]) std::fprintf(stderr, "%dx%d q%d: frame %zu mismatch\n", w, h, q, i);
     CHECK_EQ(dec[i], md5[i]);
+  }
+  if (recon) *recon = md5;
+  return 0;
+}
+
+// With the secondary transform on, intra and inter frames still decode bit-exactly, and some block
+// takes it (the reconstruction differs from the same decisions without it).
+static int random_ist_bitexact() {
+  for (const int q : {60, 140}) {
+    std::vector<std::string> off, on;
+    g_seed = 11;
+    CHECK_EQ(run(320, 192, q, 4, 0, true, 24, 4, 2, false, false, &off), 0);
+    g_seed = 11;
+    CHECK_EQ(run(320, 192, q, 4, 0, true, 24, 4, 2, false, true, &on), 0);
+    CHECK(off[0] != on[0]);  // a keyframe block
+    CHECK(off.back() != on.back());
   }
   return 0;
 }
@@ -270,6 +288,7 @@ static int random_mv_tools_bitexact() {
 int main() {
   int fails = 0;
   fails += RUN(random_mv_tools_bitexact);
+  fails += RUN(random_ist_bitexact);
   fails += RUN(random_superblock_qindex_bitexact);
   fails += RUN(compound_mvs_follow_their_references);
   fails += RUN(bframes_display_hints_past_order_hint_wrap);

@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "core/profile.h"
+
 extern "C" {
 #include "av2/common/av2_txfm.h"
 #include "av2/common/common_data.h"
@@ -117,6 +119,7 @@ void transpose(const float* s, int src_stride, float* d, int dst_stride, int h, 
 }  // namespace
 
 void fwd_dct(const int16_t* residual, int stride, TX_SIZE tx, double scale, tran_low_t* out) {
+  celv2::HotScope prof(celv2::Stage::Transform);
   const int w = tx_size_wide[tx], h = tx_size_high[tx];
   const int cw = w > 32 ? 32 : w, ch = h > 32 ? 32 : h;
   alignas(32) float rows[64 * 64];  // [x][y]: sample x of row y
@@ -180,6 +183,7 @@ void fwd_1d(const int* src, int* dst, int shift, int line, int n, int kind) {
 }  // namespace
 
 void fwd_transform(const int16_t* residual, int stride, TX_SIZE tx, TX_TYPE type, tran_low_t* out) {
+  celv2::HotScope prof(celv2::Stage::Transform);
   const int w = tx_size_wide[tx], h = tx_size_high[tx];
   int in[32 * 32], buf[32 * 32];
   for (int y = 0; y < h; y++)
@@ -191,7 +195,35 @@ void fwd_transform(const int16_t* residual, int stride, TX_SIZE tx, TX_TYPE type
     out[i] = sqrt2 ? round_shift(static_cast<int64_t>(in[i]) * NewSqrt2, NewSqrt2Bits) : in[i];
 }
 
+#ifdef CELV2_ORACLE
+void fwd_long(const int16_t* residual, int stride, TX_SIZE tx, TX_TYPE type, tran_low_t* out) {
+  const int w = tx_size_wide[tx], h = tx_size_high[tx], cw = std::min(w, 32), ch = std::min(h, 32);
+  std::vector<int> in(w * h), buf(w * h);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) in[y * w + x] = residual[y * stride + x];
+  auto pass = [](const int* src, int* dst, int shift, int line, int n, int kind) {
+    if (n != 64) return fwd_1d(src, dst, shift, line, n, kind);
+    const int offset = shift > 0 ? 1 << (shift - 1) : 0;
+    for (int i = 0; i < line; i++)
+      for (int j = 0; j < n; j++) {
+        int64_t s = 0;
+        for (int k = 0; k < n; k++) s += static_cast<int64_t>(src[i + k * line]) * tx_kernel_dct2_size64[FWD_TXFM][j][k];
+        dst[i * n + j] = static_cast<int>((s + offset) >> shift);
+      }
+  };
+  pass(in.data(), buf.data(), fwd_tx_shift[tx][0], w, h, g_ver_tx_type[type]);
+  pass(buf.data(), in.data(), fwd_tx_shift[tx][1], h, w, g_hor_tx_type[type]);
+  const bool sqrt2 = (tx_size_wide_log2[tx] + tx_size_high_log2[tx]) & 1;
+  for (int v = 0; v < ch; v++)
+    for (int u = 0; u < cw; u++) {
+      const int x = in[v * w + u];
+      out[v * cw + u] = sqrt2 ? round_shift(static_cast<int64_t>(x) * NewSqrt2, NewSqrt2Bits) : x;
+    }
+}
+#endif
+
 TX_TYPE most_compact(const int16_t* residual, int stride, TX_SIZE tx, const TX_TYPE* types, int n, tran_low_t* out) {
+  celv2::HotScope prof(celv2::Stage::Transform);
   const int w = tx_size_wide[tx], h = tx_size_high[tx];
   const bool sqrt2 = (tx_size_wide_log2[tx] + tx_size_high_log2[tx]) & 1;
   int in[16 * 16], cols[4][16 * 16], row[16 * 16];

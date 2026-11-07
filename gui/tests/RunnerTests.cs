@@ -27,6 +27,7 @@ namespace CelV2.Tests
             ("runner_target_size_retries_after_mux", TargetSizeRetriesAfterMux),
             ("pass2_over_needs_celv2encs_line", Pass2OverNeedsLine),
             ("runner_target_size_audio_too_big", TargetSizeAudioTooBig),
+            ("runner_target_size_caps_audio", TargetSizeCapsAudio),
             ("runner_he_aac_v2_falls_back_without_fdkaac", HeAacV2FallsBack),
             ("runner_video_only_input", VideoOnlyInput),
             ("runner_does_not_overwrite", DoesNotOverwrite),
@@ -47,7 +48,119 @@ namespace CelV2.Tests
             ("runner_mp4_audio_length_without_frame_count", Mp4AudioLength),
             ("runner_mp4_cancel_during_mux", Mp4CancelDuringMux),
             ("runner_mp4_non_ansi_output_paths", Mp4NonAnsiPaths),
+            ("encode_log_keeps_the_last_run", EncodeLogKeepsLastRun),
+            ("runner_job_log_has_commands_and_result", JobLogHasCommandsAndResult),
+            ("mux_only_finds_the_audio_beside_the_video", MuxOnlyFindsAudio),
+            ("runner_mux_only_joins_separate_files", MuxOnlyJoinsSeparateFiles),
         };
+
+        // The audio a separate-file run saved next to its video: same name, one of the extensions it writes.
+        static void MuxOnlyFindsAudio()
+        {
+            WithTemp(d =>
+            {
+                string ivf = Path.Combine(d, "clip.ivf");
+                File.WriteAllBytes(ivf, new byte[1]);
+                Check.Equal<string>(null, MuxOnly.FindAudio(ivf), "no audio");
+                File.WriteAllBytes(Path.Combine(d, "clip (2).m4a"), new byte[1]);
+                File.WriteAllBytes(Path.Combine(d, "clip.wav"), new byte[1]);
+                Check.Equal<string>(null, MuxOnly.FindAudio(ivf), "another name or an extension celv2 never writes");
+                File.WriteAllBytes(Path.Combine(d, "clip.opus"), new byte[1]);
+                Check.Equal(Path.Combine(d, "clip.opus"), MuxOnly.FindAudio(ivf), "opus");
+                File.WriteAllBytes(Path.Combine(d, "clip.m4a"), new byte[1]);
+                Check.Equal(Path.Combine(d, "clip.m4a"), MuxOnly.FindAudio(ivf), ".m4a first");
+            });
+        }
+
+        // 「MP4 にまとめる」: the .ivf and .m4a of a separate-file run become one .mp4 beside them, nothing re-encoded and
+        // the inputs kept; a second run takes the next free name.
+        static void MuxOnlyJoinsSeparateFiles()
+        {
+            var t = Mp4Tools();
+            WithTemp(d =>
+            {
+                string input = MakeMedia(d, "in.mp4", 1, true);
+                string sep = Sub(d, "sep");
+                Succeeded(RunJob(t, input, Separate(), sep));
+                string ivf = Path.Combine(sep, "in.ivf");
+                Check.Equal(Show(new[] { "in.ivf", "in.m4a" }), Show(Names(sep)), "separate files");
+                var lines = new List<string>();
+                var r = MuxOnly.Run(t, ivf, sep, null, CancellationToken.None, lines.Add);
+                Check.That(r.Ok, "mux failed: " + r.Error);
+                string mp4 = Path.Combine(sep, "in.mp4");
+                Check.Equal(mp4, r.Outputs.Single(), "output");
+                Check.Equal(Show(new[] { "in.ivf", "in.m4a", "in.mp4" }), Show(Names(sep)), "inputs kept");
+                Check.Equal("av02,mp4a", string.Join(",", StreamKeys(t, mp4, "codec_tag_string").OrderBy(x => x, StringComparer.Ordinal)), "tracks");
+                Check.That(lines.Any(l => l.Contains("av2_mux")) && lines.Any(l => l.Contains("MP4Box")), "commands logged");
+                r = MuxOnly.Run(t, ivf, sep, null, CancellationToken.None);
+                Check.Equal(Path.Combine(sep, "in (2).mp4"), r.Outputs.Single(), "next free name");
+                r = MuxOnly.Run(t, ivf, Sub(d, "named"), "名前", CancellationToken.None);
+                Check.Equal(Path.Combine(d, "named", "名前.mp4"), r.Outputs.Single(), "output name and folder");
+
+                var noBox = new ToolPaths { Ffmpeg = t.Ffmpeg, Ffprobe = t.Ffprobe, CelV2enc = t.CelV2enc, Av2Mux = t.Av2Mux };
+                r = MuxOnly.Run(noBox, ivf, sep, null, CancellationToken.None);
+                Check.That(!r.Ok && r.Error.Contains("MP4Box"), "audio without MP4Box: " + r.Error);
+                Check.Equal(4, Names(sep).Length, "nothing left behind by the failure");
+
+                File.Delete(Path.Combine(sep, "in.m4a"));
+                r = MuxOnly.Run(noBox, ivf, sep, null, CancellationToken.None);
+                Check.That(r.Ok, "video only needs no MP4Box: " + r.Error);
+                Check.Equal("av02", string.Join(",", StreamKeys(t, r.Outputs.Single(), "codec_tag_string")), "video track only");
+            });
+        }
+
+        // A new EncodeLog replaces the last run's file; lines are kept with their time, the file stays
+        // under MaxBytes, and a log that cannot be written never stops a run.
+        static void EncodeLogKeepsLastRun()
+        {
+            WithTemp(d =>
+            {
+                string path = Path.Combine(d, "sub", "last_encode.log");
+                using (var log = new EncodeLog(path)) log.Line("前の変換");
+                using (var log = new EncodeLog(path))
+                {
+                    log.Line("> celv2enc -i - -o 出力.ivf");
+                    log.Line(new string('x', 200));
+                }
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                Check.That(!text.Contains("前の変換"), "the run before is gone: " + text);
+                Check.That(text.Contains("> celv2enc -i - -o 出力.ivf"), "line kept: " + text);
+                Check.That(System.Text.RegularExpressions.Regex.IsMatch(text, @"\d\d:\d\d:\d\d"), "time on lines: " + text);
+                using (var log = new EncodeLog(path))
+                    for (int i = 0; i < 20000; i++) log.Line(new string('y', 1000));
+                Check.That(new FileInfo(path).Length <= EncodeLog.MaxBytes + 4096, "size " + new FileInfo(path).Length);
+                using (var log = new EncodeLog(Path.Combine(path, "not a folder", "x.log"))) log.Line("never throws");
+            });
+        }
+
+        // The job hands its tools' command lines, their messages and its result to Log, on success and on failure.
+        static void JobLogHasCommandsAndResult()
+        {
+            var t = Tools();
+            WithTemp(d =>
+            {
+                string input = MakeMedia(d, "in.mp4", 1, true);
+                var lines = new List<string>();
+                var job = new EncodeJob(t, input, Prober.Probe(t, input), Separate(), Sub(d, "out"), null);
+                job.Log += l => { lock (lines) lines.Add(l); };
+                Check.That(job.Run(CancellationToken.None).Ok, "encode");
+                Check.That(lines.Any(l => l.StartsWith("> ") && l.Contains("celv2enc") && l.Contains("--qindex")), "celv2enc command: " + string.Join("\n", lines));
+                Check.That(lines.Any(l => l.StartsWith("> ") && l.Contains("ffmpeg")), "ffmpeg command");
+                Check.That(lines.Any(l => l.Contains("celv2: decisions on")), "celv2enc's own lines");
+                Check.That(!lines.Any(l => l.StartsWith("progress frame=")), "no per-frame progress lines: " + lines.FirstOrDefault(l => l.StartsWith("progress frame=")) + " after " + lines[Math.Max(0, lines.FindIndex(l => l.StartsWith("progress frame=")) - 1)]);
+                Check.That(lines.Last().StartsWith("結果: 成功"), "result last: " + lines.Last());
+
+                string bad = Path.Combine(d, "bad.mp4");
+                File.WriteAllText(bad, "this is not a video\n");
+                var fake = new InputInfo { Width = 320, Height = 240, FpsNum = 24, FpsDen = 1, BitDepth = 8, FrameCount = 48 };
+                lines.Clear();
+                var failing = new EncodeJob(t, bad, fake, Separate(), Sub(d, "out2"), null);
+                failing.Log += l => { lock (lines) lines.Add(l); };
+                var res = failing.Run(CancellationToken.None);
+                Check.That(!res.Ok, "bad input fails");
+                Check.That(lines.Last().StartsWith("結果: 失敗") && lines.Last().Contains(res.Error.Split('\n')[0]), "error last: " + lines.Last());
+            });
+        }
 
         // ---- helpers ----
 
@@ -258,6 +371,10 @@ namespace CelV2.Tests
                 Check.Equal(Path.Combine(a, "fdkaac.exe"), t.Fdkaac, "fdkaac from the ffmpeg folder");
                 Check.Equal(Path.Combine(b, "celv2enc.exe"), t.CelV2enc, "celv2enc from the tools folder");
                 Check.Equal(Path.Combine(b, "av2_mux.exe"), t.Av2Mux, "av2_mux from its folder");
+                string c = Sub(d, "c");
+                File.WriteAllBytes(Path.Combine(c, "fdkaac.exe"), new byte[0]);
+                Check.Equal(Path.Combine(c, "fdkaac.exe"), ToolLocator.Find(a, a, b, b, c).Fdkaac, "configured fdkaac wins over the ffmpeg folder");
+                Check.Equal(Path.Combine(a, "fdkaac.exe"), ToolLocator.Find(a, a, b, b, empty).Fdkaac, "an empty fdkaac folder falls back");
 
                 t = ToolLocator.Find(null, null, b, null);
                 Check.Equal(Path.Combine(b, "ffmpeg.exe"), t.Ffmpeg, "exe folder ffmpeg");
@@ -506,10 +623,33 @@ namespace CelV2.Tests
                 string input = MakeMedia(d, "in.mp4", 2, true);
                 string outDir = Sub(d, "out");
                 var s = Separate();
-                s.TargetSizeMB = 0.01;  // the 2 s of AAC alone are over 30,000 bytes
+                s.TargetSizeMB = 0.005;  // the 2 s of AAC alone are over 5,000 bytes even at 32 kbps (8,000)
                 var r = RunJob(t, input, s, outDir);
                 Check.That(!r.Result.Ok && r.Result.Error != null && r.Result.Error.Contains("音声だけで指定サイズを超えます"), "error: " + r.Result.Error);
                 Check.Equal(0, Names(outDir).Length, "nothing left in the output folder");
+            });
+        }
+
+        // A small target (1.4 MB for a minute, here ~20 KB for 2 s): the AAC is not copied but made again at 32 kbps
+        // (1/8 of the target is under AAC's floor), so the video keeps most of the bytes.
+        static void TargetSizeCapsAudio()
+        {
+            var t = Tools();
+            WithTemp(d =>
+            {
+                string input = MakeMedia(d, "in.mp4", 2, true);
+                string plain = Sub(d, "plain"), outDir = Sub(d, "out");
+                Succeeded(RunJob(t, input, Separate(), plain));
+                long target = 20000 + new FileInfo(Path.Combine(plain, "in.ivf")).Length;
+                var s = Separate();
+                s.TargetSizeMB = target / 1e6;
+                var r = RunJob(t, input, s, outDir);
+                Succeeded(r);
+                Check.Equal(Show(new[] { "in.ivf", "in.m4a" }), Show(Names(outDir)), "files");
+                Check.That(TotalBytes(outDir) <= target, "fits: " + TotalBytes(outDir) + " of " + target);
+                Check.That(r.Result.Note != null && r.Result.Note.Contains("音声 32 kbps"), "note: " + r.Result.Note);
+                long m4a = new FileInfo(Path.Combine(outDir, "in.m4a")).Length;
+                Check.That(m4a < 12000 && m4a < new FileInfo(Path.Combine(plain, "in.m4a")).Length, "32 kbps for 2 s: " + m4a);
             });
         }
 
@@ -527,6 +667,11 @@ namespace CelV2.Tests
                 Succeeded(r);
                 Check.That(r.Result.Note != null && r.Result.Note.Contains("fdkaac"), "note names fdkaac: " + r.Result.Note);
                 Check.Equal("LC", StreamKeys(t, Path.Combine(outDir, "in.m4a"), "profile").Single(), "the AAC copied as before");
+                // With a target size the copied AAC can be what goes over: the error says why it was not HE-AACv2.
+                s.TargetSizeMB = 0.005;
+                var over = RunJob(t, input, s, Sub(d, "out2"));
+                Check.That(!over.Result.Ok && over.Result.Error.Contains("音声だけで指定サイズを超えます") && over.Result.Error.Contains("fdkaac"),
+                           "error names fdkaac: " + over.Result.Error);
             });
         }
 

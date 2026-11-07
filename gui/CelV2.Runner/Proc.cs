@@ -15,10 +15,15 @@ namespace CelV2.Runner
     {
         public sealed class Output { public int ExitCode; public string Out, Err; }
 
+        // Where this thread's tool command lines and messages go (EncodeJob.Log while a job runs); null drops them.
+        [ThreadStatic] public static Action<string> Log;
+
         public static Process Start(string exe, IEnumerable<string> args, bool stdin, bool stdout, bool stderr)
         {
             if (exe == null) throw new InvalidOperationException("tool not found");
-            var psi = new ProcessStartInfo(exe, CommandBuilder.Join(args))
+            string joined = CommandBuilder.Join(args);
+            var log = Log; if (log != null) log("> " + exe + " " + joined);
+            var psi = new ProcessStartInfo(exe, joined)
             {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardInput = stdin, RedirectStandardOutput = stdout, RedirectStandardError = stderr,
@@ -71,6 +76,13 @@ namespace CelV2.Runner
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
                 using (cancel.Register(() => Kill(p))) p.WaitForExit();
+                var log = Log;
+                if (log != null)
+                {
+                    foreach (string l in (e + "\n" + o).Split('\n'))  // celv2enc's per-frame progress lines left out
+                        if (l.Trim().Length > 0 && !l.StartsWith("progress frame=", StringComparison.Ordinal)) log(l.TrimEnd('\r'));
+                    log("(終了コード " + p.ExitCode + ")");
+                }
                 return new Output { ExitCode = p.ExitCode, Out = o.ToString(), Err = e.ToString() };
             }
         }

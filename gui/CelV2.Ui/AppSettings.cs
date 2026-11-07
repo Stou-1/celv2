@@ -16,6 +16,7 @@ namespace CelV2.Ui
         [DataMember] public string OutputFolder;    // null = next to each input
         [DataMember] public string FfmpegFolder;    // null = search
         [DataMember] public string Mp4BoxFolder;    // null = search
+        [DataMember] public string FdkaacFolder;    // null = search (the ffmpeg folder first)
 
         public AppSettings() { SetDefaults(); }
         [OnDeserializing] void OnDeserializing(StreamingContext c) { SetDefaults(); } // the serializer skips constructors

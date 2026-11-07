@@ -25,6 +25,7 @@ namespace CelV2.Ui
         readonly NumericUpDown kq = Num("kq", -100, 100);
         readonly NumericUpDown deblock = Num("deblockDelta", -16, 15);
         readonly CheckBox cdef = Check("cdef", "CDEF（輪郭のにじみ取り）を使う");
+        readonly NumericUpDown grain = Num("grain", -1, 50);
         readonly ComboBox device = Combo("device");  // filled from deviceOptions
         readonly List<DeviceOption> deviceOptions;
         readonly ComboBox tiles = Combo("tiles", "自動", "1", "2", "4");
@@ -86,9 +87,10 @@ namespace CelV2.Ui
             g = Page(tabs, "フィルター");
             AddRow(g, "デブロック強度", deblock, Note("-16〜15、標準 2。大きいほどブロック境界を強く消す"));
             AddRow(g, "CDEF", cdef, Note("標準オン（約 10% 小さく）"));
+            AddRow(g, "フィルムグレイン", grain, Note("-1 = 自動（実写は 25、ほかはなし）。0 = オフ。アニメの線は少しぼける"));
 
             g = Page(tabs, "速度・処理");
-            AddRow(g, "判定の場所", device, Note("自動 = CUDA の GPU、なければ Vulkan の GPU、なければ CPU"));
+            AddRow(g, "判定の場所", device, Note("自動 = GPU（Vulkan）、なければ CPU"));
             AddRow(g, "タイル（横）", tiles, Note("自動 = 画面サイズから決める"));
             AddRow(g, "タイル（縦）", tileRows, Note("自動 = 画面サイズから決める"));
             AddRow(g, "スレッド数", threads, Note("0 = 自動"));
@@ -126,6 +128,7 @@ namespace CelV2.Ui
             Set(kq, s.KQ);
             Set(deblock, s.DeblockDelta);
             cdef.Checked = s.Cdef;
+            Set(grain, s.Grain);
             device.SelectedIndex = deviceOptions.FindIndex(o => o.Arg == s.DeviceValue);
             tiles.SelectedIndex = InRange((int)s.Tiles, tiles);
             tileRows.SelectedIndex = InRange((int)s.TileRows, tileRows);
@@ -200,6 +203,7 @@ namespace CelV2.Ui
                 r.KQ = (int)kq.Value;
                 r.DeblockDelta = (int)deblock.Value;
                 r.Cdef = cdef.Checked;
+                r.Grain = (int)grain.Value;
                 string arg = deviceOptions[Math.Max(0, device.SelectedIndex)].Arg;
                 r.DeviceArg = arg;
                 r.Device = arg == "auto" ? DecisionDevice.Auto : arg == "cpu" ? DecisionDevice.Cpu : DecisionDevice.Gpu;  // for older versions

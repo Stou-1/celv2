@@ -15,12 +15,30 @@
 // The share of 8x8 cells of b within 2 levels of a's (how much of the picture stays still).
 double still_share(const Frame420& a, const Frame420& b);
 
+// The share of 16x16 blocks changed from the previous frame pushed (0 for the first): a block is
+// unchanged when its average is within 2 levels and its high-frequency energy (mean absolute deviation
+// from the average) within max(2, 10%), so a halftone field replaced by another of the same colour
+// counts as changed (halftone analysis spec, branches 1 and 3).
+class ChangeMeter {
+ public:
+  double push(const Frame420& f);
+
+ private:
+  std::vector<float> avg_, hf_;
+};
+
 class SceneCutDetector {
  public:
   // Call once per frame, in order; next is the following frame (nullptr at the end).
   bool push(const Frame420& cur, const Frame420* next);
 
  private:
+  bool test(const Frame420* next);  // push()'s decision on the cells it holds
+  // CELV2_GOP_LOG=1: one stderr line per frame with the test's measures (halftone analysis spec).
+  void log(bool cut, const Frame420& cur);
+
   std::vector<int> prev2_, prev_, cur_;  // cell averages of frames t-2, t-1 and t
   std::vector<double> diffs_;            // the latest differences between consecutive frames
+  std::vector<double> prev_hf_;          // CELV2_GOP_LOG: frame t-1's cell high-frequency energies
+  int frame_ = -1;                       // t
 };
