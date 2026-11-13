@@ -1,7 +1,7 @@
 # Where CelV2 loses to AV1 (stage 1 of the gap breakdown, 2026-11-04)
 
-Spec: docs/superpowers/specs/2026-11-04-av1-gap-breakdown-design.md. **Draft: the avmenc rows are still
-running; numbers marked (n/4) have n of the four points.**
+Spec: docs/superpowers/specs/2026-11-04-av1-gap-breakdown-design.md. Stage 1 stopped on 2026-11-06 at 28 of avm0's 32
+streams: crowd_run and park_joy have q100 and q190 only, so their avm0 cells below are estimates.
 
 ## Stage 1: the same 33 frames through every encoder
 
@@ -20,13 +20,15 @@ running; numbers marked (n/4) have n of the four points.**
 | chika | -0.56% | +1.42% | +7.09% | -25.58% | -27.85% |
 | Angel Beats | +0.68% | -54.25% | -33.66% | -7.86% | -18.27% |
 | 吉村 | -1.53% | +7.68% | +16.26% | -22.84% | -20.92% |
-| crowd_run | -0.53% | (1/4) | -22.61% | -18.59% | -24.43% |
-| park_joy | -0.58% | (2/4) | -16.13% | -16.25% | -21.66% |
+| crowd_run | -0.53% | about -30% (est.) | -22.61% | -18.59% | -24.43% |
+| park_joy | -0.58% | about -21% (est.) | -16.13% | -16.25% | -21.66% |
 
 Time per encode (mean over the points): CelV2 8 s, `--preset max` 16 s, SVT-AV1 40 s, libaom 997 s, avm0c
 15,784 s, avm0 41,726 s so far (one thread each for avmenc, up to 44 at once, so not a speed comparison).
 
-First reading (to confirm when the rows are complete):
+The two estimates: avm0 against avm0c on the same two end points, crowd_run -9.9%, park_joy -5.6%, applied to avm0c's cell. Against CelV2 directly, two points are too rough (avm0c by its ends alone is 0.4 to 11 points off its four-point BD-rate on four sources).
+
+First reading:
 - On 33 frames, AV1 at its slowest presets is 6-34% smaller than CelV2's default on seven of the eight; AIR is the
   exception (CelV2 33-38% smaller).
 - avmenc is a target on Dragon Maid, AM demo and Angel Beats (level with or ahead of AV1), not on AIR, chika or
@@ -274,29 +276,29 @@ avm0c's, 33 of 33, on all 32 streams. 33 frames, q100-190:
 - Not equal even so: avm0c's key frame is hidden and comes back as a 31-byte shown copy, and it and the anchors look temporally filtered (吉村's frame 0: 46.8 dB at q42, CelV2 57.1 dB), which
   avmenc does by default and CelV2 does not (tried-not-kept, twice). Its key frames also carry delta q (吉村 mean 47.4 at base 42). avm0c codes 8 bits, CelV2 10 (+48, the same step).
 
-**F0, avm0c without its temporal filter** (`--arnr-strength=0 --enable-keyframe-filtering=0`, 33 frames, q100-190; `X_L0` from F0's own lists). Dragon Maid, Angel Beats and AM are in; three of crowd_run's streams are still running.
+**F0, avm0c without its temporal filter** (`--arnr-strength=0 --enable-keyframe-filtering=0`, 33 frames, q100-190; `X_L0` from F0's own lists). All four sources are in (crowd_run's last stream landed 2026-11-07).
 
-| BD-rate | Dragon Maid | Angel Beats | AM |
-|---|---|---|---|
-| F0 against avm0c | +0.09 | +2.53 | +10.15 |
-| L0 against avm0c (filter on) | +49.06 | +79.87 | +31.44 |
-| L0 against F0 (filter off) | +48.78 | +75.18 | +18.11 |
-| Gap left with the filter off | 99% | 94% | 58% |
+| BD-rate | Dragon Maid | Angel Beats | AM | crowd_run |
+|---|---|---|---|---|
+| F0 against avm0c | +0.09 | +2.53 | +10.15 | +5.87 |
+| L0 against avm0c (filter on) | +49.06 | +79.87 | +31.44 | +31.35 |
+| L0 against F0 (filter off) | +48.78 | +75.18 | +18.11 | +23.57 |
+| Gap left with the filter off | 99% | 94% | 58% | 75% |
 
 - **On Dragon Maid and Angel Beats the filter is not the cause:** over three quarters left, the spec's reading is decisions inside the frame, so the tool is built on F0's streams, L1 and L2 first. **AM is different:** 58% left, the spec's "between". The filter is worth 10% to avmenc there, and that much of AM's gap is not decisions. This was read on the first two sources, as the spec says; AM came later and goes back to the design session.
 - CelV2's eight streams are byte for byte the L0 streams: the frame lists did not change, and F0's references match 33 of 33.
 - Same frames, same qindex, CelV2 against F0 (`l0f_cls.txt` in the shared notes), q130: leaves 1.93x (Dragon Maid), 2.59x (Angel Beats), +2.66, +1.03 dB; mids 1.70x, 1.95x, +2.33, +1.25 dB; anchors 1.72x, 1.82x, +1.72, +1.79 dB. Nearly the same as against avm0c. The key frame moves: its PSNR-Y rises by 2-4 dB without the filter (Dragon Maid q130 60.22 to 62.38, Angel Beats 51.97 to 56.02), and the other frames stay.
 - The leaves with the filter off (`l0cmp`, q130, F0's column; AM also, its q130 stream is done). Coefficients 16.5, 30.3, 7.7 kB against CelV2's 39.0, 113.2, 39.5 (Dragon Maid, Angel Beats, AM). What stands out in the area shares is what CelV2 does not do: 128 blocks are 85%, 48%, 42% of avmenc's leaf area, none of CelV2's, and intra is 32%, 28%, 1% against 0.1%, 2.1%, 0.8%. Without the filter Dragon Maid's skip mode falls from 41% to 6%, and its intra rises from 24% to 32%, at the same bytes.
 
-**L1 and L2, avmenc's partitions, then its modes and MVs** (`tools/oracle/`, only with `CELV2_ORACLE`; F0's streams and frame lists, the l0f set's settings, 33 frames, q100-190, BD-rate by global-MSE PSNR-Y). L1: the RD pass keeps avmenc's tree and picks each leaf's mode and MV; the coder re-scores as at L0. L2: no engine, no RD pass, no re-scoring: each block coded as avmenc chose it, with CelV2's transforms, quantization and filters. All 52 streams (L0, L1, L2 and the one-tile run below) decode equal to `--recon`, the frame list 33 of 33; L0's eight Dragon Maid and Angel Beats streams are the l0f set byte for byte. crowd_run has F0's q190 only so far, so no BD-rate.
+**L1 and L2, avmenc's partitions, then its modes and MVs** (`tools/oracle/`, only with `CELV2_ORACLE`; F0's streams and frame lists, the l0f set's settings, 33 frames, q100-190, BD-rate by global-MSE PSNR-Y). L1: the RD pass keeps avmenc's tree and picks each leaf's mode and MV; the coder re-scores as at L0. L2: no engine, no RD pass, no re-scoring: each block coded as avmenc chose it, with CelV2's transforms, quantization and filters. All 52 streams (L0, L1, L2 and the one-tile run below) decode equal to `--recon`, the frame list 33 of 33; L0's eight Dragon Maid and Angel Beats streams are the l0f set byte for byte. crowd_run came on 2026-11-07, with `import_bawp` dropping BAWP where a moved MV takes the template past the reference: its L2 q130 stream did not decode without that (cr L2 q100, q190 bytes +0.00%, -0.01%; the other sources' rows are from before it).
 
-| BD-rate | Dragon Maid | Angel Beats | AM |
-|---|---|---|---|
-| L0 against F0 | +48.78 | +75.18 | +18.11 |
-| L1 against L0: partitions | +14.30 | +3.06 | -0.75 |
-| L2 against L1: modes and MVs | -25.87 | -15.04 | -3.47 |
-| L2 against F0 | +30.16 | +53.38 | +13.07 |
-| L0's gap closed by L2 (log rate) | 34% | 24% | 26% |
+| BD-rate | Dragon Maid | Angel Beats | AM | crowd_run |
+|---|---|---|---|---|
+| L0 against F0 | +48.78 | +75.18 | +18.11 | +23.57 |
+| L1 against L0: partitions | +14.30 | +3.06 | -0.75 | +2.45 |
+| L2 against L1: modes and MVs | -25.87 | -15.04 | -3.47 | -4.47 |
+| L2 against F0 | +30.16 | +53.38 | +13.07 | +22.60 |
+| L0's gap closed by L2 (log rate) | 34% | 24% | 26% | 4% |
 
 - **Decisions are a quarter to a third of the gap.** The rest is what L2 leaves CelV2's: transforms, quantization, filters, entropy coding.
 - **The partitions alone do not pay.** +14.30% on Dragon Maid, whose 128 blocks (81% of the area) are 52% NEARMV and 37% intra DC: CelV2's own modes lose on that tree. The gain comes with the modes, so L1 and L2 read together: -13.92, -12.30, -4.23% against L0.
@@ -347,23 +349,25 @@ Same-reference compound, CfL, BAWP: none. Frames whose slots could not be reprod
 
 **L2b to L6, what is left after the modes** (one tile, from L4 on 8 bits and whole 128 blocks, see the departures; the same 12 streams, 33 frames, q100-190, BD-rate by global-MSE PSNR-Y):
 
-| BD-rate | Dragon Maid | Angel Beats | AM |
-|---|---|---|---|
-| L2b against L2: one tile | -1.66 | -1.30 | -2.40 |
-| L2z against L2b: `--rd-zero 1` | -1.73 | -7.48 | -2.95 |
-| L3 against L2b: transform splits and types | -1.16 | -7.82 | +3.43 |
-| L3 on 8 bits against L3 | -1.23 | +3.91 | +8.90 |
-| L4 against L3 on 8 bits: filter settings | +0.15 | -7.77 | -2.35 |
-| L4, whole 128 blocks, against L4 | -0.92 | +0.77 | -1.38 |
-| L5 against L4: which blocks are zero | +0.75 | +4.12 | -0.68 |
-| L6 against L5: the levels | -19.59 | -25.91 | -13.91 |
-| L6o against L6: CelV2's own filters | +9.02 | +82.51 | +17.66 |
-| **Against F0:** L2b | +27.87 | +51.26 | +9.66 |
-| L2z | +25.93 | +39.69 | +7.07 |
-| L3 | +26.22 | +34.33 | +12.74 |
-| L4 (whole 128) | +23.62 | +26.22 | +17.15 |
-| L5 | +25.07 | +36.39 | +16.53 |
-| L6 | +0.55 | +1.04 | +0.33 |
+| BD-rate | Dragon Maid | Angel Beats | AM | crowd_run |
+|---|---|---|---|---|
+| L2b against L2: one tile | -1.66 | -1.30 | -2.40 | -0.90 |
+| L2z against L2b: `--rd-zero 1` | -1.73 | -7.48 | -2.95 | -4.15 |
+| L3 against L2b: transform splits and types | -1.16 | -7.82 | +3.43 | +1.92 |
+| L3 on 8 bits against L3 | -1.23 | +3.91 | +8.90 | +1.44 |
+| L4 against L3 on 8 bits: filter settings | +0.15 | -7.77 | -2.35 | -0.04 |
+| L4, whole 128 blocks, against L4 | -0.92 | +0.77 | -1.38 | -0.14 |
+| L5 against L4: which blocks are zero | +0.75 | +4.12 | -0.68 | -4.04 |
+| L6 against L5: the levels | -19.59 | -25.91 | -13.91 | -15.63 |
+| L6o against L6: CelV2's own filters | +9.02 | +82.51 | +17.66 | +3.17 |
+| **Against F0:** L2b | +27.87 | +51.26 | +9.66 | +21.45 |
+| L2z | +25.93 | +39.69 | +7.07 | +16.45 |
+| L3 | +26.22 | +34.33 | +12.74 | +23.07 |
+| L4 (whole 128) | +23.62 | +26.22 | +17.15 | +23.99 |
+| L5 | +25.07 | +36.39 | +16.53 | +18.67 |
+| L6 | +0.55 | +1.04 | +0.33 | +0.13 |
+
+- **crowd_run reads the same, with two differences** (added 2026-11-07). L6 is +0.13% over F0 (bytes +0.08 to +0.22%), at F0's PSNR to four places on all four points, 33 of 33 frames equal to `--recon` at every level. The decisions close only 4% of L0's gap, against 24-34% on the anime. And zero blocks pay here: L5 against L4 -4.04%, the one source where they do, with `--rd-zero 1` -4.15% on CelV2's own levels; the bullet below on zeroing is the anime's. q130, kB, all frames, L4 / L5 / L6 / F0: coefficients 2730 / 1868 / 1256 / 1256.
 
 - **The gap is the levels.** L4 stays +17 to +26% over F0, so L5 and L6 ran; L6 closes it to +0.33-1.04% with no other change. On every source the step that does it is L5 to L6, the levels in the blocks that are not zero.
 - **The coder is not the gap.** L6 against F0 is under 2% on all three, so no coder spec by the spec's rule. By point, L6 / F0 bytes: Dragon Maid +0.2 to +1.2%, Angel Beats +0.3 to +2.0%, AM +0.1 to +0.9%, crowd_run q190 +0.2%. All frames, q130, kB, L6 / F0: coefficients 91.4 / 91.3, 250.8 / 250.6, 229.3 / 229.3; ends of block 13.2 / 13.1, 30.6 / 30.6, 44.1 / 44.1. Of what remains on Angel Beats, 1.9 of 2.5 kB is "other".
@@ -427,7 +431,18 @@ Same-reference compound, CfL, BAWP: none. Frames whose slots could not be reprod
 - **Width alone did not do it before:** AVM's method on the key frame, up to 7 frames, was +1.04% on AM (2026-10-30, `tried-not-kept.md`), with the key frame's share as the reason it gave. Nothing here tests 12 frames, or a larger key frame with the filter.
 - **Design's reading: no spec.** The share above is not the whole reason: the filter cures avmenc's frame 0 standing 2.9 to 8.8 dB above the rest, and CelV2's stands -1.1 to +2.6 dB without one. See "F1, F2's result" in the gap spec.
 
-**crowd_run:** F0's q100, q130 and q160 streams have not landed, so no BD rows. q190 alone, bytes: L4 558194, L5 415182, L6 339280, F0 338538.
+**crowd_run's frame 0** (2026-11-07; design's check, since F0 against avm0c is +5.87%, over 3%). Frame 0 against frames 1-32, PSNR-Y, dB, q100, q130, q160, q190: F0 +8.57, +5.83, +5.20, +4.53; avm0c +1.37, +3.27, +4.11, +4.16; v0.2.0 at `--key-filter 0` +1.80, +0.80, +0.17, -0.16, at `--key-filter 1` -0.83, -0.05, -0.14, -0.27. CelV2 is within 3 dB at all four points, so no spec by design's rule: the same reading as AM. First unit at q130: F0 424.0, avm0c 391.4, CelV2 214.4 kB.
+
+**T1, one tile** (2026-11-07; v0.2.0, `--tile-columns 0 --tile-rows 0` against the default, 120 frames, q100-190, one at a time):
+
+| | AIR | Dragon Maid | AM | chika | Angel Beats | 吉村 | crowd_run | park_joy | Mean |
+|---|---|---|---|---|---|---|---|---|---|
+| BD-rate | -1.70 | -0.29 | -1.00 | -1.54 | -1.59 | -1.03 | -0.38 | -0.17 | -0.96 |
+| Time | x1.12 | x1.17 | x1.18 | x1.11 | x1.20 | x1.17 | x1.23 | x1.21 | x1.17 |
+
+Under the spec's 1% on average, so not on the ranked list, and no offset is in hand for the time. Row in `tried-not-kept.md`. The run shared the machine with the v0.2.0 release steps for a few minutes (light work).
+
+**crowd_run:** in the tables above since 2026-11-07.
 
 **Departures from the spec, L3 on:**
 - From L4 on `--bit-depth 8`: avmenc's Wiener filter sets go by base qindex, and at 10 bits the same step is 48 higher, so avmenc's filters run on the wrong classifier (L4 at 10 bits breaks).
@@ -505,7 +520,51 @@ Where Qc and Qd still differ from F0, the three sources together (share: of the 
 
 **Tests:** on fixed CDFs the path's rate equals `SymbolLog`'s bits of the symbols written, to 1e-6, for every transform block, and again on the same coefficients x64, past the range and into the Golomb steps (`X_ORACLE_QCHECK`, in `cli_oracle_replay`). All 25 transform sizes, both quantizers, TCQ and plain, all three planes, on the test clip and on AM q130, Angel Beats q100, Dragon Maid q190. Every Q row decodes equal to `--recon`, 33 of 33 frames.
 
+**Q0b, F0's own residual (2026-11-09).** At L6 (F0's levels, so F0's residual), beside the coding, `real::levels()` with Qc's CDFs on every luma TCQ block at seven weights (`X_ORACLE_Q0B`, oracle build only; all 12 streams byte for byte the same with and without it). Share of luma TCQ area whose levels equal F0's:
+
+| | x0.7 | x0.85 | x1 | x1.19 | x1.41 | x1.68 | x2 | nonzero / F0 at x1, x1.41 |
+|---|---|---|---|---|---|---|---|---|
+| Angel Beats q130 | 64.9 | 69.9 | 73.4 | 77.2 | **79.4** | 79.3 | 75.8 | 1.11, 1.00 |
+| Angel Beats q190 | 72.4 | 76.6 | 80.4 | 83.2 | **84.1** | 81.5 | 77.5 | 1.12, 0.98 |
+| AM q130 | 57.8 | 65.7 | 71.9 | 78.1 | **81.2** | 79.3 | 72.9 | 1.04, 0.98 |
+| AM q190 | 75.1 | 79.6 | 82.9 | 85.5 | **86.4** | 83.7 | 78.6 | 1.02, 0.96 |
+| Dragon Maid q130 | 98.9 | 99.1 | 99.3 | 99.4 | **99.6** | 99.5 | 99.3 | 1.07, 1.01 |
+| Dragon Maid q190 | 98.7 | 99.0 | 99.2 | 99.4 | **99.5** | 99.3 | 99.0 | 1.10, 1.02 |
+
+- **The weight that matches F0 is about 1.4 times Qa's**, on every source and q: x1.41 has the most of F0's levels and F0's count of nonzero levels (0.96-1.02). This fits `rd_boost_factor`'s x1 to x1.5 (Q0's new suspect).
+- **The weight is the frame's, not the superblock's:** in the 64x64 cells where the weight changes anything, the frame's best weight is also the cell's best in 57-77% of the area, and within one step in 82-94%.
+- **No weight halves the difference:** the best weight per frame removes 26-51% of x1's differing area (q100-190: Angel Beats 26-34%, AM 34-51%, Dragon Maid 45-51%). By the spec's reading this is "not the weight".
+- **Where x1 differs:** the end of block past F0's 31-60% of the differing area, the same end with other levels 29-50%, F0 all zero 6-31%, ended before F0's 1-8%.
+
+**An oracle bug, found here and fixed:** 703a784's BAWP check (`bawp_template_inside()`, stricter than the decoder by its slack) dropped BAWP on blocks with F0's own MV, so from 703a784 on L4-L6 on Angel Beats and AM were not F0's decisions: L6 on Angel Beats q130 was 34.04 dB against F0's 39.55 (bisected: bde0550 good, 703a784 bad). The check now passes F0's own MV (F0 decodes, so it is legal); L6 is 39.55 again. The tables above and below are from the fixed build. Rows of other runs made from 703a784 to this fix on ab and am30 at L2-L6 are suspect; Q0's (2dbdd6b) came before it.
+
+**Q0c (2026-11-09).** Rows as Q0, 33 frames, q100-190, fresh L4, Qc and L6 on the same build. Share of L4 to L6 closed by PSNR-Y (BD against F0):
+
+| | Qc | Qf: from avmenc's zero bin | Qc, weight x1.41 | Qe: Q0b's weight per frame | Qf, x1.41 |
+|---|---|---|---|---|---|
+| Dragon Maid | 43.2% (+13.07) | 43.4% (+13.02) | 44.1% (+12.85) | 42.3% (+13.27) | 43.6% (+12.98) |
+| Angel Beats | 57.9% (+10.98) | 56.6% (+11.29) | 42.1% (+14.95) | 44.0% (+14.46) | 44.1% (+14.42) |
+| AM | 52.8% (+7.94) | 52.6% (+7.98) | 46.1% (+9.07) | 43.6% (+9.50) | 45.9% (+9.10) |
+
+- **Qf changes nothing:** starting the trellis at avmenc's zero bin (84/128 of a step) instead of half a step moves no source by 1.3 points. The "past" class is the trellis's own choice, not where it starts.
+- **Matching F0's weight loses:** x1.41 or Q0b's weight per frame brings the levels nearer F0's but closes less on Angel Beats and AM (-6 to -16 points), and at most +0.9 on Dragon Maid. The ceiling Qe is no better than a flat x1.41.
+- **No row reaches half on every source; Qc stays the best**, with Dragon Maid at 43%. By the spec this goes to the user: Q1 at Qc as shown, or a stop.
+- Reproduce, in celv2-bench/l1l2: `QS=100,130,160,190 python -I q0b.py 6; python -I q0b_read.py; SRCS=md,ab,am30 LEVELS=l4we,l4qace,l4qacfe,l4qacke,l4qacwe,l4qacfke,l6we python -I l12.py 6; VS="l4we l4qace l4qacfe l4qacke l4qacwe l4qacfke l6we" python -I t/qt.py`.
+
 ## The next fixes, ranked
 
-Filled from stages 1-2: each fix worth 1% or more on average, its time factor, and whether it suits
-`--preset max` or the default.
+2026-11-07, from stages 1-3: what is worth 1% or more, largest first. The first three rows are ladder steps, measured on avmenc's decisions: they say where the bytes are, not what a fix in CelV2 will gain.
+
+| # | Fix | Worth | Time | Suits | State |
+|---|---|---|---|---|---|
+| 1 | The levels: real-cost trellis | L6 against L5 -19.59, -25.91, -13.91, -15.63% (Dragon Maid, Angel Beats, AM, crowd_run). Q0's best row closes 43-58% of L4's gap on PSNR-Y (Qc) | not measured: oracle build only | default, if the time allows | Q0 short of half on Dragon Maid; Q0b, Q0c next; v0.3.0 |
+| 2 | Modes and MVs | L2 against L1 -25.87, -15.04, -3.47, -4.47%. L2 alone closes 34, 24, 26, 4% of L0's gap | W2, the CPU way: 5.3x on W3 for -0.68 points | GPU candidates, not the CPU | no spec |
+| 3 | Filter settings | L4 against L3 +0.15, -7.77, -2.35, -0.04%; CelV2's own filters on L6's stream +9.02, +82.51, +17.66, +3.17% | not measured | default | no spec; Angel Beats and AM only |
+| 4 | W3, real cost in the RD pass | -2.93%, mean of eight, 33 frames | 4.76x | `--preset max` | in `--preset max` |
+| 5 | G5, 16-frame mini-GOPs with no tune | 吉村 -5.60%, crowd_run and park_joy the same bytes | none | default for no tune | no spec; anime with no tune not measured |
+| 6 | W5, W2, W6 on W3 | together -1.07 points (W2's gain is nearly all Angel Beats) | 5.4x together | `--preset max` | no spec; W2 waits for row 2 |
+
+Off the list:
+- `--rd-zero` shipped in v0.2.0 with `--tune animation` (zero blocks: L5 against L4 pays on crowd_run only, -4.04%, and live action stays off by the viewing).
+- T1, one tile: mean -0.96%, x1.17: under the bar.
+- The key frame's filter, F64, the anchors' filter: no spec (`tried-not-kept.md`).

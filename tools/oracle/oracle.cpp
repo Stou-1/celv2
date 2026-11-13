@@ -243,10 +243,42 @@ int real_cost() {
   static const int m = [] {
     int r = 0;
     if (const char* s = std::getenv("X_ORACLE_Q"))
-      for (; *s; s++) r |= *s == 'a' ? kRealTcq : *s == 'b' ? kRealDepth : *s == 'c' ? kRealRefresh : *s == 'd' ? kRealPlain : 0;
+      for (; *s; s++) r |= *s == 'a' ? kRealTcq : *s == 'b' ? kRealDepth : *s == 'c' ? kRealRefresh : *s == 'd' ? kRealPlain : *s == 'f' ? kRealZbin : 0;
     return r;
   }();
   return m;
+}
+
+double real_weight(int display) {
+  static const std::map<int, double> per = [] {
+    std::map<int, double> m;
+    const char* const s = std::getenv("X_ORACLE_QW");
+    if (!s || !*s) return m;
+    char* end = nullptr;
+    const double all = std::strtod(s, &end);
+    if (end && !*end) {
+      m[-1] = all;
+      return m;
+    }
+    FILE* const f = std::fopen(s, "r");
+    if (!f) throw std::runtime_error(std::string("X_ORACLE_QW: cannot open ") + s);
+    int d;
+    double w;
+    while (std::fscanf(f, "%d %lf", &d, &w) == 2) m[d] = w;
+    std::fclose(f);
+    return m;
+  }();
+  if (const auto it = per.find(-1); it != per.end()) return it->second;
+  const auto it = per.find(display);
+  return it == per.end() ? 1 : it->second;
+}
+
+bool filt_cut(char part) {
+  static const std::string cut = [] {
+    const char* const s = std::getenv("X_ORACLE_FILT");
+    return std::string(s ? s : "");
+  }();
+  return cut.find(part) != std::string::npos;
 }
 
 bool real_check() {

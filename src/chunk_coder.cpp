@@ -494,6 +494,10 @@ void ChunkCoder::code(FrameQueue& in, const std::function<void(std::vector<Coded
         st = tpl_stats(q(0).f, 1, m, mids_of(m));
         if (a.tplq == 1 || a.tplq == 2) key_q = tpl_delta(st[0]) + a.kq;
       }
+      // A shot shorter than 9 frames reuses its key frame less: (ahead + 1) / 9 of the boost (C7(a); 2-frame shots'
+      // keys were 6.4% of S1's bytes). BD-rate q100-190: S1 (AM 600) -5.97%, S2 AIR 600 -1.91%, Angel Beats 120
+      // -1.13%, the other 120-frame sources (no short shot) the same bytes.
+      if (ahead < 8 && key_q < 0) key_q = static_cast<int>(std::lround(key_q * (ahead + 1) / 9.0));
       FrameSpec ks{true, q(0).display, true, true, key_q};
       if (a.deltaq && !st.empty()) ks.sb_dq = tpl_offsets(st, {key_q})[0];
       // --key-filter: coded averaged with the 2 frames after it (fewer with fewer B frames: the coder

@@ -1,4 +1,4 @@
-// The decision kernels on Vulkan, one per CUDA kernel in gpu/kernels.cu, ported one at a time.
+// The decision kernels on Vulkan, ported from the CUDA kernels (gpu/kernels.cu, removed 2026-11-08).
 // Each matches its CPU reference (gpu/kernels_ref, gpu/*_common.h) bit for bit.
 #pragma once
 #include "vk/vk_context.h"
@@ -13,7 +13,7 @@ struct DevPlane {
   uint64_t phase = 0, offset = 0;
 };
 
-// gpu/kernels.h's DevRefs: the references nearest first (n == 0: intra only), each with its level-0
+// the removed gpu/kernels.h's DevRefs: the references nearest first (n == 0: intra only), each with its level-0
 // plane (with its phases) and 8x8 motion field (mv_cols x mv_rows, the same for all).
 struct Refs {
   int n = 0;
@@ -36,11 +36,13 @@ class Kernels {
   void subpel(const DevPlane& src, const Buffer& dst, uint64_t phase, bool half = false);
   // me_kernel: one pyramid level's 8x8 field (cols x rows) into mvx / mvy, from the coarser
   // level's field (pred_x == nullptr at the top); refine: quarter-pel refinement (level 0).
+  // then_barrier false: no barrier after it in a batch (Context::dispatch).
   void me_level(const DevPlane& cur, const DevPlane& ref, const Buffer* pred_x, const Buffer* pred_y, int pred_cols,
-                int pred_rows, const Buffer& mvx, const Buffer& mvy, int cols, int rows, bool refine);
+                int pred_rows, const Buffer& mvx, const Buffer& mvy, int cols, int rows, bool refine,
+                bool then_barrier = true, long long frame_blocks = 0);  // level 0's blocks (0: this level's)
   // satd_kernel: out[i] = SATD of the 64x64 tiles a + 4096 i, b + 4096 i over w4 x h4 4x4s.
   void satd_batch(const Buffer& a, const Buffer& b, int n, int w4, int h4, const Buffer& out);
-  // cost_kernel, as gpu/kernels.h's launch_intra / launch_costs: superblock rows [row0, row0 + nrows),
+  // cost_kernel, as the removed gpu/kernels.h's launch_intra / launch_costs: superblock rows [row0, row0 + nrows),
   // k workgroups a superblock; intra at s * kIntraCosts, costs at (s - row0 * sb_cols) * costs_per_sb(refs.n)
   // (the rows from row0 on: finalize() takes the same row0).
   void intra(const DevPlane& src, int sb_cols, int row0, int nrows, int k, const Buffer& intra);
@@ -54,7 +56,8 @@ class Kernels {
   const Buffer& refs_buffer(const Refs& refs);
 
   Context& ctx_;
-  Kernel downsample_, subpel_, me_, satd_, cost_, finalize_;
+  Kernel downsample_, subpel_, me_, me_wide_, satd_, cost_, finalize_;
+  static constexpr long long kMeWideBlocks = 480 * 270;  // a 4K frame in 8x8 blocks
   Buffer tables_, table_data_, refs_;  // the task tables (built once); the current call's references
 };
 

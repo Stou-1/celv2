@@ -3,8 +3,11 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 namespace celv2::vk {
@@ -22,7 +25,8 @@ namespace celv2::vk {
   X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch)                      \
   X(vkCmdCopyBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) X(vkWaitForFences)              \
   X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkWaitSemaphores)     \
-  X(vkGetSemaphoreCounterValue) X(vkCmdPipelineBarrier) X(vkCmdUpdateBuffer)
+  X(vkGetSemaphoreCounterValue) X(vkCmdPipelineBarrier) X(vkCmdUpdateBuffer) X(vkCreateQueryPool)            \
+  X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)                              X(vkGetPipelineExecutablePropertiesKHR) X(vkGetPipelineExecutableStatisticsKHR)
 
 struct Fns {
   HMODULE dll = nullptr;
@@ -108,28 +112,70 @@ uint64_t Context::free_vram() const {
   return best;
 }
 
-Context::Context(int index) {
-  f_ = open_instance(&inst_);
-  if (!f_) throw std::runtime_error("Vulkan: no loader (vulkan-1.dll) or no instance");
-  const std::vector<VkPhysicalDevice> pds = discrete(*f_, inst_);
+uint32_t Context::compute_family(const std::vector<VkQueueFlags>& flags, int forced) {
+  const uint32_t n = static_cast<uint32_t>(flags.size());
+  if (forced >= 0) return forced < static_cast<int>(n) && (flags[forced] & VK_QUEUE_COMPUTE_BIT) ? forced : n;
+  // A compute-only family first (V1 of 2026-11-07-vulkan-wait-design.md); it may still copy.
+  for (uint32_t i = 0; i < n; i++)
+    if ((flags[i] & VK_QUEUE_COMPUTE_BIT) && !(flags[i] & VK_QUEUE_GRAPHICS_BIT)) return i;
+  for (uint32_t i = 0; i < n; i++)
+    if (flags[i] & VK_QUEUE_COMPUTE_BIT) return i;
+  return n;
+}
+
+// One GPU's instance, device and queues, shared by the Contexts on it (V2 of the Vulkan wait spec):
+// separate devices are separate contexts to the OS, which take turns on the GPU.
+struct Device {
+  std::unique_ptr<Fns> f;
+  VkInstance inst = VK_NULL_HANDLE;
+  VkPhysicalDevice pd = VK_NULL_HANDLE;
+  VkDevice dev = VK_NULL_HANDLE;
+  std::string name;
+  VkPhysicalDeviceMemoryProperties mem_props{};
+  uint32_t family = 0;
+  VkQueueFlags flags = 0;
+  std::vector<VkQueue> queues;
+  std::vector<std::mutex> queue_mu;  // vkQueueSubmit needs its queue held
+  uint32_t next = 0;                 // the queue the next Context takes, under g_devices_mu
+  bool stats = false;                // CELV2_VK_STATS: each pipeline's driver statistics to stderr
+
+  explicit Device(int index);
+  ~Device() {
+    if (dev) f->vkDeviceWaitIdle(dev), f->vkDestroyDevice(dev, nullptr);
+    if (inst) f->vkDestroyInstance(inst, nullptr);
+  }
+};
+
+Device::Device(int index) {
+  f = open_instance(&inst);
+  if (!f) throw std::runtime_error("Vulkan: no loader (vulkan-1.dll) or no instance");
+  const std::vector<VkPhysicalDevice> pds = discrete(*f, inst);
   if (index < 0 || index >= static_cast<int>(pds.size())) {
-    f_->vkDestroyInstance(inst_, nullptr);
+    f->vkDestroyInstance(inst, nullptr), inst = VK_NULL_HANDLE;
     throw std::runtime_error("Vulkan: no discrete GPU " + std::to_string(index));
   }
-  pd_ = pds[index];
+  pd = pds[index];
   VkPhysicalDeviceProperties props;
-  f_->vkGetPhysicalDeviceProperties(pd_, &props);
-  name_ = props.deviceName;
-  f_->vkGetPhysicalDeviceMemoryProperties(pd_, &mem_props_);
+  f->vkGetPhysicalDeviceProperties(pd, &props);
+  name = props.deviceName;
+  f->vkGetPhysicalDeviceMemoryProperties(pd, &mem_props);
 
   uint32_t nq = 0;
-  f_->vkGetPhysicalDeviceQueueFamilyProperties(pd_, &nq, nullptr);
+  f->vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, nullptr);
   std::vector<VkQueueFamilyProperties> qf(nq);
-  f_->vkGetPhysicalDeviceQueueFamilyProperties(pd_, &nq, qf.data());
-  while (family_ < nq && !(qf[family_].queueFlags & VK_QUEUE_COMPUTE_BIT)) family_++;
-  const float prio = 1;
+  f->vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf.data());
+  std::vector<VkQueueFlags> all;
+  for (const VkQueueFamilyProperties& q : qf) all.push_back(q.queueFlags);
+  const char* forced = std::getenv("CELV2_VK_FAMILY");
+  family = Context::compute_family(all, forced && *forced ? std::atoi(forced) : -1);
+  if (family >= nq) {
+    f->vkDestroyInstance(inst, nullptr), inst = VK_NULL_HANDLE;
+    throw std::runtime_error("Vulkan: no compute queue on " + name);
+  }
+  flags = all[family];
+  const std::vector<float> prio(qf[family].queueCount, 1.0f);
   VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-  qci.queueFamilyIndex = family_, qci.queueCount = 1, qci.pQueuePriorities = &prio;
+  qci.queueFamilyIndex = family, qci.queueCount = qf[family].queueCount, qci.pQueuePriorities = prio.data();
   // The kernels read 8-bit planes and keep 16 / 64-bit costs (both GPUs have these).
   VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
   f12.storageBuffer8BitAccess = VK_TRUE, f12.shaderInt8 = VK_TRUE, f12.bufferDeviceAddress = VK_TRUE;
@@ -144,14 +190,52 @@ Context::Context(int index) {
   f2.pNext = &f11, f2.features.shaderInt16 = VK_TRUE, f2.features.shaderInt64 = VK_TRUE;
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.pNext = &f2, dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &qci;
-  if (f_->vkCreateDevice(pd_, &dci, nullptr, &dev_) != VK_SUCCESS) {
-    f_->vkDestroyInstance(inst_, nullptr);
-    throw std::runtime_error("Vulkan: cannot create a device on " + name_);
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fx{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+  const char* ext = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+  stats = std::getenv("CELV2_VK_STATS") != nullptr;
+  if (stats) fx.pipelineExecutableInfo = VK_TRUE, f13.pNext = &fx, dci.enabledExtensionCount = 1, dci.ppEnabledExtensionNames = &ext;
+  if (f->vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS) {
+    dev = VK_NULL_HANDLE, f->vkDestroyInstance(inst, nullptr), inst = VK_NULL_HANDLE;
+    throw std::runtime_error("Vulkan: cannot create a device on " + name);
   }
-#define CELV2_VK_LOAD(name) f_->name = reinterpret_cast<PFN_##name>(f_->vkGetDeviceProcAddr(dev_, #name));
+#define CELV2_VK_LOAD(name) f->name = reinterpret_cast<PFN_##name>(f->vkGetDeviceProcAddr(dev, #name));
   CELV2_VK_DEVICE_FNS(CELV2_VK_LOAD)
 #undef CELV2_VK_LOAD
-  f_->vkGetDeviceQueue(dev_, family_, 0, &queue_);
+  queues.resize(qf[family].queueCount);
+  for (uint32_t q = 0; q < queues.size(); q++) f->vkGetDeviceQueue(dev, family, q, &queues[q]);
+  queue_mu = std::vector<std::mutex>(queues.size());
+}
+
+namespace {
+
+// Each GPU's Device while a Context holds it; the last one out closes it, a later one opens it again.
+std::mutex g_devices_mu;
+std::map<int, std::weak_ptr<Device>> g_devices;
+std::map<int, int> g_opened;  // CELV2_VK_QUEUES=devices: the Contexts opened on each GPU
+
+}  // namespace
+
+Context::Context(int index) {
+  {
+    const std::lock_guard<std::mutex> lock(g_devices_mu);
+    // Every Context on the first queue: on the Arc Pro B50 (driver 32.0.101.8976) kernels with scratch
+    // memory (cost 18 KB, finalize, me) give wrong results or lose the device while two queues of one
+    // VkDevice run them at once, as if the queues shared one scratch area; separate VkDevices do not
+    // (probes_on_queues, 2026-11-08). One queue is also the faster there. CELV2_VK_QUEUES=many: the k-th takes
+    // queue k mod count (the runs); a number n: every one on queue n mod count; devices: the k-th on a
+    // VkDevice of its own (k mod 4), its first queue, as V1.
+    const char* many = std::getenv("CELV2_VK_QUEUES");
+    const bool spread = many && std::string(many) == "many", own = many && std::string(many) == "devices";
+    const int key = own ? index + 1000 * (1 + g_opened[index]++ % 4) : index;
+    d_ = g_devices[key].lock();
+    if (!d_) d_ = std::make_shared<Device>(index), g_devices[key] = d_;
+    const uint32_t nq = static_cast<uint32_t>(d_->queues.size());
+    const uint32_t q = spread ? d_->next++ % nq : many && *many && !own ? static_cast<uint32_t>(std::atoi(many)) % nq : 0;
+    queue_ = d_->queues[q], queue_mu_ = &d_->queue_mu[q];
+  }
+  f_ = d_->f.get(), inst_ = d_->inst, pd_ = d_->pd, dev_ = d_->dev, name_ = d_->name;
+  mem_props_ = d_->mem_props, family_ = d_->family, queue_flags_ = d_->flags;
 
   VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, cpci.queueFamilyIndex = family_;
@@ -167,21 +251,34 @@ Context::Context(int index) {
   sci.pNext = &sti;
   ok(f_->vkCreateSemaphore(dev_, &sci, nullptr, &timeline_), "vkCreateSemaphore");
   batches_.reserve(kMaxBatches);  // open_ points into it
+  if (const char* t = std::getenv("CELV2_VK_TIMES"); t && *t && *t != '0') {
+    VkPhysicalDeviceProperties props;
+    f_->vkGetPhysicalDeviceProperties(pd_, &props);
+    uint32_t nq = 0;
+    f_->vkGetPhysicalDeviceQueueFamilyProperties(pd_, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(nq);
+    f_->vkGetPhysicalDeviceQueueFamilyProperties(pd_, &nq, qf.data());
+    const uint32_t bits = family_ < nq ? qf[family_].timestampValidBits : 0;
+    times_ = bits > 0;  // a family without time stamps: nothing timed
+    tick_ms_ = props.limits.timestampPeriod * 1e-6;
+    tick_mask_ = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+  }
 }
 
 Context::~Context() {
   if (!dev_) return;
-  f_->vkDeviceWaitIdle(dev_);
+  idle();
   for (Kernel& k : kernels_) {
     f_->vkDestroyPipeline(dev_, k.pipe, nullptr);
     f_->vkDestroyPipelineLayout(dev_, k.layout, nullptr);
   }
   if (stage_) f_->vkDestroyBuffer(dev_, stage_, nullptr), f_->vkFreeMemory(dev_, stage_mem_, nullptr);
+  for (Batch& b : batches_)
+    if (b.qp) f_->vkDestroyQueryPool(dev_, b.qp, nullptr);
   f_->vkDestroySemaphore(dev_, timeline_, nullptr);
   f_->vkDestroyFence(dev_, fence_, nullptr);
   f_->vkDestroyCommandPool(dev_, pool_, nullptr);
-  f_->vkDestroyDevice(dev_, nullptr);
-  f_->vkDestroyInstance(inst_, nullptr);
+  // d_ goes after this: the last Context on the GPU closes its device.
 }
 
 namespace {
@@ -222,7 +319,7 @@ Buffer Context::buffer(size_t size) {
 }
 
 void Context::free(Buffer& b) {
-  if (b.buf) f_->vkDeviceWaitIdle(dev_), f_->vkDestroyBuffer(dev_, b.buf, nullptr), f_->vkFreeMemory(dev_, b.mem, nullptr);
+  if (b.buf) idle(), f_->vkDestroyBuffer(dev_, b.buf, nullptr), f_->vkFreeMemory(dev_, b.mem, nullptr);
   b = Buffer{};
 }
 
@@ -252,7 +349,7 @@ HostBuffer Context::host_buffer(size_t size) {
 }
 
 void Context::free(HostBuffer& h) {
-  if (h.buf) f_->vkDeviceWaitIdle(dev_), f_->vkDestroyBuffer(dev_, h.buf, nullptr), f_->vkFreeMemory(dev_, h.mem, nullptr);
+  if (h.buf) idle(), f_->vkDestroyBuffer(dev_, h.buf, nullptr), f_->vkFreeMemory(dev_, h.mem, nullptr);
   h = HostBuffer{};
 }
 
@@ -271,11 +368,23 @@ void Context::begin() {
   ok(f_->vkBeginCommandBuffer(cb_, &bi), "vkBeginCommandBuffer");
 }
 
+// The device's writes made visible to host reads after the wait (a fence or semaphore alone does not).
+void Context::to_host(VkCommandBuffer cb) {
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  f_->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                           nullptr);
+}
+
 void Context::submit_wait() {
+  to_host(cb_);
   ok(f_->vkEndCommandBuffer(cb_), "vkEndCommandBuffer");
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1, si.pCommandBuffers = &cb_;
-  ok(f_->vkQueueSubmit(queue_, 1, &si, fence_), "vkQueueSubmit");
+  {
+    const std::lock_guard<std::mutex> lock(*queue_mu_);
+    ok(f_->vkQueueSubmit(queue_, 1, &si, fence_), "vkQueueSubmit");
+  }
   ok(f_->vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
   ok(f_->vkResetFences(dev_, 1, &fence_), "vkResetFences");
 }
@@ -332,21 +441,104 @@ Kernel Context::kernel_words(const uint32_t* spv, size_t words, int push_bytes, 
     cpi.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
   }
   cpi.layout = k.layout;
+  if (d_->stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
   const VkResult r = f_->vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &k.pipe);
   f_->vkDestroyShaderModule(dev_, sm, nullptr);
   ok(r, "vkCreateComputePipelines");
+  if (d_->stats) {  // the investigation of the B50's queues (2026-11-08): scratch and spills per kernel
+    VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pi.pipeline = k.pipe;
+    uint32_t ne = 0;
+    f_->vkGetPipelineExecutablePropertiesKHR(dev_, &pi, &ne, nullptr);
+    std::vector<VkPipelineExecutablePropertiesKHR> ep(ne, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    f_->vkGetPipelineExecutablePropertiesKHR(dev_, &pi, &ne, ep.data());
+    for (uint32_t e = 0; e < ne; e++) {
+      VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+      ei.pipeline = k.pipe, ei.executableIndex = e;
+      uint32_t ns = 0;
+      f_->vkGetPipelineExecutableStatisticsKHR(dev_, &ei, &ns, nullptr);
+      std::vector<VkPipelineExecutableStatisticKHR> st(ns, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+      f_->vkGetPipelineExecutableStatisticsKHR(dev_, &ei, &ns, st.data());
+      std::string line = "stats " + std::to_string(words) + " words " + ep[e].name + " (subgroup " +
+                         std::to_string(ep[e].subgroupSize) + "):";
+      for (const VkPipelineExecutableStatisticKHR& x : st) {
+        line += std::string(" ") + x.name + "=";
+        line += x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR ? std::to_string(x.value.f64)
+                : x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? std::to_string(x.value.i64)
+                : x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR ? std::to_string(x.value.b32)
+                                                                                 : std::to_string(x.value.u64);
+      }
+      std::fprintf(stderr, "%s\n", line.c_str());
+    }
+  }
   kernels_.push_back(k);
   return k;
 }
 
-void Context::dispatch(const Kernel& k, const void* push, uint32_t gx, uint32_t gy, uint32_t gz) {
+namespace {
+std::mutex g_times_mu;
+std::map<std::pair<std::string, std::string>, Context::KernelTime> g_times;
+// Prints the totals at the process's end, when CELV2_VK_TIMES gathered any.
+struct TimesPrinter {
+  ~TimesPrinter() {
+    for (const Context::KernelTime& t : Context::kernel_times())
+      std::fprintf(stderr, "celv2enc: vk-times: %s: %-12s %8llu calls %10.1f ms %8.1f us each\n", t.device.c_str(),
+                   t.kernel.c_str(), static_cast<unsigned long long>(t.calls), t.ms, t.calls ? 1000 * t.ms / t.calls : 0.0);
+  }
+} g_times_printer;
+}  // namespace
+
+std::vector<Context::KernelTime> Context::kernel_times() {
+  const std::lock_guard<std::mutex> lock(g_times_mu);
+  std::vector<KernelTime> v;
+  for (const auto& e : g_times) v.push_back(e.second);
+  return v;
+}
+
+// The barrier first: without it a GPU that overlaps work (the RTX 5090) starts the dispatch before the work ahead
+// ends, and the stamp, written when that work ends, comes late (cost inter read 0.7 us). Timed batches therefore
+// run their work one after another.
+void Context::stamp_begin() {
+  if (!times_ || !open_ || open_->marks.size() >= kMarks) return;
+  barrier();
+  f_->vkCmdWriteTimestamp(open_->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open_->qp,
+                          static_cast<uint32_t>(2 * open_->marks.size()));
+}
+
+void Context::stamp_end(const char* name) {
+  if (!times_ || !open_ || open_->marks.size() >= kMarks) return;
+  barrier();  // likewise: the RTX 5090 wrote this one before the dispatch ended (0.7 us a row's costs)
+  f_->vkCmdWriteTimestamp(open_->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open_->qp,
+                          static_cast<uint32_t>(2 * open_->marks.size() + 1));
+  open_->marks.push_back(name);
+}
+
+void Context::harvest(Batch& b) {
+  if (b.marks.empty()) return;
+  std::vector<uint64_t> t(2 * b.marks.size());
+  const VkResult r = f_->vkGetQueryPoolResults(dev_, b.qp, 0, static_cast<uint32_t>(t.size()), t.size() * 8, t.data(), 8,
+                                              VK_QUERY_RESULT_64_BIT);
+  if (r == VK_SUCCESS) {
+    const std::lock_guard<std::mutex> lock(g_times_mu);
+    for (size_t i = 0; i < b.marks.size(); i++) {
+      KernelTime& k = g_times[{name_, b.marks[i]}];
+      k.device = name_, k.kernel = b.marks[i];
+      k.calls++, k.ms += static_cast<double>((t[2 * i + 1] - t[2 * i]) & tick_mask_) * tick_ms_;
+    }
+  }
+  b.marks.clear();
+}
+
+void Context::dispatch(const Kernel& k, const void* push, uint32_t gx, uint32_t gy, uint32_t gz, bool then_barrier) {
   if (!open_) begin();
   const VkCommandBuffer cb = open_ ? open_->cb : cb_;
+  stamp_begin();
   f_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipe);
   if (k.push_bytes) f_->vkCmdPushConstants(cb, k.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, k.push_bytes, push);
   f_->vkCmdDispatch(cb, gx, gy, gz);
-  if (open_) barrier();
-  else submit_wait();
+  stamp_end(k.name);
+  if (!open_) submit_wait();
+  else if (then_barrier) barrier();
 }
 
 void Context::barrier() {
@@ -364,6 +556,7 @@ void Context::begin_batch() {
   for (Batch& b : batches_)
     if (b.value <= done) {
       open_ = &b;
+      harvest(b);
       break;
     }
   if (!open_) {
@@ -382,12 +575,21 @@ void Context::begin_batch() {
   VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   ok(f_->vkBeginCommandBuffer(open_->cb, &bi), "vkBeginCommandBuffer");
+  if (times_) {
+    if (!open_->qp) {
+      VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qi.queryType = VK_QUERY_TYPE_TIMESTAMP, qi.queryCount = 2 * kMarks;
+      ok(f_->vkCreateQueryPool(dev_, &qi, nullptr, &open_->qp), "vkCreateQueryPool");
+    }
+    f_->vkCmdResetQueryPool(open_->cb, open_->qp, 0, 2 * kMarks);
+  }
 }
 
 uint64_t Context::submit() {
   if (!open_) throw std::logic_error("Vulkan: no batch to submit");
   Batch& b = *open_;
   open_ = nullptr;
+  to_host(b.cb);
   ok(f_->vkEndCommandBuffer(b.cb), "vkEndCommandBuffer");
   const uint64_t value = submitted_ + 1;
   VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -395,7 +597,10 @@ uint64_t Context::submit() {
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.pNext = &tsi, si.commandBufferCount = 1, si.pCommandBuffers = &b.cb;
   si.signalSemaphoreCount = 1, si.pSignalSemaphores = &timeline_;
-  ok(f_->vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+  {
+    const std::lock_guard<std::mutex> lock(*queue_mu_);
+    ok(f_->vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+  }
   b.value = submitted_ = value;
   return value;
 }
@@ -406,16 +611,28 @@ void Context::wait(uint64_t value) {
   ok(f_->vkWaitSemaphores(dev_, &wi, UINT64_MAX), "vkWaitSemaphores");
 }
 
+void Context::idle() {
+  try {
+    if (submitted_) wait(submitted_);
+    for (Batch& b : batches_)
+      if (b.value <= submitted_) harvest(b);
+  } catch (const std::runtime_error&) {  // a lost device: nothing left to wait for (and destructors call this)
+  }
+}
+
 void Context::finish() {
   if (open_) submit();
   if (submitted_) wait(submitted_);
+  for (Batch& b : batches_) harvest(b);
 }
 
 void Context::copy(const Buffer& dst, size_t dst_off, const HostBuffer& src, size_t src_off, size_t size) {
   if (!open_) throw std::logic_error("Vulkan: copy outside a batch");
   if (dst_off + size > dst.size || src_off + size > src.size) throw std::invalid_argument("Vulkan copy: out of range");
   const VkBufferCopy region{src_off, dst_off, size};
+  stamp_begin();
   f_->vkCmdCopyBuffer(open_->cb, src.buf, dst.buf, 1, &region);
+  stamp_end("upload");
   barrier();
 }
 
@@ -423,7 +640,9 @@ void Context::copy(const HostBuffer& dst, size_t dst_off, const Buffer& src, siz
   if (!open_) throw std::logic_error("Vulkan: copy outside a batch");
   if (dst_off + size > dst.size || src_off + size > src.size) throw std::invalid_argument("Vulkan copy: out of range");
   const VkBufferCopy region{src_off, dst_off, size};
+  stamp_begin();
   f_->vkCmdCopyBuffer(open_->cb, src.buf, dst.buf, 1, &region);
+  stamp_end("download");
   barrier();
 }
 

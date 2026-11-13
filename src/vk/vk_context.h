@@ -9,12 +9,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace celv2::vk {
 
 struct Fns;
+struct Device;
 
 // A buffer in device memory; `addr` is what a kernel's push constants point at.
 struct Buffer {
@@ -37,6 +39,7 @@ struct Kernel {
   VkPipeline pipe = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
   int push_bytes = 0;
+  const char* name = "kernel";  // CELV2_VK_TIMES' label
 };
 
 class Context {
@@ -49,7 +52,15 @@ class Context {
   Context(const Context&) = delete;
   Context& operator=(const Context&) = delete;
 
+  // The queue family a Context takes, from each family's flags: `forced` if it has compute
+  // (CELV2_VK_FAMILY, for the runs), else one with compute and no graphics, else the first with
+  // compute. flags.size() when none fits.
+  static uint32_t compute_family(const std::vector<VkQueueFlags>& flags, int forced);
+
   const std::string& name() const { return name_; }
+  VkQueueFlags queue_flags() const { return queue_flags_; }
+  VkDevice device() const { return dev_; }
+  VkQueue queue() const { return queue_; }
   // What the largest device-local heap has left (VK_EXT_memory_budget), or its size without that.
   uint64_t free_vram() const;
 
@@ -82,34 +93,65 @@ class Context {
   // subgroup > 0: every subgroup is exactly that wide and full (the CUDA kernels' warps of 32).
   // (Not an overload of kernel(): kernel(spv, push, subgroup) would pick it, words = push.)
   Kernel kernel_words(const uint32_t* spv, size_t words, int push_bytes, int subgroup);
-  // Runs k on gx x gy x gz workgroups and waits for it.
-  void dispatch(const Kernel& k, const void* push, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1);
+  // Runs k on gx x gy x gz workgroups and waits for it. In a batch: records it, then a barrier()
+  // unless then_barrier is false (dispatches on separate buffers, ordered by one barrier() after them).
+  void dispatch(const Kernel& k, const void* push, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1,
+                bool then_barrier = true);
+  void barrier();  // in a batch: everything recorded so far before everything after
+
+  // CELV2_VK_TIMES=1 (the speed-first spec's step 0): GPU time stamps around each dispatch and copy in a batch,
+  // summed per GPU and kernel name over the process, and printed at its end. A barrier goes before each, so the
+  // timed work runs one dispatch at a time (no overlap: totals above an untimed run's) and each interval is that
+  // dispatch's own time.
+  struct KernelTime {
+    std::string device, kernel;
+    uint64_t calls = 0;
+    double ms = 0;
+  };
+  static std::vector<KernelTime> kernel_times();
 
  private:
   void copy(VkBuffer dst, VkBuffer src, size_t size);
   void staging(size_t size);
   void begin();
   void submit_wait();
-  void barrier();  // everything recorded so far before everything after
+  void to_host(VkCommandBuffer cb);
+  // Waits for this Context's submitted batches (not the open one, not other Contexts'). Before a free:
+  // vkDeviceWaitIdle would wait for every Context on the GPU and needs all its queues held.
+  void idle();
 
   // The batches' command buffers, each free again once the value it signals is reached.
   struct Batch {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     uint64_t value = 0;
+    VkQueryPool qp = VK_NULL_HANDLE;  // CELV2_VK_TIMES: two stamps per mark
+    std::vector<const char*> marks;
   };
+  static constexpr uint32_t kMarks = 256;  // stamped dispatches and copies a batch, at most
+  void stamp_begin();
+  void stamp_end(const char* name);
+  void harvest(Batch& b);  // b's stamps into the totals (b done)
+  bool times_ = false;
+  double tick_ms_ = 0;
+  uint64_t tick_mask_ = 0;
   static constexpr size_t kMaxBatches = 256;
   std::vector<Batch> batches_;
   Batch* open_ = nullptr;
   VkSemaphore timeline_ = VK_NULL_HANDLE;
   uint64_t submitted_ = 0;
 
-  std::unique_ptr<Fns> f_;
+  // The GPU's device, shared by every Context on it (V2 of the Vulkan wait spec); the rest of the
+  // handles below are its, copied. queue_mu_ guards queue_, which other Contexts may share.
+  std::shared_ptr<Device> d_;
+  Fns* f_ = nullptr;
+  std::mutex* queue_mu_ = nullptr;
   std::string name_;
   VkInstance inst_ = VK_NULL_HANDLE;
   VkPhysicalDevice pd_ = VK_NULL_HANDLE;
   VkDevice dev_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t family_ = 0;
+  VkQueueFlags queue_flags_ = 0;
   VkPhysicalDeviceMemoryProperties mem_props_{};
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkCommandBuffer cb_ = VK_NULL_HANDLE;

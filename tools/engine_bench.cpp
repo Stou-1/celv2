@@ -1,5 +1,6 @@
 // engine_bench <in.y4m> <frames> [qindex] [refs] [cpu]: the decision engines alone (no coding), ms per
-// frame; cpu adds the CPU engine (minutes a frame at 16K). Each frame is decided against the refs (2 by default) before it, nearest first (source
+// frame; cpu adds the CPU engine (minutes a frame at 16K). Every engine is made before the first runs (they share the
+// VRAM). Each frame is decided against the refs (2 by default) before it, nearest first (source
 // frames as references), with the next frame prepared ahead, as Pipeline::code does.
 #include <chrono>
 #include <cstdio>

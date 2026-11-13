@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -11,6 +12,7 @@
 #include "vk_shaders/downsample.h"
 #include "vk_shaders/finalize.h"
 #include "vk_shaders/me.h"
+#include "vk_shaders/me_wide.h"
 #include "vk_shaders/satd.h"
 #include "vk_shaders/subpel.h"
 
@@ -44,7 +46,7 @@ struct SatdPush {
   uint64_t a, b, out;
   int n, w4, h4;
 };
-constexpr int kInterSlots = 4400;  // gpu/kernels.h
+constexpr int kInterSlots = 4400;  // as shaders/common.slang
 constexpr int kNumIntra = kSbBlocks * kNumModes;
 struct KRefs {  // common.slang's KRefs
   int n;
@@ -79,7 +81,7 @@ struct FinalizePush {
 };
 static_assert(sizeof(FinalizePush) <= 128);
 
-// gpu/kernels.cu's inter_tasks_kernel: the inter tasks of a superblock (block x candidate MV) and
+// the removed gpu/kernels.cu's inter_tasks_kernel: the inter tasks of a superblock (block x candidate MV) and
 // the chunks the warps take, the same for every superblock.
 std::unique_ptr<TableData> make_tables(int* n_intra_chunks, int* n_inter_chunks) {
   auto t = std::make_unique<TableData>();
@@ -121,9 +123,14 @@ Kernels::Kernels(Context& ctx)
       downsample_(ctx.kernel(kSpv_downsample, sizeof(DownsamplePush))),
       subpel_(ctx.kernel(kSpv_subpel, sizeof(SubpelPush))),
       me_(ctx.kernel(kSpv_me, sizeof(MePush))),
+      me_wide_(ctx.kernel(kSpv_me_wide, sizeof(MePush))),
       satd_(ctx.kernel(kSpv_satd, sizeof(SatdPush))),
-      cost_(ctx.kernel(kSpv_cost, sizeof(CostPush), 32)),
+      // CELV2_VK_COST_SUBGROUP: another width (0: the driver's), for the B50 queue runs only (costs differ).
+      cost_(ctx.kernel(kSpv_cost, sizeof(CostPush),
+                       std::getenv("CELV2_VK_COST_SUBGROUP") ? std::atoi(std::getenv("CELV2_VK_COST_SUBGROUP")) : 32)),
       finalize_(ctx.kernel(kSpv_finalize, sizeof(FinalizePush))) {
+  downsample_.name = "downsample", subpel_.name = "subpel", me_.name = "me", me_wide_.name = "me wide", satd_.name = "satd";
+  cost_.name = "cost inter", finalize_.name = "finalize";
   Tables t;
   const std::unique_ptr<TableData> d = make_tables(&t.n_intra_chunks, &t.n_inter_chunks);
   table_data_ = ctx.buffer(sizeof(TableData));
@@ -154,7 +161,9 @@ const Buffer& Kernels::refs_buffer(const Refs& r) {
 
 void Kernels::intra(const DevPlane& src, int sb_cols, int row0, int nrows, int k, const Buffer& intra) {
   const CostPush p{plane(src), tables_.addr, refs_buffer(Refs{}).addr, intra.addr, 0, 0, sb_cols, row0, k, 1};
-  ctx_.dispatch(cost_, &p, static_cast<uint32_t>(sb_cols), static_cast<uint32_t>(nrows * k));
+  Kernel cost_intra = cost_;
+  cost_intra.name = "cost intra";
+  ctx_.dispatch(cost_intra, &p, static_cast<uint32_t>(sb_cols), static_cast<uint32_t>(nrows * k));
 }
 
 void Kernels::costs(const DevPlane& src, const Refs& refs, int sb_cols, int row0, int nrows, int k, int64_t lambda_q8,
@@ -184,10 +193,20 @@ void Kernels::subpel(const DevPlane& src, const Buffer& dst, uint64_t phase, boo
 
 void Kernels::me_level(const DevPlane& cur, const DevPlane& ref, const Buffer* pred_x, const Buffer* pred_y,
                        int pred_cols, int pred_rows, const Buffer& mvx, const Buffer& mvy, int cols, int rows,
-                       bool refine) {
+                       bool refine, bool then_barrier, long long frame_blocks) {
   const MePush p{plane(cur), plane(ref), pred_x ? pred_x->addr : 0, pred_y ? pred_y->addr : 0, mvx.addr, mvy.addr,
                  pred_cols, pred_rows, cols, rows, refine ? 1 : 0};
-  ctx_.dispatch(me_, &p, groups(cols, 8), groups(rows, 8));
+  // Frames of at most kMeWideBlocks 8x8 blocks (4K): a workgroup a block on every level (me_wide, the same field). One
+  // thread a block left most of the GPU idle at the coarse levels (1080p, 7 refs: me -56% on the Arc Pro B50, -58% on
+  // the RTX 5090). Larger frames: one thread a block on every level. At 16K the B50's engine lost about 15% with
+  // workgroups on any level (its later kernels ran slower too; cause not found), while the 5090's gained.
+  // CELV2_VK_ME_WIDE_MAX: another limit (the runs and tests; read per call, a few a frame).
+  const char* const e = std::getenv("CELV2_VK_ME_WIDE_MAX");
+  const long long wide_max = e && *e ? std::atoll(e) : kMeWideBlocks;
+  if ((frame_blocks > 0 ? frame_blocks : static_cast<long long>(cols) * rows) <= wide_max)
+    ctx_.dispatch(me_wide_, &p, static_cast<uint32_t>(cols), static_cast<uint32_t>(rows), 1, then_barrier);
+  else
+    ctx_.dispatch(me_, &p, groups(cols, 8), groups(rows, 8), 1, then_barrier);
 }
 
 void Kernels::satd_batch(const Buffer& a, const Buffer& b, int n, int w4, int h4, const Buffer& out) {

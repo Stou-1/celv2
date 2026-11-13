@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <future>
@@ -21,7 +22,6 @@
 #include "core/rd_pass.h"
 #include "core/threads.h"
 #include "gpu/cpu_engine.h"
-#include "gpu/engine.h"
 #ifdef CELV2_HAVE_VULKAN
 #include "vk/vk_context.h"
 #include "vk/vk_engine.h"
@@ -41,19 +41,11 @@ std::vector<std::pair<std::string, std::string>> list_devices() {
 }
 
 std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height, int tile_threads,
-                                            const std::function<ProbeResult()>& probe,
                                             std::string* description, int engines) {
   constexpr int kSbSize = 64;
 #ifdef CELV2_ORACLE
   if (celv2::oracle::level() >= 2) device = Device::Cpu;  // ImportEngine never asks it
 #endif
-  if (device == Device::Cuda) {
-    const ProbeResult p = probe();
-    if (!p.ok) throw std::runtime_error("no usable CUDA GPU: " + p.reason);
-    *description = "decisions on CUDA (" + p.name + ", compute " + std::to_string(p.cc_major) + "." +
-                   std::to_string(p.cc_minor) + ")";
-    return std::make_unique<GpuEngine>(width, height, kSbSize);
-  }
   if (device == Device::Cpu) {
     *description = "decisions on CPU (requested with --device cpu)";
   } else {
@@ -82,7 +74,7 @@ std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height
 Pipeline::Pipeline(const SeqConfig& c, Device device)
     : cfg_(c),
       enc_(c),
-      engine_(make_engine(device, c.width, c.height, enc_.tile_threads(), probe_gpu, &description_, c.engines)) {
+      engine_(make_engine(device, c.width, c.height, enc_.tile_threads(), &description_, c.engines)) {
   // Every tile row starts coding as soon as its first superblock row is decided (16K with 4 tile
   // rows: the lower 12 of 16 tiles waited for the rows above them).
 #ifdef CELV2_ORACLE
@@ -114,6 +106,13 @@ Frame420 copy_frame(const Frame420& s, bool full_depth) {
   return d;
 }
 
+// The RD pass prices side information from the frame's CDFs (docs/superpowers/specs/2026-11-12-sideinfo-cost-design.md);
+// X_SIDE=0: the constants, as before (experiment).
+bool side_on() {
+  static const bool on = !std::getenv("X_SIDE") || std::atoi(std::getenv("X_SIDE")) != 0;
+  return on;
+}
+
 }  // namespace
 
 std::vector<uint8_t> Pipeline::encode(const Frame420& src, bool key) {
@@ -125,6 +124,8 @@ std::vector<uint8_t> Pipeline::encode(const Frame420& src, bool key) {
 
 std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given, const Frame420* next,
                                     int next_display) {
+  const auto t0 = std::chrono::steady_clock::now();
+  auto since = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
   FrameSpec spec = given;
   spec.qindex_delta += qindex_offset_;
   snap_sb_dq(spec.sb_dq, cfg_.width, cfg_.height, enc_.sb_px());  // the RD pass decides at the coded qindex
@@ -135,16 +136,23 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given,
   std::vector<const Frame420*> refs;
   std::vector<long long> keys;
   references(enc_.begin(spec), refs, keys);
+  celv2::add_wall(celv2::Wall::Begin, since());
   {
     celv2::StageScope prof(celv2::Stage::Decision);
-    engine_->launch(src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), dm, keys, spec.display);
+    launch(src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), dm, keys, spec.display);
     if (next && next_display >= 0) engine_->prepare(*next, next_display);
   }
+  celv2::add_wall(celv2::Wall::Launch, since());
   // Tile threads code each superblock row as soon as the collector publishes it.
   std::future<void> collector;
+  // The RD pass's side-information prices from the frame's starting CDFs (the coder runs meanwhile).
+  SideCosts side;
+  if (side_on()) enc_.side_costs(side);
   try {
     collector = std::async(std::launch::async, [&] {
-      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq, spec.map.get(), spec.screen, spec.ibc.get());
+      collect(dm, gate, src, refs, std::max(1, std::min(255, cfg_.qindex + spec.qindex_delta)), spec.sb_dq, spec.map.get(), spec.screen, spec.ibc.get(),
+              side_on() ? &side : nullptr);
+      celv2::add_wall(celv2::Wall::RdDone, since());
     });
   } catch (...) {
     // No collector thread: drain the launched work here (collect leaves none pending on failure).
@@ -158,21 +166,38 @@ std::vector<uint8_t> Pipeline::code(const Frame420& src, const FrameSpec& given,
   std::vector<uint8_t> tu;
   try {
     tu = enc_.code(src, dm, &gate);
+    celv2::add_wall(celv2::Wall::Coded, since());
   } catch (...) {
     collector.wait();  // collect() uses dm and gate, and the next launch needs it finished
     throw;
   }
   collector.get();  // a decision error surfaces here
   keep(spec);
+  celv2::add_wall(celv2::Wall::Total, since());
   return tu;
+}
+
+void Pipeline::launch(const Frame420& src, const std::vector<const Frame420*>& refs, int qindex, DecisionMap& dm,
+                      const std::vector<long long>& keys, long long display) {
+  const auto t0 = std::chrono::steady_clock::now();
+  engine_->launch(src, refs, qindex, dm, keys, display);
+  launch_end_ = std::chrono::steady_clock::now();
+  launch_ms_ = std::chrono::duration<double, std::milli>(launch_end_ - t0).count();
+}
+
+void Pipeline::engine_collect(DecisionMap& dm, RowGate& gate) {
+  engine_->collect(dm, gate);
+  const auto row0 = gate.first_ready();
+  if (celv2::profiling() && row0 != std::chrono::steady_clock::time_point{})
+    celv2::add_engine_wall(launch_ms_, std::chrono::duration<double, std::milli>(row0 - launch_end_).count());
 }
 
 void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
                        int qindex, const std::vector<int>& sb_dq, const celv2::AqMap* map, bool screen,
-                       const celv2::IntrabcIndex* ibc) {
+                       const celv2::IntrabcIndex* ibc, const SideCosts* side) {
   if (!cfg_.rd_pass) {
     celv2::StageScope prof(celv2::Stage::Decision);
-    return engine_->collect(dm, gate);
+    return engine_collect(dm, gate);
   }
   RdPassParams p;
   p.qindex = qindex;
@@ -182,6 +207,10 @@ void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, cons
   p.intra64 = cfg_.intra64;
   p.psy = cfg_.psy_rd, p.map = map, p.psy_lines = cfg_.psy_lines, p.trellis = cfg_.psy_trellis;
   p.screen = screen, p.ibc = ibc;
+  // The side prices, and the weight of a bit swept with them (33 frames, 8 sources, BD-rate YUV / Y against
+  // the constants at 0.025: 0.025 -0.70 / -0.43%, 0.03 -0.98 / -0.36%; 0.035 on 4 of them: chika Y +1.42%). Re-swept
+  // with 8x4 / 4x8 priced as coded (against a9d5670): 0.025 +0.35 / -0.02%, 0.03 -0.02 / -0.05%, 0.035 +0.28 / +0.39%.
+  if (side) p.side = side, p.bit_weight = 0.03;
   if (const char* e = std::getenv("X_RDW")) p.bit_weight = std::atof(e);
   if (const char* e = std::getenv("X_RDB")) p.block_bits = std::atof(e);
   // W3: X_ALTS="weight:bits,weight:bits": the pass run again with these, each result an alternative.
@@ -249,7 +278,7 @@ void Pipeline::collect(DecisionMap& dm, RowGate& gate, const Frame420& src, cons
   try {
     for (int t = 0; t < nt; t++) pool.emplace_back(work);
     celv2::StageScope prof(celv2::Stage::Decision);
-    engine_->collect(dm, inner);  // fails `inner` on error, which ends the workers
+    engine_collect(dm, inner);  // fails `inner` on error, which ends the workers
   } catch (...) {
     err = std::current_exception();
     stop = true;
@@ -322,12 +351,14 @@ std::vector<std::vector<uint8_t>> Pipeline::code_group(const std::vector<const F
   for (size_t i = 0; i < n && !err; i++) {
     try {
       celv2::StageScope prof(celv2::Stage::Decision);
-      engine_->launch(*srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)), dms[i],
-                      keys[i], specs[i].display);
+      launch(*srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)), dms[i], keys[i],
+             specs[i].display);
       if (i + 1 < n) engine_->prepare(*srcs[i + 1], specs[i + 1].display);
-      auto collector = std::async(std::launch::async, [&, i] {
+      auto side = std::make_shared<SideCosts>();  // as code()'s
+      if (side_on()) encs[i]->side_costs(*side);
+      auto collector = std::async(std::launch::async, [&, i, side] {
         collect(dms[i], *gates[i], *srcs[i], refs[i], std::max(1, std::min(255, cfg_.qindex + specs[i].qindex_delta)),
-                specs[i].sb_dq, specs[i].map.get(), specs[i].screen, specs[i].ibc.get());
+                specs[i].sb_dq, specs[i].map.get(), specs[i].screen, specs[i].ibc.get(), side_on() ? side.get() : nullptr);
       });
       coders.push_back(std::async(std::launch::async, [&, i] { return encs[i]->code(*srcs[i], dms[i], gates[i].get()); }));
       collector.get();  // a decision error surfaces here (and fails the gate the coder waits on)

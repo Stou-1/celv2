@@ -21,6 +21,7 @@ struct Block {
   bool tcq;
   double flag[2];  // the all-zero flag's bits: coded, all zero
   double weight;   // of a bit, in squared DC steps
+  double start = 0.5;  // the last coefficient the trellis may give a level: at least this many steps (Qf: avmenc's zero bin)
 };
 
 double eob_bits(const Block& b, int eob) {
@@ -194,7 +195,7 @@ int levels(const Block& b, const tran_low_t* coeff, tran_low_t* q, tran_low_t* d
   int top = n - 1;
   while (top >= 0) {
     const int pos = so->scan[top];
-    if (std::abs(static_cast<double>(coeff[pos])) >= 0.5 * (pos ? ac_q : dc_q) / scale) break;
+    if (std::abs(static_cast<double>(coeff[pos])) >= b.start * (pos ? ac_q : dc_q) / scale) break;
     top--;
   }
   if (top < 0) {

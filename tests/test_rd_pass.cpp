@@ -2,8 +2,10 @@
 #include <vector>
 
 #include "check.h"
+#include "core/encoder.h"
 #include "core/rd_pass.h"
 #include "gpu/sb_blocks.h"
+#include "test_frames.h"
 
 // A flat keyframe superblock (its neighbours flat too) whose 32x32 squares have DC as the engine's intra
 // mode and whose smaller blocks have V: DC predicts the squares exactly, so each stays one block.
@@ -107,12 +109,58 @@ static int flat_superblock_one_intra64_block() {
   return 0;
 }
 
+// An inter frame's side prices (Encoder::side_costs()): the 8x4 / 4x8 halves of an 8x8 code no partition symbol
+// (NONE their only one: 0, where a 16x8's is coded) and an inter block of theirs only skip_txfm 0, less than the
+// is_inter and skip_txfm flags of larger ones.
+static int side_costs_of_8x4() {
+  const int w = 128, h = 128;
+  Encoder enc(SeqConfig{w, h, 30, 1, 120});
+  enc.encode(scene_frame(w, h), uniform_decision(w, h, 64), true);
+  enc.begin(FrameSpec{});
+  SideCosts t;
+  enc.side_costs(t);
+  CHECK_EQ(t.part_half[3][0][0], 0);
+  CHECK_EQ(t.part_half[3][1][0], 0);
+  CHECK(t.part_half[2][0][0] > 0 && t.part_half[2][1][0] > 0);
+  CHECK(t.skip_txfm > 0 && t.skip_txfm < t.inter_block);
+  return 0;
+}
+
+// The pass prices an inter frame's 8x4 / 4x8 blocks by skip_txfm alone (inter_side()): with an inter block's flags
+// at 10000 bits and every other side price 0, a picture its reference predicts exactly takes 8x4s throughout (128
+// blocks), not one 64x64 block.
+static int inter_8x4_flags_are_skip_txfm() {
+  const Frame420 f = scene_frame(128, 128);
+  SbDecision sb;
+  sb.cands.resize(celv2::kSbBlocks);
+  for (int b = 0; b < celv2::kSbBlocks; b++) {
+    int x, y, bw, bh;
+    celv2::sb_block_geom(b, &x, &y, &bw, &bh);
+    sb.cands[b].inter_cost = 1;
+    sb.cands[b].inter.inter = true;  // reference 0, MV 0
+    sb.cands[b].inter.w4 = static_cast<uint8_t>(bw / 4), sb.cands[b].inter.h4 = static_cast<uint8_t>(bh / 4);
+  }
+  SideCosts t;
+  t.inter_block = 10000 * 512;
+  RdPassParams p;
+  p.qindex = 120;
+  p.block_bits = 0;
+  p.side = &t;
+  for (double& s : p.scale) s = 1;
+  rd_pass_sb(f, {&f}, 64, 64, p, sb);
+  CHECK_EQ(sb.blocks.size(), 128u);
+  for (const BlockDecision& d : sb.blocks) CHECK(d.inter && d.w4 * d.h4 == 2);
+  return 0;
+}
+
 int main() {
   int fails = 0;
   fails += RUN(flat_dc_squares_stay_whole);
   fails += RUN(every_intra_mode_finds_h);
   fails += RUN(a_half_splits_again);
   fails += RUN(flat_superblock_one_intra64_block);
+  fails += RUN(side_costs_of_8x4);
+  fails += RUN(inter_8x4_flags_are_skip_txfm);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;
 }

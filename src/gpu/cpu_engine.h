@@ -1,5 +1,5 @@
 // CPU decision engine: the GPU's decision rules (kernels_ref) on worker threads, used when no
-// usable GPU exists. Decisions are integer-only, so the result equals GpuEngine's exactly.
+// usable GPU exists. Decisions are integer-only, so the result equals VulkanEngine's exactly.
 #pragma once
 #include <atomic>
 #include <condition_variable>

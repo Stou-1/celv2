@@ -8,10 +8,11 @@
 // 4x the median of the previous 8 differences plus 1, and frame t+1 differs from t by less than
 // half as much, so a one-frame flash (or a black frame between shots) is not a cut but the first
 // frame of the new shot is. It must also differ from frame t-2 by over 20, so the frame after a
-// flash, back in the same scene, is not a cut either, and leave at most half of its cells within 2
-// levels of frame t-1's: held animation whose next drawing changes part of the picture (after
-// identical frames, any change is far over the median) is the same shot. Tuned on an anime clip: 49 cuts in 5087
-// frames, none on fast action or flashes.
+// flash, back in the same scene, is not a cut either, and leave at most a quarter of its cells within 2
+// levels of frame t-1's (letterbox and pillarbox bars left out): held animation whose next drawing changes part of the picture (after
+// identical frames, any change is far over the median) is the same shot. Tuned on an anime clip at the
+// earlier half-still threshold: 49 cuts in 5087 frames, none on fast action or flashes; 0bc092b (C3)
+// lowered it to a quarter on S1/S2 (which can only remove cuts).
 // The share of 8x8 cells of b within 2 levels of a's (how much of the picture stays still).
 double still_share(const Frame420& a, const Frame420& b);
 
@@ -41,4 +42,5 @@ class SceneCutDetector {
   std::vector<double> diffs_;            // the latest differences between consecutive frames
   std::vector<double> prev_hf_;          // CELV2_GOP_LOG: frame t-1's cell high-frequency energies
   int frame_ = -1;                       // t
+  int cw_ = 1;                           // cells a row
 };

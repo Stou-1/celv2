@@ -11,3 +11,5 @@ uint64_t installed_memory_bytes() {
   m.dwLength = sizeof(m);
   return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;
 }
+
+void lower_process_priority() { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS); }

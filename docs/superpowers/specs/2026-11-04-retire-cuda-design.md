@@ -42,7 +42,7 @@ that remains beside it.
    - `engine_bench` compares Vulkan with the CPU engine.
    - test_cli's `CUDA_VISIBLE_DEVICES` cases become "no Vulkan GPU" cases (an environment switch that
      hides Vulkan devices, for tests).
-4. **CUDA removed.**
+4. **CUDA removed.** Not before `2026-11-07-vulkan-wait-design.md` is read: its runs are measured against `--device cuda`.
    - `src/gpu/engine.cu`, `src/gpu/kernels.cu`, `kernels.h` and the CUDA engine class go.
    - `__CUDACC__` branches go from `inter_common.h` and `intra_common.h`; the integer primitives stay
      shared by the CPU reference and, by porting, the Slang shaders.

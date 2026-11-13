@@ -180,8 +180,7 @@ std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool
         }
     }
   }
-#ifdef CELV2_ORACLE
-  if (celv2::oracle::filters() && seq->enable_restoration) {  // decode_restoration_mode(), all of it
+  if (seq->enable_restoration) {  // decode_restoration_mode(), all of it: CodecState::begin_frame() and restore() set it
     bool luma = false, chroma = false;
     for (int p = 0; p < av2_num_planes(cm); p++) {
       const FeatureFlags& f = cm->features;
@@ -216,46 +215,6 @@ std::vector<uint8_t> write_frame_header(const SeqConfig& c, CodecState& st, bool
     }
     for (int p = 0; p < av2_num_planes(cm); p++)
       if (is_frame_filters_enabled(p) && to_readwrite_framefilters(&cm->rst_info[p], 0, 0))
-        for (const uint8_t bit : st.lr_filter_bits(p)) avm_wb_write_bit(&wb, bit);
-  } else
-#endif
-  if (seq->enable_restoration) {  // decode_restoration_mode(): CodecState::begin_frame() set the tools
-    for (int p = 0; p < av2_num_planes(cm); p++) {
-      const FeatureFlags& f = cm->features;
-      int ndx = 0;  // the inverse of index_to_frame_restoration_type()
-      for (int r = RESTORE_NONE; r < cm->rst_info[p].frame_restoration_type; r++) ndx += !((f.lr_tools_disable_mask[p] >> r) & 1);
-      // rb_read_uniform()
-      const int n = f.lr_frame_tools_count[p], l = get_unsigned_bits(n), m = (1 << l) - n;
-      if (ndx < m) {
-        avm_wb_write_literal(&wb, ndx, l - 1);
-      } else {
-        avm_wb_write_literal(&wb, m + ((ndx - m) >> 1), l - 1);
-        avm_wb_write_bit(&wb, (ndx - m) & 1);
-      }
-      const RestorationInfo& rsi = cm->rst_info[p];
-      if (rsi.frame_restoration_type == RESTORE_WIENER_NONSEP) {  // one filter for the frame, not a reference's
-        if (!rsi.frame_filters_on || rsi.temporal_pred_flag || rsi.num_filter_classes != 1 || p == 0)
-          throw std::logic_error("Wiener-nonsep other than one chroma frame filter");
-        avm_wb_write_bit(&wb, 1);  // frame_filters_on
-        if (!frame_is_intra_only(cm) && !frame_is_sframe(cm) && cm->ref_frames_info.num_total_refs > 0)
-          avm_wb_write_bit(&wb, 0);  // temporal_pred_flag
-      }
-    }
-    if (cm->mib_size != 32) throw std::logic_error("restoration units under superblocks other than 128x128");
-    if (cm->rst_info[0].frame_restoration_type != RESTORE_NONE) {  // 128x128 luma units
-      if (cm->rst_info[0].restoration_unit_size != RESTORATION_UNITSIZE_MAX >> 2)
-        throw std::logic_error("luma restoration units other than 128x128");
-      avm_wb_write_bit(&wb, 0);  // not 256
-      avm_wb_write_bit(&wb, 0);  // not 512
-    }
-    if (cm->rst_info[1].frame_restoration_type != RESTORE_NONE || cm->rst_info[2].frame_restoration_type != RESTORE_NONE) {
-      if (cm->rst_info[1].restoration_unit_size != RESTORATION_UNITSIZE_MAX >> 3)  // 64x64 at 4:2:0
-        throw std::logic_error("chroma restoration units other than 64x64");
-      avm_wb_write_bit(&wb, 0);  // not 128
-      avm_wb_write_bit(&wb, 0);  // not 256
-    }
-    for (int p = 1; p < av2_num_planes(cm); p++)  // read_wienerns_framefilters_hdr(), from CodecState::restore()
-      if (cm->rst_info[p].frame_restoration_type == RESTORE_WIENER_NONSEP)
         for (const uint8_t bit : st.lr_filter_bits(p)) avm_wb_write_bit(&wb, bit);
   }
   if (seq->enable_ccso) {  // setup_ccso(): no reuse of a reference's filters

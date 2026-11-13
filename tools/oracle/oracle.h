@@ -73,13 +73,23 @@ void count(Kind k, long long area);
 // Q0 of docs/superpowers/specs/2026-11-06-real-cost-trellis-design.md, X_ORACLE_Q, letters: a TCQ's levels by real bits on the
 // frame's starting CDFs, b avmenc's depth factors, c the CDFs of each superblock instead, d the plain path too.
 // X_ORACLE_QCHECK=1: each block's rate against the symbols written.
-enum { kRealTcq = 1, kRealDepth = 2, kRealRefresh = 4, kRealPlain = 8 };
+// Q0c: f (Qf) starts the trellis at avmenc's first quantizer's end of block, the zero bin (84 or 80 of 128 steps);
+// X_ORACLE_QW the weight's factor (Qe): a number, or a file of "display factor" lines.
+enum { kRealTcq = 1, kRealDepth = 2, kRealRefresh = 4, kRealPlain = 8, kRealZbin = 16 };
 int real_cost();
+double real_weight(int display);  // X_ORACLE_QW's factor for this frame, 1 without it
 bool real_check();
 int depth(int display);  // the frame's layer in avmenc's pyramid: 0 key, 1 anchor, 5 at most
 
 int level();  // 0: off
 bool filters();  // the stream's filter settings are in use
+// C2's split (X_ORACLE_FILT, letters): F0's filters, but a part cut to what CelV2 codes. c CDEF one strength (F0's most used),
+// s no CDEF on skip blocks, o CCSO on every unit, d no deblocking deltas, k one LR class, w luma Wiener units PC Wiener.
+// Week 1 gates: i (L2 on) the frame's interpolation filter CelV2's EIGHTTAP_REGULAR, not avmenc's (G2.2's L2r); r CelV2's own
+// loop restoration (restore()) on F0's other filters; f with r, luma keeps F0's types, units and classes, as frame filters
+// fit by CelV2's least squares (C2 part 3); u with r, chroma keeps F0's restoration as it is. X_G11 (no oracle level needed, rd_pass.cpp): inter frames' RD pass also scores
+// 64x64, 64x32 and 32x64 intra in every mode, as intra frames' (G1.1's gate).
+bool filt_cut(char part);
 const Frame* frame(int display);  // nullptr when off; throws if the file has no such frame
 int max_drl_bits();  // the stream's: the MV candidates past it differ
 const OracleFrame& first_head();  // for what the sequence takes from the stream

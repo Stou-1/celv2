@@ -9,7 +9,7 @@ if (-not $vs) { throw 'Visual Studio with the C++ x64 tools not found (set CELV2
 cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
   if ($_ -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] }
 }
-# Git's usr\bin provides patch.exe, which AVM's TFLite dependency fetch needs.
+# Git's usr\bin provides perl.exe, which AVM's build runs (AVM is built without TFLite, so nothing is fetched).
 # NASM: $env:CELV2_NASM, else %LOCALAPPDATA%\bin\NASM (or already on the PATH).
 $nasm = if ($env:CELV2_NASM) { $env:CELV2_NASM } else { "$env:LOCALAPPDATA\bin\NASM" }
 $env:PATH = "$nasm;$env:ProgramFiles\LLVM\bin;$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;$env:ProgramFiles\Git\usr\bin;$env:PATH"
@@ -18,6 +18,14 @@ $env:CL = '/utf-8'
 # cl prints its include notes in the console's code page, and ninja's msvc_deps_prefix was recorded
 # in the system's: on a UTF-8 console a Japanese Windows's notes match nothing, ninja records no
 # header dependencies, and a header edit leaves stale objects (mismatched structs, crashes).
+# Even so a full build can leave objects with no recorded headers (40 of 116, 2026-11-08; the same
+# objects built alone record theirs; cl has only Japanese resources, so VSLANG=1033 cannot help).
+# celv2-deps <build folder> deletes those objects; the next build compiles them again, with deps.
+function global:celv2-deps($dir) {
+  $objs = ninja -C $dir -t deps | Select-String '^(\S+): #deps 0' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+  $objs | ForEach-Object { Remove-Item (Join-Path $dir $_) -ErrorAction SilentlyContinue }
+  "celv2-deps: $(@($objs).Count) objects without deps removed in $dir"
+}
 $acp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
 if ([Console]::OutputEncoding.CodePage -ne [int]$acp) {
   chcp $acp | Out-Null

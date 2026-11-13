@@ -1,0 +1,14 @@
+diff --git a/src/core/av2_sequence_header.cpp b/src/core/av2_sequence_header.cpp
+index 281753d..f454ce7 100644
+--- a/src/core/av2_sequence_header.cpp
++++ b/src/core/av2_sequence_header.cpp
+@@ -584,7 +584,8 @@ bool SequenceFilterConfig::parse(BitstreamReader& br, bool single_picture_header
+   enable_restoration = br.read_bit();
+ 
+   if (enable_restoration) {
+-    lr_tools_disable.resize(2, std::vector<uint32_t>(2, 0));
++    // Indexed by RestorationType (RESTORE_WIENER_NONSEP is 2): two entries wrote past the end.
++    lr_tools_disable.resize(2, std::vector<uint32_t>(RESTORE_SWITCHABLE + 1, 0));
+     lr_tools_disable[0][RESTORE_PC_WIENER] = br.read_bit();
+     lr_tools_disable[0][RESTORE_WIENER_NONSEP] = br.read_bit();
+     lr_tools_disable[1][RESTORE_PC_WIENER] = 1;

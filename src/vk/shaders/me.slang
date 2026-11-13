@@ -1,4 +1,4 @@
-// me_kernel (gpu/kernels.cu): the 8x8 motion search of one pyramid level, quarter-pel refined at level 0.
+// me_kernel (gpu/kernels.cu, removed 2026-11-08): the 8x8 motion search of one pyramid level, quarter-pel refined at level 0.
 import common;
 
 struct Params {

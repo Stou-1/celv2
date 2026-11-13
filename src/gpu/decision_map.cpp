@@ -29,9 +29,16 @@ void RowGate::publish_one(int row) {
     std::lock_guard<std::mutex> lk(m_);
     if (one_.size() <= static_cast<size_t>(row)) one_.resize(row + 1, 0);
     one_[row] = 1;
+    const int was = ready_;
     while (static_cast<size_t>(ready_) < one_.size() && one_[ready_]) ready_++;
+    if (was == 0 && ready_ > 0) first_ready_ = std::chrono::steady_clock::now();
   }
   cv_.notify_all();
+}
+
+std::chrono::steady_clock::time_point RowGate::first_ready() const {
+  std::lock_guard<std::mutex> lk(m_);
+  return first_ready_;
 }
 
 void RowGate::wait_row(int row) const {

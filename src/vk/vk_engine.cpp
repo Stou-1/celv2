@@ -13,14 +13,14 @@
 
 namespace {
 
-constexpr int kIntraCosts = celv2::kSbBlocks * celv2::kNumModes;  // gpu/kernels.h
+constexpr int kIntraCosts = celv2::kSbBlocks * celv2::kNumModes;  // as shaders/common.slang
 constexpr int kInterSlots = 4400;
 // Workgroups a superblock of the cost kernel; any number gives the same costs.
 constexpr int kShares = 4;
 
 }  // namespace
 
-// GpuEngine::Impl's structure on Vulkan: the work is recorded in batches on one queue (a launch's
+// The CUDA engine's structure on Vulkan: the work is recorded in batches on one queue (a launch's
 // motion search, then each superblock row with the download of its decisions, so collect() takes
 // rows as they finish), references are kept under their keys, and prepare() uploads the next
 // source and its intra costs behind the current launch.
@@ -94,7 +94,7 @@ struct VulkanEngine::Impl {
   char layout = '1';  // vk_phase_layout()'s
   static constexpr uint64_t kOnDemand = 1ull << 63, kHalf = 1ull << 62;
 
-  // GpuEngine::Impl::upload, recorded in the open batch: the padded luma plane and its pyramid; a
+  // As the CUDA engine's upload, recorded in the open batch: the padded luma plane and its pyramid; a
   // reference's level 0 also gets its quarter-pel phases.
   void upload(const Frame420& f, Pyramid& p, bool phases) {
     const size_t n = f.y.size();
@@ -124,11 +124,12 @@ struct VulkanEngine::Impl {
 // How a reference's quarter-pel phases are held (the speed budget spec), by frame size: whole encode, 16 planes
 // against 4, 2026-11-05 (under load): 1080p 9.44 / 5.42 fps on the RTX 5090, 1.40 / 0.78 on the Arc Pro B50; 4K 2.09 /
 // 1.80, 0.42 / 0.26; 8K 1.90 / 1.95 s a frame, 4.6 / 5.4; 16K 7.3 / 7.1, 23.1 / 19.4. Between 8K and 16K is not
-// measured. Then by free VRAM: seven references' planes, and the rest, 4.6 GB at 16K (2026-11-04-vram-16k.md).
+// measured. Then by free VRAM: seven references' planes, and the rest: other 4.66 GiB, 38 B/px (7 refs, 2026-11-07;
+// 2026-11-04-vram-16k.md).
 char vk_phase_layout(int64_t pixels, uint64_t free_vram, int engines) {
   free_vram /= static_cast<uint64_t>(std::max(engines, 1));
   constexpr int64_t kHalfPlanesFrom = 8192ll * 8192;
-  constexpr uint64_t kOtherPerPixel = 35;
+  constexpr uint64_t kOtherPerPixel = 38;
   auto fits = [&](int planes) { return static_cast<uint64_t>(pixels) * (planes * 7 + kOtherPerPixel) <= free_vram; };
   if (pixels < kHalfPlanesFrom && fits(celv2::kSubpelPhases)) return '1';
   return fits(4) ? 'B' : fits(1) ? 'A' : 0;
@@ -200,6 +201,7 @@ void VulkanEngine::launch(const Frame420& src, const std::vector<const Frame420*
     celv2::vk::Refs vr;
     vr.n = nrefs;
     const long long now = ++m.launches;
+    std::vector<Impl::RefSlot*> used(nrefs);
     for (int ri = 0; ri < nrefs; ri++) {
       // The slot holding this key, else one that no reference of this launch needs, else a new one.
       const long long key = ref_keys.empty() ? -1 : ref_keys[ri];
@@ -218,19 +220,28 @@ void VulkanEngine::launch(const Frame420& src, const std::vector<const Frame420*
         slot->key = key;
       }
       slot->used = now;
-      celv2::vk::DevPlane p0 = slot->p.plane[0];
-      int cols = 0, rows = 0;
-      for (int l = celv2::kMeLevels - 1; l >= 0; l--) {  // GpuEngine::launch's motion search
-        const int pcols = cols, prows = rows;
-        cols = (cs.p.plane[l].w + 7) / 8, rows = (cs.p.plane[l].h + 7) / 8;
-        const size_t n = static_cast<size_t>(cols) * rows * sizeof(int);
+      used[ri] = slot;
+    }
+    // The motion search, level by level from the top: every reference's search of a
+    // level, then one barrier (V3 of the Vulkan wait spec: 5 barriers, not one per search). Each
+    // reference writes its own mvx, mvy and reads only the level above.
+    int cols = 0, rows = 0;
+    const long long frame_blocks = static_cast<long long>((cs.p.plane[0].w + 7) / 8) * ((cs.p.plane[0].h + 7) / 8);
+    for (int l = celv2::kMeLevels - 1; l >= 0; l--) {
+      const int pcols = cols, prows = rows;
+      cols = (cs.p.plane[l].w + 7) / 8, rows = (cs.p.plane[l].h + 7) / 8;
+      const size_t n = static_cast<size_t>(cols) * rows * sizeof(int);
+      const bool top = l == celv2::kMeLevels - 1;
+      for (int ri = 0; ri < nrefs; ri++) {
         m.ensure(m.mvx[ri][l], n), m.ensure(m.mvy[ri][l], n);
-        const bool top = l == celv2::kMeLevels - 1;
-        m.k.me_level(cs.p.plane[l], l == 0 ? p0 : slot->p.plane[l], top ? nullptr : &m.mvx[ri][l + 1],
+        m.k.me_level(cs.p.plane[l], used[ri]->p.plane[l], top ? nullptr : &m.mvx[ri][l + 1],
                      top ? nullptr : &m.mvy[ri][l + 1], top ? 0 : pcols, top ? 0 : prows, m.mvx[ri][l], m.mvy[ri][l],
-                     cols, rows, l == 0);
+                     cols, rows, l == 0, false, frame_blocks);
       }
-      vr.plane[ri] = p0;
+      if (nrefs) m.ctx.barrier();
+    }
+    for (int ri = 0; ri < nrefs; ri++) {
+      vr.plane[ri] = used[ri]->p.plane[0];
       vr.mvx[ri] = &m.mvx[ri][0], vr.mvy[ri] = &m.mvy[ri][0];
       vr.mv_cols = cols, vr.mv_rows = rows;
     }

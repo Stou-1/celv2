@@ -116,10 +116,10 @@ void fill_sequence_params(const SeqConfig& c, SequenceHeader* s) {
   s->enable_cdef = c.cdef;
   s->enable_cdef_on_skip_txfm = CDEF_ON_SKIP_TXFM_DISABLED;
   s->enable_restoration = c.lr;
-  // Luma PC_WIENER only (the nonseparable Wiener off); chroma the nonseparable Wiener with lr_uv, else
-  // the luma mask with PC_WIENER off too, as decodeframe.c derives them.
-  s->lr_tools_disable_mask[0] = c.lr ? 1 << RESTORE_WIENER_NONSEP : 0;
-  s->lr_tools_disable_mask[1] = !c.lr ? 0 : c.lr_uv ? DEF_UV_LR_TOOLS_DISABLE_MASK : s->lr_tools_disable_mask[0] | DEF_UV_LR_TOOLS_DISABLE_MASK;
+  // Luma PC_WIENER, the nonseparable Wiener and SWITCHABLE (CodecState::restore() picks per frame and unit); chroma
+  // the nonseparable Wiener with lr_uv, else nothing (PC_WIENER is never chroma's).
+  s->lr_tools_disable_mask[0] = 0;
+  s->lr_tools_disable_mask[1] = !c.lr ? 0 : c.lr_uv ? DEF_UV_LR_TOOLS_DISABLE_MASK : DEF_UV_LR_TOOLS_DISABLE_MASK | 1 << RESTORE_WIENER_NONSEP;
   s->enable_ccso = c.ccso;  // after CDEF, offsets from the deblocked luma (CodecState::ccso())
   s->ccso_unit_matches_sb_size = 0;
   s->df_par_bits_minus2 = c.deblock_delta || c.deblock_search ? 3 : 0;  // 5-bit deblocking deltas when one is used

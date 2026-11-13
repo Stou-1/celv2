@@ -16,6 +16,19 @@ extern "C" {
 #include "av2/common/enums.h"
 }
 
+// Side-information prices from the frame's starting CDFs, each symbol's bits averaged over its contexts, in 1/512
+// bit (Encoder::side_costs(); docs/superpowers/specs/2026-11-12-sideinfo-cost-design.md).
+struct SideCosts {
+  // Squares 64, 32, 16, 8 (level 0-3): NONE, HORZ, VERT, SPLIT; their 2:1 halves (dir 0: of HORZ, 1: of VERT):
+  // NONE, into their two squares. Not coded: 0; not allowed: a large price.
+  int part_sq[4][4] = {}, part_half[4][2][2] = {};
+  int inter_block = 0;  // an inter block's flags (skip_mode 0, is_inter 1, skip_txfm 0)
+  int skip_txfm = 0;    // skip_txfm 0 alone: an 8x4 / 4x8 block's only flag (no skip_mode, is_inter or comp flag)
+  int single = 0, compound = 0;  // the comp flag (0 / 1), where coded
+  int ref[8] = {};      // a single reference's index
+  int nearmv = 0, newmv = 0, new_new = 0;  // the mode with its first DRL bit: NEARMV, NEWMV, NEW_NEWMV
+};
+
 struct RdPassParams {
   int qindex = 0;
   bool tcq = false;
@@ -43,6 +56,8 @@ struct RdPassParams {
   // With screen: exact repeats of a block already coded in its window try a copy, also as an intra
   // DC decision, where the coder's IntraBC search runs.
   const celv2::IntrabcIndex* ibc = nullptr;
+  // Side information priced from the frame's CDFs (Encoder::side_costs(); nullptr, or X_SIDE=0: the constants).
+  const SideCosts* side = nullptr;
   // CELV2_WIDE (core/wide.h): W1, W2, W4, W6.
   bool per_ref = false, full_search = false, chroma = false, all_pairs = false;
 };

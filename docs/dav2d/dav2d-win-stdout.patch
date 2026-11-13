@@ -1,0 +1,52 @@
+diff --git a/tools/output/y4m2.c b/tools/output/y4m2.c
+index ea64027..0a59cf5 100644
+--- a/tools/output/y4m2.c
++++ b/tools/output/y4m2.c
+@@ -32,6 +32,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
+ 
+ #include "common/intops.h"
+ 
+@@ -48,6 +52,10 @@ static int y4m2_open(Y4m2OutputContext *const c, const char *const file,
+ {
+     if (!strcmp(file, "-")) {
+         c->f = stdout;
++#ifdef _WIN32
++        _setmode(_fileno(stdout), _O_BINARY); /* Windows stdout is text mode by default */
++        setvbuf(stdout, NULL, _IOFBF, 4 << 20); /* default 4KB writes cap pipe throughput */
++#endif
+     } else if (!(c->f = fopen(file, "wb"))) {
+         fprintf(stderr, "Failed to open %s: %s\n", file, strerror(errno));
+         return -1;
+diff --git a/tools/output/yuv.c b/tools/output/yuv.c
+index 545865f..6095873 100644
+--- a/tools/output/yuv.c
++++ b/tools/output/yuv.c
+@@ -31,6 +31,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
+ 
+ #include "output/muxer.h"
+ 
+@@ -44,6 +48,10 @@ static int yuv_open(YuvOutputContext *const c, const char *const file,
+ {
+     if (!strcmp(file, "-")) {
+         c->f = stdout;
++#ifdef _WIN32
++        _setmode(_fileno(stdout), _O_BINARY); /* Windows stdout is text mode by default */
++        setvbuf(stdout, NULL, _IOFBF, 4 << 20); /* default 4KB writes cap pipe throughput */
++#endif
+     } else if (!(c->f = fopen(file, "wb"))) {
+         fprintf(stderr, "Failed to open %s: %s\n", file, strerror(errno));
+         return -1;

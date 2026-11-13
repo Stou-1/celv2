@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <immintrin.h>
 #include <limits>
+#include <optional>
 
 #include "core/profile.h"
 
@@ -162,6 +163,7 @@ int tcq_levels(const tran_low_t* coeff, tran_low_t* qcoeff, tran_low_t* dqcoeff,
   const int max_dc = 0xffffff / (2 * dc_q), max_ac = 0xffffff / (2 * ac_q);  // qIdx = 2 level
   double e_of[1024];
   const double weight = kTcqBitWeight;
+  std::optional<celv2::RdTimer> timer(std::in_place, celv2::RdPart::TcqPrep);  // CELV2_RD_TIMES
   const int prep = tcq_prep(coeff, n, step_dc, step_ac, so, e_of, psy, weight);
   const int eob = force_eob >= 0 ? force_eob : prep;
   const bool pass = force_eob < 0 && g_rd_zero;
@@ -189,6 +191,7 @@ int tcq_levels(const tran_low_t* coeff, tran_low_t* qcoeff, tran_low_t* dqcoeff,
   const __m256d second = _mm256_castsi256_pd(_mm256_setr_epi64x(0, -1, 0, -1));  // a pair's second next state
   const double first = first_level(weight, 0), first_ac = first_level(weight, psy);
   double tail = 0;  // --rd-zero: dropped() from the position after this one up to eob - 1
+  timer.reset(), timer.emplace(celv2::RdPart::TcqViterbi);
   for (int c = eob - 1; c >= 0; c--) {
     const int pos = so->scan[c];
     TcqCands t;
@@ -239,6 +242,7 @@ int tcq_levels(const tran_low_t* coeff, tran_low_t* qcoeff, tran_low_t* dqcoeff,
       tail += dropped(e_of[pos], pos, psy);
     }
   }
+  timer.reset(), timer.emplace(celv2::RdPart::TcqBack);
   alignas(32) double path[8];
   _mm256_store_pd(path, lo);
   _mm256_store_pd(path + 4, hi);

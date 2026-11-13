@@ -1,6 +1,6 @@
 # CelV2
 
-An experimental AV2 encoder. A GPU (CUDA or Vulkan) searches motion and scores candidate
+An experimental AV2 encoder. A GPU (Vulkan) searches motion and scores candidate
 partitions and modes; the CPU re-picks them by rate and distortion, codes the bitstream and
 reconstructs with the AVM reference code. Every frame CelV2 writes decodes bit-exactly with the AVM
 v1.0.0 decoder: the tests compare per-frame MD5s against the in-process AVM decoder.
@@ -19,7 +19,7 @@ Open Media.
 - ffmpeg (`ffmpeg.exe` and `ffprobe.exe`), not included; MP4Box (GPAC) for an MP4 with audio,
   optional
 
-The zip needs no Visual Studio or CUDA toolkit; [Requirements](#requirements-windows) below is for
+The zip needs no Visual Studio; [Requirements](#requirements-windows) below is for
 building from source. [gui/README_ja.txt](gui/README_ja.txt) (Japanese) says how to use it.
 
 ## Status
@@ -36,15 +36,21 @@ building from source. [gui/README_ja.txt](gui/README_ja.txt) (Japanese) says how
 - Residual: DCT / ADST / identity transforms with transform partitions, the intra secondary
   transform (IST) on luma, the cross-chroma transform (CCTX, U and V rotated together),
   trellis coded quantization (TCQ).
-- In-loop filters: deblocking, CDEF (one strength per frame), CCSO, loop restoration (luma
-  pixel-classified Wiener, on or off per 128x128 unit; chroma a Wiener filter fitted per frame, on
-  or off per 64x64 unit).
-- Decision engines: CUDA (NVIDIA), Vulkan (tested on an RTX 5090 and an Arc Pro B50) and a CPU
-  fallback, all giving the same bytes.
+- In-loop filters: deblocking, CDEF (up to 8 strength pairs a frame, one picked per 64x64 unit),
+  CCSO (on or off per unit and plane), loop restoration (luma: each 128x128 unit off,
+  pixel-classified Wiener, or a Wiener filter fitted per pixel class, 1 to 16 classes; chroma: units
+  of 64, 128 or 256, each off, the frame's filter, or its own taps coded against the unit bank).
+- Decision engines: Vulkan (tested on an RTX 5090 and an Arc Pro B50) and a CPU fallback, both
+  giving the same bytes.
 
-On the project's 1080p test clips it uses fewer bits than NVENC AV1 (p7) on most of them and still
-more than SVT-AV1 (preset 6), by 4% to 63%. 1080p codes at about 6 fps on an RTX 5090 and a
-24-core Xeon. See docs/design for the measurements behind each choice. (The clips named there,
+It still needs more bits than the best AV1 encoders. On the project's eight 1080p test clips (120
+frames, qindex 100 to 190, measured on 2026-11-13 against 10-bit SVT-AV1 4.2.0 and libaom at crf 20
+to 56), it needs on average 34% more bits than SVT-AV1 preset 0 for the same PSNR-YUV (6:1:1), 19%
+more for the same PSNR-Y and 37% more for the same SSIMULACRA2; 40% more than libaom (cpu-used 0) and
+20% more than SVT-AV1 preset 2 by PSNR-YUV. By clip the gap to SVT-AV1 preset 0 runs from 14% (two
+anime clips) to 68% (grainy live action), and it is larger at low bitrates. A 600-frame 1080p anime
+clip with 6 scenes codes at about 12 fps (`--tune animation --workers auto`, qindex 130) on an RTX
+5090 and a 24-core Xeon. See docs/design for the measurements behind each choice. (The clips named there,
 "anime A" to "anime E" and "live action", are private and not distributed; the Xiph clips
 crowd_run, park_joy and ducks_take_off are public.)
 
@@ -52,14 +58,13 @@ crowd_run, park_joy and ducks_take_off are public.)
 
 - Visual Studio 2026 with the C++ x64 tools (MSVC), LLVM (clang-cl, for AVM), NASM, CMake, Ninja
   (`scripts\env.ps1` finds Visual Studio with vswhere; `CELV2_VS` and `CELV2_NASM` override it)
-- CUDA toolkit 13.x (the build needs it even when only the Vulkan engine is used)
 - Optional, for the Vulkan engine: the Vulkan headers and `slangc`, from the LunarG SDK
   (`VULKAN_SDK`), the PATH, or unpacked under `%LOCALAPPDATA%\bin` (`Vulkan-Headers-<version>`,
   `slang-<version>`). Without them the Vulkan engine is left out.
 - A CPU with AVX2 (the build uses `/arch:AVX2`)
 - The AVM source tree at tag `v1.0.0` (commit `966a7d7cd6fcf60360caf5dc413b2aeeb65e144d`), from
-  <https://gitlab.com/AOMediaCodec/avm>
-- Paths without non-ASCII characters (nvcc)
+  <https://github.com/AOMediaCodec/avm>
+- Paths without non-ASCII characters (some tests pass exe paths through `std::system`)
 
 ## Build and test
 
@@ -111,8 +116,8 @@ tiles: 2 at 1080p, 4 at 4K, 16 at 8K and 16K. Each tile costs a few bits (4K: 2,
 at 2.4, 2.7 and 3.1 fps for +0.6% and +1.6% bytes).
 
 `--device auto` (the default) decides on the first discrete Vulkan GPU, else on the CPU, which is
-much slower. All give the same output. `--device gpu|cuda|cpu|vulkan|vulkan2` picks one (`cuda`: an
-NVIDIA GPU, Turing or newer, driver r580 or newer; `vulkan2`: the second discrete Vulkan GPU). On the CPU path `--threads` limits only the tile threads; the decision threads take
+much slower. All give the same output. `--device gpu|cpu|vulkan|vulkan2` picks one (`vulkan2`: the second
+discrete Vulkan GPU). On the CPU path `--threads` limits only the tile threads; the decision threads take
 the other cores.
 
 ### Settings by content, effort and size
@@ -126,8 +131,16 @@ for live action; 16-frame mini-GOPs throughout for slides. Options given on the 
 (Angel Beats -8.20%, Flash -4.79%), and leaves regular video as it is. Sources that open it encode 1.12-1.18x slower;
 `--screen 0` turns it off.
 
+`--real-trellis 1` (the default) picks the trellis's levels by the bits the coder really writes for them, which also
+decides where a luma TCQ block's coefficients end: 120 frames, PSNR-Y -1.61% on average, every source better, live action
+included, up to +1.9% CPU a frame ([the report](docs/reports/2026-11-10-real-trellis-q1.md)). `--real-trellis 0` turns it off.
+It picks those levels without `--psy-trellis`'s term, so `--psy-trellis` above 0 turns it off unless `--real-trellis 1` is given.
+
 `--rd-zero 1` lets the quantizer drop a block's last coefficients, or all of them, where that costs less by rate and distortion.
-On with `--tune animation`, off otherwise: it helps anime and costs live action detail ([the spec](docs/superpowers/specs/2026-11-06-rd-zeroing-design.md)).
+On with `--tune animation`, off otherwise: measured with `--real-trellis 0`, it helped anime and cost live action detail
+([the spec](docs/superpowers/specs/2026-11-06-rd-zeroing-design.md)). With `--real-trellis 1` the end of a luma TCQ block is
+already chosen by real bits, so there `--rd-zero` adds only the choice to drop the whole block, and it still applies to the
+other blocks.
 
 `--preset max` ignores speed for quality and size: a 16-frame mini-GOP is coded both as one and as
 two of 8 and the better kept (`--gop-trial`), and live action gets a per-frame deblocking search
@@ -172,7 +185,8 @@ The zip holds the app, `celv2enc.exe`, `av2_mux.exe`, the VC++ runtime DLLs and 
 MP4Box. The GUI can also code the audio as HE-AACv2 with `fdkaac.exe` (nu774/fdkaac built with
 libfdk-aac), which is not included either: libfdk-aac comes under its own license
 (Fraunhofer FDK AAC Codec Library license) and grants no patent rights. See [gui/README_ja.txt](gui/README_ja.txt) (Japanese) for how to use it. `av2_mux.exe` is av2-tools commit ffbcb39
-with its MP4 writer replaced so it no longer uses MPEG's libisomediafile; see
+with its MP4 writer replaced so it no longer uses MPEG's libisomediafile, and a fix to its
+loop-restoration parsing; see
 [gui/third_party/av2-tools/](gui/third_party/av2-tools/).
 
 ## License
@@ -186,6 +200,12 @@ Clear License.
 CelV2 also links the AVM library and compiles AVM's `common/md5_utils.c`. AVM's license and
 the Alliance for Open Media Patent License 1.0 are in [third_party/avm/](third_party/avm/).
 Include both files when you redistribute CelV2 in source or binary form.
+
+The AVM library also carries code from AVM's `third_party` folder (vector, x86inc), and
+the Vulkan engine compiles in the Vulkan headers.
+[gui/third_party/celv2enc/NOTICE.txt](gui/third_party/celv2enc/NOTICE.txt) lists them with their
+licenses, and [gui/third_party/celv2enc/licenses/](gui/third_party/celv2enc/licenses/) holds the
+license texts; the GUI zip includes both.
 
 Neither license grants patent rights beyond what those files state.
 

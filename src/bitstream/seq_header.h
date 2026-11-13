@@ -23,9 +23,9 @@ struct SeqConfig {
   int deblock_delta = 0;
   // Per frame, the deblocking offset in {-4, -2, 0, 2, 4} of the lowest squared error (--preset max).
   bool deblock_search = false;
-  bool cdef = true;  // CDEF after deblocking, one strength per frame chosen by squared error
-  // Cross-component sample offset after CDEF: offsets by deblocked luma band and edge class, every
-  // unit on (33 frames 1080p q100-190: anime B Y -2.04%, U -4.03%, V -2.47%; live action
+  bool cdef = true;  // CDEF after deblocking, up to 8 strength pairs a frame, one picked per 64x64 unit
+  // Cross-component sample offset after CDEF: offsets by deblocked luma band and edge class, on or off
+  // per unit and plane (every unit on when first measured: 33 frames 1080p q100-190: anime B Y -2.04%, U -4.03%, V -2.47%; live action
   // Y -0.78%, U -2.05%, V -0.96% BD-rate).
   bool ccso = true;
   // Multiple intra reference lines, chosen as the coder searches the luma mode (33 frames 1080p
@@ -45,13 +45,15 @@ struct SeqConfig {
   // Intra secondary transform on luma (intra and inter blocks), chosen per transform block by RD cost
   // (33 frames 1080p q100-190: AM demo -0.27%, live action -0.27%, AIR OP -1.70% BD-rate, same speed).
   bool ist = true;
-  // Loop restoration: pixel-classified Wiener (PC_WIENER) on luma, on or off per 128x128 unit by
-  // squared error after CDEF and CCSO (CodecState::restore()). 33 frames 1080p q100-190, BD-rate Y /
+  // Loop restoration on luma after CDEF and CCSO (CodecState::restore()): each 128x128 unit off,
+  // pixel-classified Wiener (PC_WIENER) or a Wiener filter fitted per pixel class (WIENER_NONSEP).
+  // PC_WIENER alone when first measured: 33 frames 1080p q100-190, BD-rate Y /
   // YUV 6:1:1: AM demo -0.58 / -0.44%, live action -2.00 / -1.63%, AIR OP -0.69 / -0.36%, 0.91x the speed.
   bool lr = true;
   // With lr: chroma loop restoration, the nonseparable Wiener filter (WIENER_NONSEP, from the chroma
-  // and the luma) fitted to each chroma plane per frame by least squares, on or off per 64x64 unit,
-  // the plane without restoration on frames where it does not pay. 33 frames 1080p q100-190, BD-rate
+  // and the luma) by least squares, in units of 64, 128 or 256: each unit off, the frame's filter or its
+  // own taps coded against the unit bank, the plane without restoration on frames where it does not
+  // pay. The frame filter alone when first measured: 33 frames 1080p q100-190, BD-rate
   // Y / YUV 6:1:1: AM demo -0.06 / -0.70%, live action -0.17 / -0.85%, AIR OP -0.11 / -1.71%,
   // kaguya -0.01 / -0.52%.
   bool lr_uv = true;
@@ -91,6 +93,7 @@ struct SeqConfig {
   double psy_trellis = 0;  // --psy-trellis strength (quantize()'s psy before the block's weight; 0: off)
   bool psy_lines = false;  // --psy-rd's line rule (--tune animation) instead of the texture rule
   bool rd_zero = false;   // --rd-zero (core/quant.h's g_rd_zero)
+  bool real_trellis = false;  // --real-trellis: the coder's TCQ levels by real bits (core/real_trellis.h)
   int engines = 1;        // decision engines the run may hold at once, sharing the GPU (vk_phase_layout())
   // --screen: 0 off (the sequence header as before), 1 the screen content tools (palette) on every
   // frame, 2 (auto) per frame by FrameSpec::screen.

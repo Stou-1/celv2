@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "gpu/engine.h"
+#include "gpu/decision_engine.h"
 #include "io/y4m.h"
 #include "pipeline.h"
 

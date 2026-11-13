@@ -9,7 +9,7 @@ if(NOT EXISTS "${AVM_LIB_BUILD}/avm.lib")
   message(FATAL_ERROR "avm.lib not found; run scripts/build_avm_lib.ps1 first")
 endif()
 
-# avm.lib's ML-based objects reference TFLite and its dependencies; link every library the AVM build made.
+# Link every library the AVM build made with avm.lib (avm_version.lib; AVM is built without TFLite, so no ML libraries).
 file(GLOB_RECURSE AVM_DEP_LIBS "${AVM_LIB_BUILD}/*.lib")
 list(FILTER AVM_DEP_LIBS EXCLUDE REGEX "/avm\\.lib$")
 

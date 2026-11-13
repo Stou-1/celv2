@@ -85,12 +85,16 @@ void BlockWriter::import_single(const BlockDecision& d, MV_REFERENCE_FRAME ref_f
 }
 
 // read_bawp flags of a single-reference block, as read_inter_block_mode_info() reads them.
-void BlockWriter::import_bawp(const OracleBlock& b) {
+void BlockWriter::import_bawp(const OracleBlock& b, BLOCK_SIZE bsize, MV mv) {
   AV2_COMMON* const cm = st_.cm();
   MACROBLOCKD* const xd = xd_;
   MB_MODE_INFO* const mbmi = xd->mi[0];
   FRAME_CONTEXT* const ec_ctx = xd->tile_ctx;
-  const int flag = b.bawp[0];
+  // The decoder rejects a template past the reference, and a moved MV can put it there. F0's own MV is legal (F0 decodes):
+  // bawp_template_inside() is stricter than the decoder (its slack), and on F0's MV it dropped BAWP on ab and am30 (L6 drifted).
+  const bool inside = (mv.row == b.mv[0][0] && mv.col == b.mv[0][1]) || bawp_template_inside(xd, bsize, mv);
+  const int flag = inside ? b.bawp[0] : 0;
+  if (!inside && b.bawp[0]) count(oracle::kBawpLost, block_area());
   mbmi->bawp_flag[0] = mbmi->bawp_flag[1] = 0;
   if (cm->features.enable_bawp && av2_allow_bawp(cm, mbmi, xd->mi_row, xd->mi_col)) {
     w_->symbol(flag > 0, ec_ctx->bawp_cdf[0], 2);
@@ -299,6 +303,7 @@ void BlockWriter::import_cdef() {
   int v = f->cdef_idx[(xd->mi_row >> 4) * nhfb + (xd->mi_col >> 4)];
   if (v < 0) v = 0;  // not filtered in avmenc, where this block was skipped
   const int n = cm->cdef_info.nb_cdef_strengths;
+  if (n == 1) v = 0;  // X_ORACLE_FILT c: F0's indices cut to one strength
   if (n > 1) {
     w_->symbol(v == 0, xd->tile_ctx->cdef_strength_index0_cdf[av2_get_cdef_context(cm, xd)], 2);
     if (v && n > 2) w_->symbol(v - 1, xd->tile_ctx->cdef_cdf[n - 3], n - 1);

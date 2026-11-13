@@ -1,5 +1,6 @@
-// Boundary type between the GPU decision engine and the CPU encoder (no CUDA or AVM dependency).
+// Boundary type between the GPU decision engine and the CPU encoder (no Vulkan or AVM dependency).
 #pragma once
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -94,6 +95,8 @@ class RowGate {
   void wait_row(int row) const;     // blocks until row is ready; rethrows the failure if any
   void fail(std::exception_ptr e);  // records e and wakes every waiter
   int ready_rows() const;           // number of rows published so far
+  // When row 0 became ready (default-constructed until then): CELV2_PROFILE's engine wall times.
+  std::chrono::steady_clock::time_point first_ready() const;
 
  private:
   mutable std::mutex m_;
@@ -101,4 +104,5 @@ class RowGate {
   int ready_ = 0;
   std::vector<char> one_;  // publish_one rows
   std::exception_ptr error_;
+  std::chrono::steady_clock::time_point first_ready_{};
 };

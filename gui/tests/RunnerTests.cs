@@ -50,6 +50,7 @@ namespace CelV2.Tests
             ("runner_mp4_non_ansi_output_paths", Mp4NonAnsiPaths),
             ("encode_log_keeps_the_last_run", EncodeLogKeepsLastRun),
             ("runner_job_log_has_commands_and_result", JobLogHasCommandsAndResult),
+            ("runner_low_priority", LowPriority),
             ("mux_only_finds_the_audio_beside_the_video", MuxOnlyFindsAudio),
             ("runner_mux_only_joins_separate_files", MuxOnlyJoinsSeparateFiles),
         };
@@ -134,6 +135,39 @@ namespace CelV2.Tests
         }
 
         // The job hands its tools' command lines, their messages and its result to Log, on success and on failure.
+        // celv2enc's priority class seen while it runs: below normal by default, normal with the setting off.
+        // From a normal process, as the GUI started from Explorer: a below normal parent passes its class on.
+        static void LowPriority()
+        {
+            var t = Tools();
+            var self = Process.GetCurrentProcess();
+            var before = self.PriorityClass;
+            self.PriorityClass = ProcessPriorityClass.Normal;
+            try { WithTemp(d =>
+            {
+                string input = MakeMedia(d, "in.mp4", 1, false);
+                var info = Prober.Probe(t, input);
+                foreach (bool low in new[] { true, false })
+                {
+                    var s = Separate();
+                    Check.That(s.LowPriority, "on by default");
+                    s.LowPriority = low;
+                    var seen = new List<ProcessPriorityClass>();
+                    var job = new EncodeJob(t, input, info, s, Sub(d, "out" + low), null);
+                    job.Log += l =>
+                    {
+                        if (l.Contains("celv2: decisions on"))
+                            lock (seen) seen.AddRange(Process.GetProcessesByName("celv2enc").Select(p => p.PriorityClass));
+                    };
+                    Check.That(job.Run(CancellationToken.None).Ok, "encode");
+                    Check.That(seen.Count > 0, "celv2enc seen");
+                    var want = low ? ProcessPriorityClass.BelowNormal : ProcessPriorityClass.Normal;
+                    Check.That(seen.All(c => c == want), "priority " + string.Join(",", seen) + " with LowPriority " + low);
+                }
+            }); }
+            finally { self.PriorityClass = before; }
+        }
+
         static void JobLogHasCommandsAndResult()
         {
             var t = Tools();

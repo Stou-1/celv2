@@ -1,4 +1,4 @@
-// cost_kernel (gpu/kernels.cu): the costs of every candidate of one superblock, shared by k
+// cost_kernel (gpu/kernels.cu, removed 2026-11-08): the costs of every candidate of one superblock, shared by k
 // workgroups. Subgroups of 32 (the pipeline requires them) stand in for CUDA's warps.
 import common;
 

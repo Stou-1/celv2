@@ -1,9 +1,9 @@
-// finalize_kernel (gpu/kernels.cu): per superblock, each block's best candidate from cost's costs,
+// finalize_kernel (gpu/kernels.cu, removed 2026-11-08): per superblock, each block's best candidate from cost's costs,
 // then the bottom-up partition choice and the SbOut emission.
 import common;
 
 static const int kSbOutCap = 256;
-// gpu/kernels.h's SbOut, field for field.
+// gpu/sb_out.h's SbOut, field for field.
 struct SbOut {
   int ntree, nblocks;
   uint8_t tree[kSbOutCap];

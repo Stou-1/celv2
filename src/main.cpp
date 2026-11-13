@@ -1,7 +1,7 @@
 // celv2enc: y4m (8-bit 4:2:0) -> IVF with GPU- or CPU-decided partitions/modes/motion and CPU
 // reconstruction.
 // Usage: celv2enc -i in.y4m -o out.ivf [--qindex 120] [--frames N] [--keyint 0] [--recon r.yuv]
-//                [--tile-columns L] [--tile-rows L] [--threads N] [--device auto|gpu|cuda|cpu|vulkan|vulkan2]
+//                [--tile-columns L] [--tile-rows L] [--threads N] [--device auto|gpu|cpu|vulkan|vulkan2]
 //                [--refs N] [--scenecut 0|1] [--bframes N] [--bq D] [--aq D] [--pyramid 0|1] [--progress] [--psnr]
 //                [--tune film|animation|still]
 //   -i - reads the y4m from standard input (e.g. ffmpeg ... -f yuv4mpegpipe - | celv2enc -i - ...).
@@ -25,8 +25,8 @@
 //   CPU threads (default 0 = one per tile); never more threads than tiles or CPU cores. With
 //   --device cpu, --threads limits only these tile threads; the decision threads take the other cores.
 //   --device: where the decisions run (default auto = the first discrete Vulkan GPU, else the CPU; gpu
-//   is that GPU and fails without one; vulkan / vulkan2 take the first / second one; cuda the CUDA
-//   engine, for one release). All give the same output; the choice is printed once on stderr.
+//   is that GPU and fails without one; vulkan / vulkan2 take the first / second one).
+//   All give the same output; the choice is printed once on stderr.
 //   --list-devices: prints the usable devices, one "<--device value><TAB><name>" line each, and exits.
 //   --refs: past frames an inter frame may predict from (1..7, default SeqConfig's).
 //   --bframes N: up to N frames between reference frames are coded after the next one (which is
@@ -52,7 +52,8 @@
 //   block by the importance map: texture (live action) or, with --tune animation, drawn lines
 //   (docs/superpowers/specs/2026-11-04-psy-rd-design.md).
 //   --psy-trellis T: the same map's strength in the level choice (0 off, the default; 2 at most): an AC
-//   level costs T * weight * | |coefficient| - |level| |, so small levels stop dropping to 0 as readily.
+//   level costs T * weight * | |coefficient| - |level| |, so small levels stop dropping to 0 as readily. Above 0
+//   it turns --real-trellis off unless that is given (the real trellis picks luma levels without this term).
 //   --paq S: perceptual AQ strength (0 off; 0.25 the default; 2 at most): each 64x64's qindex by
 //   a 16x16 importance map of the source luma (variance, edges, halftone, darkness), on every coded
 //   frame, added to --deltaq's (docs/superpowers/specs/2026-11-04-perceptual-aq-design.md). 120 frames
@@ -70,12 +71,13 @@
 //   --deblock-delta D: deblocking strength offset (-16..15, steps of 8 qindex; default 2).
 //   --deblock-search 0|1: per frame, the offset in {-4, -2, 0, 2, 4} whose deblocked frame is nearest
 //   the source (default 0; 1 with --preset max).
-//   --cdef 0|1: CDEF after deblocking, one strength per frame (default 1).
-//   --ccso 0|1: cross-component sample offset after CDEF (default 1).
+//   --cdef 0|1: CDEF after deblocking, up to 8 strength pairs a frame, one picked per 64x64 unit (default 1).
+//   --ccso 0|1: cross-component sample offset after CDEF, on or off per unit and plane (default 1).
 //   --mrls 0|1: intra prediction from reference lines further out (default 1).
-//   --lr 0|1: loop restoration, luma PC_WIENER switched per 128x128 unit (default 1).
-//   --lr-uv 0|1: with --lr, chroma loop restoration, a Wiener filter fitted per frame and switched
-//       per 64x64 unit (default 1).
+//   --lr 0|1: loop restoration, each 128x128 luma unit off, PC_WIENER or a Wiener filter fitted per
+//       pixel class (default 1).
+//   --lr-uv 0|1: with --lr, chroma loop restoration in units of 64, 128 or 256, each off, the frame's
+//       Wiener filter or its own taps coded against the unit bank (default 1).
 //   --ist 0|1: secondary transform of luma low frequencies, per transform block (default 1).
 //   --cctx 0|1: cross-chroma transform (U and V rotated together), per chroma transform block (default 1).
 //   --mhccp 0|1: multi-hypothesis cross-component chroma prediction, searched per block (default 1 without
@@ -127,7 +129,8 @@
 //   read ahead for them (default 4096; the reader waits beyond it). --workers auto: one per 16
 //   hardware threads, 1..4 (provisional). --memory-limit MB: at most this (default 80% of the
 //   installed RAM): fewer workers, then no parallel B frames (the same bytes), then no GOP trial
-//   (unless given), each with a warning.
+//   (unless given), each with a warning. --priority normal|below: the process's priority class
+//   (default normal; below: other software stays smooth while it runs; the same bytes).
 //   --tune film|animation|still: settings by content (x264's --tune); options given on the command
 //   line override them. All take 16-frame mini-GOPs where --bframes is not given (with --refs 5 or
 //   more and --qindex 100 or more). film: --gop-still 0.7 --deltaq 1 --grain 25 (not with --target-vmaf). animation: --gop-still 0.85
@@ -143,6 +146,9 @@
 //   levels against none (default 0, 1 with --tune animation). 120 frames 1080p q100-190 at --paq 0, PSNR-Y / SSIMULACRA2 / XPSNR BD-rate: five anime
 //   -0.84 / -1.88 / -0.51%, three live action -0.56 / +0.37 / +4.76%, which lose detail
 //   (docs/superpowers/specs/2026-11-06-rd-zeroing-design.md).
+//   --real-trellis 0|1: the coder's TCQ levels by the bits of the symbols written, on the live tile CDFs the block
+//   is coded with (1, the default, 0 with --psy-trellis above 0; 120 frames 1080p q100-190 against 0, PSNR-Y / SSIMULACRA2 / XPSNR-Y mean -1.61 / -0.41 /
+//   -1.29%, up to +1.9% CPU a frame; docs/reports/2026-11-10-real-trellis-q1.md).
 //   --screen 0|1|auto: palettes and IntraBC for screen content and halftone: off, on, or frame by frame by a gate (default
 //   auto; regular sources stay shut, at the speed of 0; sources that open it, such as Flash, run 1.12-1.18x slower;
 //   docs/superpowers/specs/2026-11-04-intrabc-palette-design.md).
@@ -180,7 +186,6 @@
 #include "core/size_control.h"
 #include "core/vmaf_probe.h"
 #include "core/tpl.h"
-#include "gpu/engine.h"
 #include "io/ivf.h"
 #include "io/memory.h"
 #include "io/stats.h"
@@ -290,6 +295,7 @@ struct Args {
   bool rd_pass = true;
   bool rd_intra = false;
   bool rd_zero = false;
+  bool real_trellis = true;  // --real-trellis
   bool intra64 = true;
   Device device = Device::Auto;
   bool progress = false;
@@ -299,6 +305,7 @@ struct Args {
   int memory_limit = 0;  // --memory-limit MB (0: 80% of the installed RAM)
   bool gop_trial_given = false;  // --gop-trial on the command line (the memory cap leaves it alone)
   int chunk_memory = 4096;  // --chunk-memory: MB of frames read ahead for the workers
+  bool below_priority = false;  // --priority below
 };
 
 // Reads frames on its own thread, up to `depth` ahead of take(): a mini-GOP takes bframes + 1
@@ -478,6 +485,10 @@ Args parse(int argc, char** argv) {
       a.memory_limit = std::string(v) == "auto" ? 0 : to_int(v, "--memory-limit");
       if (a.memory_limit < 0 || std::string(v) == "0") throw std::invalid_argument("--memory-limit must be MB above 0, or auto");
     }
+    else if (k == "--priority") {
+      if (std::string(v) != "normal" && std::string(v) != "below") throw std::invalid_argument("--priority must be normal or below");
+      a.below_priority = std::string(v) == "below";
+    }
     else if (k == "--chunk-memory") {
       a.chunk_memory = to_int(v, "--chunk-memory");
       if (a.chunk_memory < 64) throw std::invalid_argument("--chunk-memory must be 64 (MB) or more");
@@ -562,6 +573,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--rd-pass") a.rd_pass = to_int(v, "--rd-pass") != 0;
     else if (k == "--rd-intra") a.rd_intra = to_int(v, "--rd-intra") != 0;
     else if (k == "--rd-zero") a.rd_zero = to_int(v, "--rd-zero") != 0;
+    else if (k == "--real-trellis") a.real_trellis = to_int(v, "--real-trellis") != 0;
     else if (k == "--intra64") a.intra64 = to_int(v, "--intra64") != 0;
     else if (k == "--deblock-delta") a.deblock_delta = to_int(v, "--deblock-delta");
     else if (k == "--deblock-search") a.deblock_search = to_int(v, "--deblock-search") != 0;
@@ -570,11 +582,10 @@ Args parse(int argc, char** argv) {
       const std::string d = v;
       if (d == "auto") a.device = Device::Auto;
       else if (d == "gpu") a.device = Device::Gpu;
-      else if (d == "cuda") a.device = Device::Cuda;
       else if (d == "cpu") a.device = Device::Cpu;
       else if (d == "vulkan") a.device = Device::Vulkan;
       else if (d == "vulkan2") a.device = Device::Vulkan2;
-      else throw std::invalid_argument("bad value for --device: " + d + " (auto, gpu, cuda, cpu, vulkan or vulkan2)");
+      else throw std::invalid_argument("bad value for --device: " + d + " (auto, gpu, cpu, vulkan or vulkan2)");
     }
     else throw std::invalid_argument("unknown option " + k);
   }
@@ -626,6 +637,8 @@ Args parse(int argc, char** argv) {
     if (search && unset("--deblock-search")) a.deblock_search = true;
     if (unset("--rd-intra")) a.rd_intra = true;
   }
+  // The real trellis re-picks luma TCQ levels without --psy-trellis's term (real_levels()), which would undo it.
+  if (a.psy_trellis > 0 && unset("--real-trellis")) a.real_trellis = false;
   if (a.pass == 1 && a.stats.empty()) throw std::invalid_argument("--pass 1 needs --stats");
   if (a.pass == 2 && (a.stats.empty() || !a.target_size)) throw std::invalid_argument("--pass 2 needs --stats and --target-size");
   if (a.pass != 2 && a.target_size) throw std::invalid_argument("--target-size needs --pass 2 (and --pass 1 before it)");
@@ -647,6 +660,7 @@ Args parse(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     const Args a = parse(argc, argv);
+    if (a.below_priority) lower_process_priority();
     if (a.list_devices) {  // one "<--device value>\t<name>" line each, then nothing else
       for (const auto& [arg, name] : list_devices()) std::printf("%s\t%s\n", arg.c_str(), name.c_str());
       return 0;
@@ -709,6 +723,7 @@ int main(int argc, char** argv) {
     cfg.rd_pass = a.rd_pass;
     cfg.rd_intra = a.rd_intra;
     cfg.rd_zero = a.rd_zero;
+    cfg.real_trellis = a.real_trellis;
     cfg.intra64 = a.intra64;
     cfg.psy_rd = a.psy_rd, cfg.psy_trellis = a.psy_trellis, cfg.psy_lines = a.tune == "animation";
     cfg.screen = a.screen;
@@ -1104,6 +1119,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "speed: %d frames / %.0f s = %.1f s/frame, %.3f fps\n", n, s,
                  s / (n > 0 ? n : 1), s > 0 ? n / s : 0.0);
     celv2::print_profile(stderr, n);
+    celv2::print_rd_stats(stderr);
+    celv2::print_rd_times(stderr, n);
     if (size_control) {
       const unsigned long long size = std::filesystem::file_size(std::filesystem::u8path(a.out));
       std::fprintf(stderr, "target-size: %llu of %lld bytes\n", size, a.target_size);

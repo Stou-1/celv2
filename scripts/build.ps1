@@ -1,4 +1,4 @@
-# Configures (first time) and builds celv2 into .\build with MSVC cl + nvcc.
+# Configures (first time) and builds celv2 into .\build with MSVC cl.
 $ErrorActionPreference = 'Stop'
 . $PSScriptRoot\env.ps1
 $root = Split-Path $PSScriptRoot -Parent

@@ -1,5 +1,5 @@
-// Integer primitives of the motion search and inter cost, shared by the CUDA kernels and the CPU
-// reference (plan Task 8): 3-level pyramid (2x2 average), +-8 (level 0: +-4) full search of 8x8 blocks per level
+// Integer primitives of the motion search and inter cost, shared by the CPU reference and, ported, the
+// Slang shaders (plan Task 8): 3-level pyramid (2x2 average), +-8 (level 0: +-4) full search of 8x8 blocks per level
 // (SAD plus a distance penalty, first minimum in raster order) around the best of 6 starts,
 // integer-pel MVs, cur(x, y) ~ ref(x + mvx, y + mvy). Level 0 is then refined to quarter pels
 // (me_refine), so the level-0 field and the inter costs use quarter-pel MVs.

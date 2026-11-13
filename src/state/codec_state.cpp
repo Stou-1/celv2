@@ -6,8 +6,10 @@
 
 #include "core/ccso_apply.h"
 #include "core/ccso_search.h"
+#include "core/cdef_search.h"
 #include "core/profile.h"
 #include "core/threads.h"
+#include "core/wiener_sums.h"
 #ifdef CELV2_ORACLE
 #include "oracle.h"
 #endif
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -40,6 +43,8 @@ extern "C" {
 #include "av2/common/tile_common.h"
 #include "config/avm_dsp_rtcd.h"
 #include "avm_mem/avm_mem.h"
+#include "avm_dsp/binary_codes_writer.h"
+#include "avm_dsp/bitwriter.h"
 #include "avm_dsp/bitwriter_buffer.h"
 #include "config/avm_scale_rtcd.h"
 }
@@ -479,7 +484,14 @@ void CodecState::begin_frame(const FrameSpec& spec) {
     cf->refresh_frame_flags = all;
   } else if (spec.reference) {
     since_key_++;
-    cf->refresh_frame_flags = (1 << (since_key_ % cfg_.refs)) | (spec.shown ? all & ~turns : 0);
+    // The turn whose frame is the earliest in display order (the turns' order where display order is
+    // coding order). A mini-GOP's hidden anchor and mids took the previous anchor's slot by turns before
+    // its leaves, the frames next to it, were coded (the improvement candidates' C4(A)).
+    int slot = since_key_ % cfg_.refs;
+    auto hint = [&](int i) { return cm->ref_frame_map[i] ? static_cast<long long>(cm->ref_frame_map[i]->display_order_hint) : -1; };
+    for (int i = 0; i < cfg_.refs; i++)
+      if (hint(i) < hint(slot)) slot = i;
+    cf->refresh_frame_flags = (1 << slot) | (spec.shown ? all & ~turns : 0);
   } else {
     cf->refresh_frame_flags = spec.shown && spec.keep_shown ? all & ~turns : 0;
   }
@@ -564,7 +576,7 @@ void CodecState::begin_frame(const FrameSpec& spec) {
     if (celv2::oracle::level() >= 2) {
       const OracleFrame& o = celv2::oracle::frame(spec.display)->head;
       f->fr_mv_precision = f->most_probable_fr_mv_precision = static_cast<MvSubpelPrecision>(o.fr_mv_precision);
-      f->interp_filter = static_cast<InterpFilter>(o.interp_filter);
+      if (!celv2::oracle::filt_cut('i')) f->interp_filter = static_cast<InterpFilter>(o.interp_filter);
     }
 #endif
     f->enabled_motion_modes = seq->seq_enabled_motion_modes;
@@ -687,8 +699,8 @@ void CodecState::begin_frame(const FrameSpec& spec) {
     cm->rst_info[p].frame_filters_on = 0;
     buf->rst_info[p].frame_filters_on = 0;
   }
-  // Loop restoration (SeqConfig::lr): luma PC_WIENER in 128x128 units (one per superblock), each
-  // switched by restore() after the tiles; chroma, with lr_uv, WIENER_NONSEP in 64x64 units with one
+  // Loop restoration (SeqConfig::lr): luma in 128x128 units (one per superblock), PC_WIENER until
+  // restore() picks the frame's type and each unit's after the tiles; chroma, with lr_uv, WIENER_NONSEP in 64x64 units with one
   // filter per plane in the frame header (frame_filters_on, not predicted from a reference), else
   // none. The sizes decode_restoration_mode() sets.
   if (seq->enable_restoration) {
@@ -944,17 +956,23 @@ void CodecState::deblock() {
                              lf_workers_.data(), static_cast<int>(lf_workers_.size()), &lf_sync_);
 }
 
-void CodecState::cdef(const Frame420& src) {
+void CodecState::cdef(const Frame420& src, double sse_per_bit) {
   celv2::StageScope prof(celv2::Stage::Cdef);
   WorkersScope avm_workers(celv2::Stage::Cdef, lf_workers_);
+  std::optional<celv2::WallScope> wall(celv2::Wall::FCdefSearch);
+  std::optional<celv2::StageScope> search_cpu(celv2::Stage::CdefSearch);
   AV2_COMMON* const cm = cm_;
   CdefInfo* const ci = &cm->cdef_info;
   const CommonModeInfoParams* const mi = &cm->mi_params;
-  // read_cdef() with one strength and no filtering of skipped blocks: a 64x64 unit's first block
-  // gets strength 0 if any of its blocks codes a residual, else -1 (not filtered).
+  // read_cdef() with no filtering of skipped blocks: a 64x64 unit's first block gets an index if any
+  // of its blocks codes a residual, else -1 (not filtered). A block wider or taller than 64 covers
+  // several units with one MB_MODE_INFO, and the decoder reads one index into it: one group.
   const int nvfb = (mi->mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;
   const int nhfb = (mi->mi_cols + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;
   std::vector<int> units;  // filtered units, fbr * nhfb + fbc
+  std::vector<MB_MODE_INFO*> heads;  // each group's MB_MODE_INFO
+  std::vector<int> unit_group(static_cast<size_t>(nvfb) * nhfb, -1);  // -1: not filtered
+  auto head = [&](int fbr, int fbc) { return mi->mi_grid_base[fbr * MI_SIZE_64X64 * mi->mi_stride + fbc * MI_SIZE_64X64]; };
   for (int fbr = 0; fbr < nvfb; fbr++)
     for (int fbc = 0; fbc < nhfb; fbc++) {
       bool coded = false;
@@ -964,8 +982,19 @@ void CodecState::cdef(const Frame420& src) {
             coded = true;
             break;
           }
-      mi->mi_grid_base[fbr * MI_SIZE_64X64 * mi->mi_stride + fbc * MI_SIZE_64X64]->cdef_strength = coded ? 0 : -1;
-      if (coded) units.push_back(fbr * nhfb + fbc);
+      // the block covering this unit started in the unit to the left or above
+      const bool left = fbc && head(fbr, fbc) == head(fbr, fbc - 1);
+      const bool above = fbr && head(fbr, fbc) == head(fbr - 1, fbc);
+      // read_cdef() would write -1 into the shared head midway; the decoder's order is not simulated.
+      if ((left && coded != (unit_group[fbr * nhfb + fbc - 1] >= 0)) ||
+          (above && coded != (unit_group[(fbr - 1) * nhfb + fbc] >= 0)))
+        throw std::logic_error("cdef: a block spanning 64x64 units codes a residual in only some of them");
+      head(fbr, fbc)->cdef_strength = coded ? 0 : -1;
+      if (!coded) continue;
+      int g = left ? unit_group[fbr * nhfb + fbc - 1] : above ? unit_group[(fbr - 1) * nhfb + fbc] : -1;
+      if (g < 0) g = static_cast<int>(heads.size()), heads.push_back(head(fbr, fbc));
+      unit_group[fbr * nhfb + fbc] = g;
+      units.push_back(fbr * nhfb + fbc);
     }
   ci->cdef_frame_enable = 0;
   ci->cdef_on_skip_txfm_frame_enable = 0;
@@ -973,9 +1002,9 @@ void CodecState::cdef(const Frame420& src) {
   ci->cdef_damping = std::min(6, 3 + (cfg_.qindex_8bit(cm->quant_params.base_qindex) >> 6));
   if (units.empty()) return;
 
-  // The one strength pair (luma, chroma) of least squared error against the source over at most
-  // kSample of those units, each filtered from the deblocked frame as av2_cdef_frame() would (1080p:
-  // 128 instead of all 510 took the encode from 19.3 to 24.9 fps for -0.01 dB at the same size).
+  // Every unit's squared error against the source at every strength pair, each unit filtered from the
+  // deblocked frame as av2_cdef_frame() would; the frame's set of up to 8 pairs and each group's index
+  // from them (celv2::cdef_choose_set()). Then the damping on at most kSample of the units.
   constexpr int kSample = 128;
   constexpr int kStrengths = CDEF_PRI_STRENGTHS * CDEF_SEC_STRENGTHS;
   const size_t step = (units.size() + kSample - 1) / kSample;
@@ -984,20 +1013,36 @@ void CodecState::cdef(const Frame420& src) {
   // One unit a thread at least (the sums are integers: the same at any split).
   const int nt = std::max(1, std::min({cores, cfg_.threads > 0 ? cfg_.threads : cores,
                                        static_cast<int>((units.size() + step - 1) / step)}));
-  std::vector<std::array<int64_t, 2 * kStrengths>> sse(nt);
-  int damping = ci->cdef_damping;
-  int only[2] = {-1, -1};  // >= 0: the one strength tried per plane type (else all)
-  auto search = [&](int t) {
-    sse[t].fill(0);
+  const int damping = ci->cdef_damping;
+  std::vector<int> others;
+  for (int d = 3; d <= 6; d++)
+    if (d != damping) others.push_back(d);
+  std::vector<std::array<int64_t, 2 * kStrengths>> err(units.size());  // per unit: luma, then chroma
+  std::vector<std::array<int64_t, 2 * kStrengths>> sse(others.size() * nt);  // the damping pass: by damping and thread
+  std::vector<celv2::CdefPair> pair_of(units.size());
+  // The sampled units' luma directions from the first pass, for the damping pass (they do not depend on the damping).
+  struct Dirs {
+    int dir[CDEF_NBLOCKS][CDEF_NBLOCKS], var[CDEF_NBLOCKS][CDEF_NBLOCKS];
+  };
+  std::vector<Dirs> sampled_dirs((units.size() + step - 1) / step);
+  // Unit k's errors: without sum, at every strength (the default damping) into err[k]; with sum, at
+  // its own pair (pair_of[k]) into sum, every stride-th unit of the thread's share.
+  auto search = [&](int t, size_t stride, int dmp, std::array<int64_t, 2 * kStrengths>* sum) {
+    if (sum) sum->fill(0);
     std::vector<uint16_t> in(CDEF_INBUF_SIZE), out(64 * 64);
     cdef_list dlist[MI_SIZE_64X64 * MI_SIZE_64X64];
     int dir[CDEF_NBLOCKS][CDEF_NBLOCKS], var[CDEF_NBLOCKS][CDEF_NBLOCKS];
-    for (size_t k = t * step; k < units.size(); k += nt * step) {
+    for (size_t k = t * stride; k < units.size(); k += nt * stride) {
       const int fbr = units[k] / nhfb, fbc = units[k] % nhfb;
       const int count = av2_cdef_compute_sb_list(cm, mi, fbr * MI_SIZE_64X64, fbc * MI_SIZE_64X64,
                                                  dlist, BLOCK_64X64, MAX_MB_PLANE);
       if (!count) continue;
       int dirinit = 0;
+      Dirs& saved = sampled_dirs[k / step];
+      if (sum) {
+        std::memcpy(dir, saved.dir, sizeof(dir)), std::memcpy(var, saved.var, sizeof(var));
+        dirinit = 1;
+      }
       for (int p = 0; p < MAX_MB_PLANE; p++) {
         const int ss = p ? 1 : 0, bs = 8 >> ss, size = 64 >> ss;
         const uint16_t* const rec = p == 0 ? b.y_buffer : p == 1 ? b.u_buffer : b.v_buffer;
@@ -1010,12 +1055,17 @@ void CodecState::cdef(const Frame420& src) {
         const int fw = (mi->mi_cols * MI_SIZE) >> ss, fh = (mi->mi_rows * MI_SIZE) >> ss;
         const int vw = (src.width + ss) >> ss, vh = (src.height + ss) >> ss;
         const int y0 = fbr * size, x0 = fbc * size;
-        for (int r = -CDEF_VBORDER; r < size + CDEF_VBORDER; r++)
-          for (int c = -CDEF_HBORDER; c < size + CDEF_HBORDER; c++) {
-            const int y = y0 + r, x = x0 + c;
-            in[(r + CDEF_VBORDER) * CDEF_BSTRIDE + c + CDEF_HBORDER] =
-                y >= 0 && y < fh && x >= 0 && x < fw ? rec[static_cast<size_t>(y) * rs + x] : CDEF_VERY_LARGE;
-          }
+        // The unit and its borders, CDEF_VERY_LARGE outside the frame (row by row: the inside copied).
+        for (int r = -CDEF_VBORDER; r < size + CDEF_VBORDER; r++) {
+          const int y = y0 + r;
+          uint16_t* const row = &in[(r + CDEF_VBORDER) * CDEF_BSTRIDE];
+          const int c0 = y >= 0 && y < fh ? std::max(-CDEF_HBORDER, -x0) : size + CDEF_HBORDER;
+          const int c1 = y >= 0 && y < fh ? std::min(size + CDEF_HBORDER, fw - x0) : size + CDEF_HBORDER;
+          for (int c = -CDEF_HBORDER; c < c0; c++) row[c + CDEF_HBORDER] = CDEF_VERY_LARGE;
+          if (c1 > c0)
+            std::memcpy(row + c0 + CDEF_HBORDER, rec + static_cast<size_t>(y) * rs + x0 + c0, sizeof(uint16_t) * (c1 - c0));
+          for (int c = std::max(c0, c1); c < size + CDEF_HBORDER; c++) row[c + CDEF_HBORDER] = CDEF_VERY_LARGE;
+        }
         uint16_t* const blk = &in[CDEF_VBORDER * CDEF_BSTRIDE + CDEF_HBORDER];
         // Squared error of the packed 8x8 (4x4 chroma) blocks out[] (or the input) to the source.
         auto error = [&](const uint16_t* f, bool packed) {
@@ -1042,48 +1092,96 @@ void CodecState::cdef(const Frame420& src) {
           }
           return e;
         };
-        int64_t* const acc = &sse[t][p ? kStrengths : 0];
-        const int one = only[p > 0];
-        if (one <= 0) acc[0] += error(blk, false);
-        // Luma first: its directions (found on the first filtered strength) steer chroma too.
-        for (int s = one > 0 ? one : 1; s < (one > 0 ? one + 1 : one == 0 ? 1 : kStrengths); s++) {
-          const int pri = s / CDEF_SEC_STRENGTHS, sec = s % CDEF_SEC_STRENGTHS + (s % CDEF_SEC_STRENGTHS == 3);
-          av2_cdef_filter_fb(nullptr, out.data(), 0, blk, ss, ss, dir, &dirinit, var, p, dlist, count, pri, sec,
-                             damping, cm->seq_params.bit_depth - 8);  // coeff_shift, as av2_cdef_frame()
-          acc[s] += error(out.data(), true);
+        int64_t* const acc = sum ? &(*sum)[p ? kStrengths : 0] : &err[k][p ? kStrengths : 0];
+        const int one = sum ? (p ? pair_of[k].chroma : pair_of[k].luma) : -1;
+        // avm_av2_cdef_find_dir(): luma's directions steer chroma too.
+        auto find_dirs = [&] {
+          const int cs = cm->seq_params.bit_depth - 8;
+          int i = 0;
+          for (; i + 1 < count; i += 2) {
+            const int by = dlist[i].by, bx = dlist[i].bx, by2 = dlist[i + 1].by, bx2 = dlist[i + 1].bx;
+            av2_cdef_find_dir_dual(&blk[8 * by * CDEF_BSTRIDE + 8 * bx], &blk[8 * by2 * CDEF_BSTRIDE + 8 * bx2],
+                                   CDEF_BSTRIDE, &var[by][bx], &var[by2][bx2], cs, &dir[by][bx], &dir[by2][bx2]);
+          }
+          if (i < count)
+            dir[dlist[i].by][dlist[i].bx] =
+                av2_cdef_find_dir(&blk[8 * dlist[i].by * CDEF_BSTRIDE + 8 * dlist[i].bx], CDEF_BSTRIDE,
+                                  &var[dlist[i].by][dlist[i].bx], cs);
+          dirinit = 1;
+        };
+        if (one < 0) {
+          // Every strength at once from the filter's parts (celv2::cdef_block_errors(), the same sums as
+          // av2_cdef_filter_fb() at each strength).
+          static_assert(CDEF_PRI_STRENGTHS * CDEF_SEC_STRENGTHS == celv2::kCdefStrengths);
+          if (p == 0) {
+            find_dirs();
+            if (k % step == 0) std::memcpy(saved.dir, dir, sizeof(dir)), std::memcpy(saved.var, var, sizeof(var));
+          }
+          for (int i = 0; i < count; i++) {
+            const int by = y0 + dlist[i].by * bs, bx = x0 + dlist[i].bx * bs;
+            const int bh = std::min(bs, vh - by), bw = std::min(bs, vw - bx);
+            if (bh <= 0 || bw <= 0) continue;
+            const uint16_t* const in = &blk[dlist[i].by * bs * CDEF_BSTRIDE + dlist[i].bx * bs];
+            const size_t o = static_cast<size_t>(by) * os + bx;
+            if (p && dlist[i].chroma_lossless) {  // copied, at every strength
+              int64_t e = 0;
+              for (int r = 0; r < bh; r++)
+                for (int c = 0; c < bw; c++) {
+                  const int d = in[r * CDEF_BSTRIDE + c] - (org16 ? org16[o + r * os + c] : org8[o + r * os + c]);
+                  e += d * d;
+                }
+              for (int s = 0; s < kStrengths; s++) acc[s] += e;
+              continue;
+            }
+            celv2::cdef_block_errors(in, p == 0, dir[dlist[i].by][dlist[i].bx], var[dlist[i].by][dlist[i].bx], dmp,
+                                     cm->seq_params.bit_depth - 8, org16 ? org16 + o : nullptr, org8 + o, os, bw, bh, acc);
+          }
+          continue;
         }
+        if (one == 0) {  // unfiltered (the decoder still takes luma's directions for chroma)
+          acc[0] += error(blk, false);
+          if (p == 0 && !dirinit) find_dirs();
+          continue;
+        }
+        const int pri = one / CDEF_SEC_STRENGTHS, sec = one % CDEF_SEC_STRENGTHS + (one % CDEF_SEC_STRENGTHS == 3);
+        av2_cdef_filter_fb(nullptr, out.data(), 0, blk, ss, ss, dir, &dirinit, var, p, dlist, count, pri, sec,
+                           dmp, cm->seq_params.bit_depth - 8);  // coeff_shift, as av2_cdef_frame()
+        acc[one] += error(out.data(), true);
       }
     }
   };
-  auto run = [&] { celv2::parallel(nt, search); };
-  auto total = [&](int p, int s) {
+  celv2::parallel(nt, [&](int t) { search(t, 1, damping, nullptr); });
+  const int groups = static_cast<int>(heads.size());
+  std::vector<int64_t> gerr(static_cast<size_t>(groups) * 2 * kStrengths, 0);
+  for (size_t k = 0; k < units.size(); k++)
+    for (int i = 0; i < 2 * kStrengths; i++) gerr[static_cast<size_t>(unit_group[units[k]]) * 2 * kStrengths + i] += err[k][i];
+  std::vector<int8_t> index;
+  const std::vector<celv2::CdefPair> set = celv2::cdef_choose_set(gerr.data(), groups, sse_per_bit, &index);
+  if (set.empty()) return;
+  for (int g = 0; g < groups; g++) heads[g]->cdef_strength = index[g];
+  for (size_t k = 0; k < units.size(); k++) pair_of[k] = set[index[unit_group[units[k]]]];
+  // Then the damping (3..6) for those pairs on the sampled units: on anime clips -0.9% / -0.1% BD-rate
+  // at qindex 45-180 / 30-75 (searching every strength at every damping gained the same at 1.5x the
+  // encode time).
+  int64_t least = 0;
+  for (size_t k = 0; k < units.size(); k += step) least += err[k][pair_of[k].luma] + err[k][kStrengths + pair_of[k].chroma];
+  // Every damping given in one job (one fork-join under a busy pool instead of one each).
+  celv2::parallel(nt * static_cast<int>(others.size()), [&](int k) { search(k % nt, step, others[k / nt], &sse[k]); });
+  for (size_t i = 0; i < others.size(); i++) {
     int64_t e = 0;
-    for (int t = 0; t < nt; t++) e += sse[t][p * kStrengths + s];
-    return e;
-  };
-  run();
-  int best[2] = {0, 0};
-  for (int p = 0; p < 2; p++) {
-    int64_t least = INT64_MAX;
-    for (int s = 0; s < kStrengths; s++)
-      if (total(p, s) < least) least = total(p, s), best[p] = s;
+    for (int t = 0; t < nt; t++)
+      for (const int64_t v : sse[i * nt + t]) e += v;
+    if (e < least) least = e, ci->cdef_damping = others[i];
   }
-  // Then the damping (3..6) for that pair: on anime clips -0.9% / -0.1% BD-rate at qindex 45-180 /
-  // 30-75 (searching every strength at every damping gained the same at 1.5x the encode time).
-  int64_t least = total(0, best[0]) + total(1, best[1]);
-  const int start = ci->cdef_damping;
-  only[0] = best[0], only[1] = best[1];
-  // (luma filtered: chroma takes its directions)
-  for (damping = 3; damping <= 6 && best[0]; damping++) {
-    if (damping == start) continue;
-    run();
-    const int64_t e = total(0, best[0]) + total(1, best[1]);
-    if (e < least) least = e, ci->cdef_damping = damping;
-  }
-  if (!best[0] && !best[1]) return;
   ci->cdef_frame_enable = 1;
-  ci->cdef_strengths[0] = best[0];
-  ci->cdef_uv_strengths[0] = best[1];
+  ci->nb_cdef_strengths = static_cast<int>(set.size());
+  for (size_t i = 0; i < set.size(); i++) ci->cdef_strengths[i] = set[i].luma, ci->cdef_uv_strengths[i] = set[i].chroma;
+  if (const char* e = std::getenv("CELV2_GOP_LOG"); e && *e && *e != '0')
+    std::fprintf(stderr, "celv2enc: cdef frame %d strengths %d damping %d\n",
+                 static_cast<int>(cm->current_frame.display_order_hint), ci->nb_cdef_strengths, ci->cdef_damping);
+  search_cpu.reset();
+  wall.reset();
+  wall.emplace(celv2::Wall::FCdefApply);
   const int workers = static_cast<int>(lf_workers_.size());
   if (workers > 1) {
     if (cdef_workers_ != workers) {
@@ -1098,6 +1196,32 @@ void CodecState::cdef(const Frame420& src) {
   }
 }
 
+// Plane p's filter as cm->ccso_info holds it, over the frame's buffer and luma (the deblocked luma
+// padded as extend_ccso_border()); the caller sets `on`.
+static celv2::CcsoPlane ccso_plane(const AV2_COMMON* cm, const std::vector<uint16_t>& luma, int p) {
+  const CcsoInfo* const ci = &cm->ccso_info;
+  const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
+  const int luma_stride = b.y_width + 2 * CCSO_PADDING_SIZE;
+  celv2::CcsoPlane c;
+  const bool uv = p > 0;
+  c.luma = luma.data() + CCSO_PADDING_SIZE * luma_stride + CCSO_PADDING_SIZE;
+  c.luma_stride = luma_stride;
+  c.dst = p == 0 ? b.y_buffer : p == 1 ? b.u_buffer : b.v_buffer;
+  c.dst_stride = uv ? b.uv_stride : b.y_stride;
+  c.w = uv ? b.uv_width : b.y_width;
+  c.h = uv ? b.uv_height : b.y_height;
+  c.sx = uv ? cm->seq_params.subsampling_x : 0;
+  c.sy = uv ? cm->seq_params.subsampling_y : 0;
+  c.bit_depth = cm->seq_params.bit_depth;
+  c.bo_only = ci->ccso_bo_only[p];
+  c.thr = quant_sz[ci->scale_idx[p]][ci->quant_idx[p]];
+  c.edge_clf = ci->edge_clf[p];
+  celv2::ccso_neighbours(ci->ext_filter_support[p], luma_stride, c.loc);
+  c.max_band_log2 = ci->max_band_log2[p];
+  c.offset = ci->filter_offset[p];
+  return c;
+}
+
 void CodecState::ccso(const Frame420& src, std::vector<uint16_t>& luma, double sse_per_bit) {
   celv2::StageScope prof(celv2::Stage::Ccso);
   AV2_COMMON* const cm = cm_;
@@ -1107,6 +1231,8 @@ void CodecState::ccso(const Frame420& src, std::vector<uint16_t>& luma, double s
   const int threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
   // The planes' searches at once (each one's counting is on its own threads; 1080p chroma has one).
   CcsoChoice choice[3];
+  std::optional<celv2::WallScope> wall(celv2::Wall::FCcsoSearch);
+  std::optional<celv2::StageScope> search_cpu(celv2::Stage::CcsoSearch);
   auto search = [&](int p) {
     const bool uv = p > 0;
     const uint16_t* const rec = p == 0 ? b.y_buffer : p == 1 ? b.u_buffer : b.v_buffer;
@@ -1121,11 +1247,33 @@ void CodecState::ccso(const Frame420& src, std::vector<uint16_t>& luma, double s
       choice[p] = ccso_search(lum, stride, rec, rs, p == 0 ? src.y.data() : p == 1 ? src.u.data() : src.v.data(), ss,
                               w, h, sx, sy, sse_per_bit, threads);
   };
+  // Then each plane's flags per unit (docs/superpowers/specs/2026-11-10-ccso-per-unit-design.md): the
+  // unit's first MB_MODE_INFO carries its flag (read_ccso()), and units a block over the unit covers
+  // share one (one MB_MODE_INFO): one group, one flag, as CDEF's groups.
+  const CommonModeInfoParams* const mi = &cm->mi_params;
+  const int blk_log2 = get_ccso_unit_size_log2_adaptive_tile(cm, cm->mib_size_log2 + MI_SIZE_LOG2, CCSO_BLK_SIZE);
+  const int f = 1 << blk_log2 >> MI_SIZE_LOG2;
+  const int rows = (mi->mi_rows + f - 1) / f, cols = (mi->mi_cols + f - 1) / f;
+  auto head = [&](int r, int c) { return mi->mi_grid_base[r * f * mi->mi_stride + c * f]; };
+  std::vector<int> unit_group(static_cast<size_t>(rows) * cols);
+  std::vector<MB_MODE_INFO*> heads;
+  for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++) {
+      int g = -1;  // the block covering this unit started in the unit to the left or above
+      if (c && head(r, c) == head(r, c - 1)) g = unit_group[r * cols + c - 1];
+      if (g < 0 && r && head(r, c) == head(r - 1, c)) g = unit_group[(r - 1) * cols + c];
+      if (g < 0) g = static_cast<int>(heads.size()), heads.push_back(head(r, c));
+      unit_group[r * cols + c] = g;
+    }
+  const int groups = static_cast<int>(heads.size());
+  int on_units[3] = {};
+  // Each plane's search, then every unit's error change at each offset under that classification (the planes at once:
+  // the unit errors one plane after another took 3.3 ms of the chain).
+  std::vector<CcsoDelta> plane_stats[3];
+  int plane_classes[3] = {};
   celv2::parallel(3, [&](int p) {
-    if (ci->ccso_enable[p]) search(p);
-  });
-  for (int p = 0; p < 3; p++) {
-    if (!ci->ccso_enable[p]) continue;
+    if (!ci->ccso_enable[p]) return;
+    search(p);
     const CcsoChoice& c = choice[p];
     ci->ccso_bo_only[p] = c.bo_only;
     ci->scale_idx[p] = static_cast<uint8_t>(c.scale_idx);
@@ -1134,8 +1282,58 @@ void CodecState::ccso(const Frame420& src, std::vector<uint16_t>& luma, double s
     ci->edge_clf[p] = static_cast<uint8_t>(c.edge_clf);
     ci->max_band_log2[p] = c.max_band_log2;
     std::memcpy(ci->filter_offset[p], c.offset, sizeof(c.offset));
+    const celv2::CcsoPlane plane = ccso_plane(cm, luma, p);
+    const bool uv = p > 0;
+    const int w = uv ? b.uv_crop_width : b.y_crop_width, h = uv ? b.uv_crop_height : b.y_crop_height;
+    const int ss = uv ? src.stride_uv() : src.stride_y();
+    const int scale = choice[p].scale_idx + 1;
+    plane_classes[p] =
+        src.bit_depth > 8
+            ? ccso_unit_stats(plane, p == 0 ? src.hy.data() : p == 1 ? src.hu.data() : src.hv.data(), ss, w, h, scale,
+                              blk_log2 - plane.sx, blk_log2 - plane.sy, cols, &plane_stats[p])
+            : ccso_unit_stats(plane, p == 0 ? src.y.data() : p == 1 ? src.u.data() : src.v.data(), ss, w, h, scale,
+                              blk_log2 - plane.sx, blk_log2 - plane.sy, cols, &plane_stats[p]);
+  });
+  for (int p = 0; p < 3; p++) {
+    if (!ci->ccso_enable[p]) continue;
+    CcsoChoice& c = choice[p];
+    // The unit stats summed by group.
+    const std::vector<CcsoDelta>& stats = plane_stats[p];
+    const int classes = plane_classes[p];
+    std::vector<CcsoDelta> gstats(static_cast<size_t>(groups) * classes);
+    for (size_t u = 0; u < unit_group.size(); u++)
+      for (int k = 0; k < classes; k++) gstats[static_cast<size_t>(unit_group[u]) * classes + k] += stats[u * classes + k];
+    std::vector<uint8_t> on;
+    if (ccso_unit_flags(gstats.data(), groups, classes, sse_per_bit, &c, &on, unit_group.data(), rows, cols) >= 0) {
+      ci->ccso_enable[p] = cm->cur_frame->ccso_info.ccso_enable[p] = 0;
+      continue;
+    }
+    std::memcpy(ci->filter_offset[p], c.offset, sizeof(c.offset));
     av2_copy_ccso_filters(&cm->cur_frame->ccso_info, ci, p, 1, 0, 0);
+    // The flags: each group's into its first MB_MODE_INFO, then every block's from its unit's where
+    // read_ccso() copies it (the unit's first block inside the block's tile), as the decoder's
+    // neighbours carry them; sb_filter_control as span_ccso() leaves it.
+    auto get = [p](const MB_MODE_INFO* m) { return p == 0 ? m->ccso_blk_y : p == 1 ? m->ccso_blk_u : m->ccso_blk_v; };
+    auto set = [p](MB_MODE_INFO* m, int v) { (p == 0 ? void(m->ccso_blk_y = v) : p == 1 ? void(m->ccso_blk_u = v) : void(m->ccso_blk_v = v)); };
+    for (int g = 0; g < groups; g++) set(heads[g], on[g]);
+    for (const Tile& t : tiles_) {
+      const TileInfo& ti = t.xd->tile;
+      for (int r = ti.mi_row_start; r < ti.mi_row_end; r++)
+        for (int c = ti.mi_col_start; c < ti.mi_col_end; c++)
+          if (r / f * f >= ti.mi_row_start && c / f * f >= ti.mi_col_start)
+            set(mi->mi_grid_base[r * mi->mi_stride + c], get(head(r / f, c / f)));
+    }
+    for (size_t u = 0; u < unit_group.size(); u++)
+      on_units[p] += cm->cur_frame->ccso_info.sb_filter_control[p][u] = on[unit_group[u]];
   }
+  ci->ccso_frame_flag = ci->ccso_enable[0] || ci->ccso_enable[1] || ci->ccso_enable[2];
+  search_cpu.reset();
+  wall.reset();
+  if (const char* e = std::getenv("CELV2_GOP_LOG"); e && *e && *e != '0')
+    std::fprintf(stderr, "celv2enc: ccso frame %d units %zu on %d %d %d\n", static_cast<int>(cm->current_frame.display_order_hint),
+                 unit_group.size(), on_units[0], on_units[1], on_units[2]);
+  if (!ci->ccso_frame_flag) return;
+  wall.emplace(celv2::Wall::FCcsoApply);
   apply_ccso(luma);
 }
 
@@ -1148,9 +1346,7 @@ void CodecState::apply_ccso(const std::vector<uint16_t>& luma) {
   if (cm->seq_params.disable_loopfilters_across_tiles || cm->features.has_lossless_segment || cm->bru.enabled ||
       cm->bridge_frame_info.is_bridge_frame)
     throw std::logic_error("apply_ccso: tiles, lossless segments, BRU and bridge frames are not supported");
-  YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
   const CommonModeInfoParams* const mi = &cm->mi_params;
-  const int luma_stride = b.y_width + 2 * CCSO_PADDING_SIZE;
   const int blk_log2 = get_ccso_unit_size_log2_adaptive_tile(cm, cm->mib_size_log2 + MI_SIZE_LOG2, CCSO_BLK_SIZE);
   const int blk_size = 1 << blk_log2;
   celv2::CcsoPlane planes[3];
@@ -1158,23 +1354,7 @@ void CodecState::apply_ccso(const std::vector<uint16_t>& luma) {
   int rows[3] = {};
   for (int p = 0; p < 3; p++) {
     if (!ci->ccso_enable[p]) continue;
-    celv2::CcsoPlane& c = planes[p];
-    const bool uv = p > 0;
-    c.luma = luma.data() + CCSO_PADDING_SIZE * luma_stride + CCSO_PADDING_SIZE;
-    c.luma_stride = luma_stride;
-    c.dst = p == 0 ? b.y_buffer : p == 1 ? b.u_buffer : b.v_buffer;
-    c.dst_stride = uv ? b.uv_stride : b.y_stride;
-    c.w = uv ? b.uv_width : b.y_width;
-    c.h = uv ? b.uv_height : b.y_height;
-    c.sx = uv ? cm->seq_params.subsampling_x : 0;
-    c.sy = uv ? cm->seq_params.subsampling_y : 0;
-    c.bit_depth = cm->seq_params.bit_depth;
-    c.bo_only = ci->ccso_bo_only[p];
-    c.thr = quant_sz[ci->scale_idx[p]][ci->quant_idx[p]];
-    c.edge_clf = ci->edge_clf[p];
-    celv2::ccso_neighbours(ci->ext_filter_support[p], luma_stride, c.loc);
-    c.max_band_log2 = ci->max_band_log2[p];
-    c.offset = ci->filter_offset[p];
+    celv2::CcsoPlane& c = planes[p] = ccso_plane(cm, luma, p);
     // av2_apply_ccso_filter_for_row()'s skips, per block.
     const int blk_log2_x = blk_log2 - c.sx, blk_log2_y = blk_log2 - c.sy;
     const int unit_log2 = cm->mib_size_log2 - std::max(c.sx, c.sy) + MI_SIZE_LOG2;
@@ -1221,15 +1401,15 @@ void CodecState::save_contexts() {
 }
 
 // Least squares for plane p's chroma WIENER_NONSEP taps (wienerns_filter_uv: 6 symmetric chroma pairs
-// and 12 luma taps, all against the centre sample) against src, over the samples 2 or more from the
-// edges, the luma downsampled as the decoder's filter has it (cfl_ds_filter_index) without its stripe
-// boundaries: the normal equations' matrix a (18x18) and vector v. Taps t then change the plane's
-// squared error by about (t.a.t / 128 - 2 t.v) / 128 (wienerns_gain()).
-void CodecState::fit_wienerns(const Frame420& src, int p, double* a, double* v) const {
+// and 12 luma taps, all against the centre sample) against src, the luma downsampled as the decoder's filter has it
+// (cfl_ds_filter_index) without its stripe boundaries: per rectangle the sums of the normal equations, whose matrix a
+// (18x18) and vector v (wienerns_normal()) give taps t a change of the rectangle's squared error of about
+// (t.a.t / 128 - 2 t.v) / 128 (wienerns_gain()).
+void CodecState::fit_wienerns(const Frame420& src, int p, const std::vector<std::array<int, 4>>& rects,
+                              std::vector<int64_t>& sums) const {
   const AV2_COMMON* const cm = cm_;
   const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
   const NonsepFilterConfig& nc = get_wienerns_parameters(cm->quant_params.base_qindex, 1)->nsfilter_config;
-  static constexpr int N = kWienerTaps;
   const int w = b.uv_crop_width, h = b.uv_crop_height, st = b.uv_stride, ys = b.y_stride;
   const int ds = cm->seq_params.cfl_ds_filter_index;
   std::vector<int16_t> luma(static_cast<size_t>(w) * h);
@@ -1243,58 +1423,19 @@ void CodecState::fit_wienerns(const Frame420& src, int p, double* a, double* v) 
   const uint16_t* const x = b.buffers[p];
   const uint16_t* const s16 = src.bit_depth > 8 ? (p == 1 ? src.hu : src.hv).data() : nullptr;
   const uint8_t* const s8 = (p == 1 ? src.u : src.v).data();
-  // The sums in doubles (v as column N of a): every product is an integer below 2^24 and every sum one
-  // below 2^53 (a 16K 10-bit plane), so they are exact in any order, the int64 sums' values. A row's
-  // samples first, then each 4x4 tile of the upper triangle summed over them in registers (AM 1080p 120
-  // frames: 2.53 -> 0.95 s, the encode 5.26 -> 5.43 fps).
-  static constexpr int NP = 20;  // N, t, padded to 4 lanes
-  struct alignas(32) Sums {
-    double a[NP][NP] = {};
-  };
-  const int bands = std::max(1, std::min(static_cast<int>(std::thread::hardware_concurrency()), (h - 4) / 16));
-  std::vector<Sums> part(bands);
-  celv2::parallel(bands, [&](int k) {
-    Sums& m = part[k];
-    const int n = w - 4;
-    std::vector<double> rowf(static_cast<size_t>(std::max(n, 0)) * NP);
-    for (int r = 2 + (h - 4) * k / bands; r < 2 + (h - 4) * (k + 1) / bands; r++) {
-      for (int c = 2; c < w - 2; c++) {
-        const uint16_t* const o = x + static_cast<size_t>(r) * st + c;
-        const int16_t* const l = &luma[static_cast<size_t>(r) * w + c];
-        double* const f = &rowf[static_cast<size_t>(c - 2) * NP];
-        for (int i = 0; i < nc.num_pixels; i += 2) {
-          const int d = nc.config[i][NONSEP_ROW_ID] * st + nc.config[i][NONSEP_COL_ID];
-          f[nc.config[i][NONSEP_BUF_POS]] = o[d] + o[-d] - 2 * o[0];
-        }
-        for (int i = 0; i < nc.num_pixels2; i++)
-          f[nc.config2[i][NONSEP_BUF_POS]] = l[nc.config2[i][NONSEP_ROW_ID] * w + nc.config2[i][NONSEP_COL_ID]] - l[0];
-        const size_t at = static_cast<size_t>(r) * src.stride_uv() + c;
-        f[N] = (s16 ? s16[at] : s8[at]) - o[0];
-      }
-      for (int i0 = 0; i0 < N; i0 += 4)
-        for (int j0 = i0; j0 < NP; j0 += 4) {
-          __m256d s0 = _mm256_setzero_pd(), s1 = s0, s2 = s0, s3 = s0;
-          for (int c = 0; c < n; c++) {
-            const double* const f = &rowf[static_cast<size_t>(c) * NP];
-            const __m256d fj = _mm256_loadu_pd(f + j0);
-            s0 = _mm256_add_pd(s0, _mm256_mul_pd(_mm256_broadcast_sd(f + i0), fj));
-            s1 = _mm256_add_pd(s1, _mm256_mul_pd(_mm256_broadcast_sd(f + i0 + 1), fj));
-            s2 = _mm256_add_pd(s2, _mm256_mul_pd(_mm256_broadcast_sd(f + i0 + 2), fj));
-            s3 = _mm256_add_pd(s3, _mm256_mul_pd(_mm256_broadcast_sd(f + i0 + 3), fj));
-          }
-          const __m256d s[4] = {s0, s1, s2, s3};
-          for (int q = 0; q < 4; q++)
-            _mm256_store_pd(&m.a[i0 + q][j0], _mm256_add_pd(_mm256_load_pd(&m.a[i0 + q][j0]), s[q]));
-        }
-    }
+  // The sums in integers (celv2::wiener_rect_sums(), 2.1x less CPU than the doubles they replaced, the same values).
+  static_assert(kWienerTaps == celv2::kWienerFeatures);
+  celv2::WienerTaps t;
+  for (int i = 0; i < nc.num_pixels; i += 2, t.nx++)
+    t.dx[t.nx] = nc.config[i][NONSEP_ROW_ID] * st + nc.config[i][NONSEP_COL_ID], t.px[t.nx] = nc.config[i][NONSEP_BUF_POS];
+  for (int i = 0; i < nc.num_pixels2; i++, t.nl++)
+    t.dl[t.nl] = nc.config2[i][NONSEP_ROW_ID] * w + nc.config2[i][NONSEP_COL_ID], t.pl[t.nl] = nc.config2[i][NONSEP_BUF_POS];
+  sums.resize(rects.size() * celv2::kWienerPairs);
+  celv2::parallel(static_cast<int>(rects.size()), [&](int k) {
+    const std::array<int, 4>& r = rects[k];
+    celv2::wiener_rect_sums(x, st, luma.data(), w, s16, s8, src.stride_uv(), r[0], r[1], r[2], r[3], t,
+                            &sums[static_cast<size_t>(k) * celv2::kWienerPairs]);
   });
-  for (int i = 0; i < N; i++)
-    for (int j = i; j <= N; j++) {
-      double sum = 0;
-      for (const Sums& m : part) sum += m.a[i][j];
-      if (j < N) a[i * N + j] = a[j * N + i] = sum;
-      else v[i] = sum;
-    }
 }
 
 namespace {
@@ -1416,22 +1557,43 @@ std::pair<int, int> CodecState::wienerns_matches(int p) {
   return {base, base + (group == 0 ? 1 : group_counts[group])};
 }
 
+namespace {
+
+// wienerns_gain()'s matrix a and vector v from celv2::wiener_rect_sums()'s pairs.
+void wienerns_normal(const int64_t* q, double* a, double* v) {
+  for (int i = 0, p = 0; i < kWienerN; i++)
+    for (int j = i; j <= kWienerN; j++, p++) {
+      const double s = static_cast<double>(q[p]);
+      if (j < kWienerN) a[i * kWienerN + j] = a[j * kWienerN + i] = s;
+      else v[i] = s;
+    }
+}
+
+// The bits of n flags, k of them 1, at their own odds (adaptive CDFs).
+double flag_entropy(int n, int k) {
+  const double q = n ? static_cast<double>(k) / n : 0;
+  return q > 0 && q < 1 ? -n * (q * std::log2(q) + (1 - q) * std::log2(1 - q)) : 0;
+}
+
+// avm_write_symbol()'s bits for v at cdf.
+double cdf_bits(const avm_cdf_prob* cdf, int v) {
+  const int hi = v ? cdf[v - 1] : CDF_PROB_TOP, p = hi - cdf[v];
+  return -std::log2(std::max(p, 1) / static_cast<double>(CDF_PROB_TOP));
+}
+
+}  // namespace
+
 void CodecState::restore(const Frame420& src, bool optimized, double luma_sse_per_bit) {
   celv2::StageScope prof(celv2::Stage::Restoration);
   WorkersScope avm_workers(celv2::Stage::Restoration, lf_workers_);
+  std::optional<celv2::WallScope> wall(celv2::Wall::FLrFit);
+  std::optional<celv2::StageScope> fit_cpu(celv2::Stage::LrFit);
   AV2_COMMON* const cm = cm_;
   // A chroma bit is weighed as 4 bits against chroma error: weights 1 / 2 / 4 / 8 gave BD-rate Y on
   // AM demo, live action, AIR OP and kaguya of up to +0.66 / +0.65 / -0.01 / +0.09% (4: all below 0).
   constexpr double uv_k = 4;
   YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
   const int planes = av2_num_planes(cm);
-  // A WIENER_NONSEP plane's filter: of a dictionary filter as it is and the least-squares taps of each
-  // subset coded against one, the one whose estimated error less its bits' worth is best.
-  struct Choice {
-    int match = 0, s = -1, bits = 0;
-    int16_t t[kWienerTaps] = {};
-  };
-  Choice chosen[MAX_MB_PLANE];
   // The filter also writes the rows and columns past the visible frame up to the aligned size; an
   // unit put back takes those too, its error counts only the visible pixels.
   for (int p = 0; p < planes; p++) {
@@ -1439,52 +1601,22 @@ void CodecState::restore(const Frame420& src, bool optimized, double luma_sse_pe
     if (rsi->frame_restoration_type == RESTORE_NONE) continue;
     lr_keep_[p].resize(static_cast<size_t>(b.strides[p > 0]) * b.heights[p > 0]);
     std::memcpy(lr_keep_[p].data(), b.buffers[p], sizeof(uint16_t) * lr_keep_[p].size());
-    const int n = rsi->horz_units_per_frame * rsi->vert_units_per_frame;
-    if (rsi->frame_restoration_type == RESTORE_PC_WIENER) {
-      for (int i = 0; i < n; i++) rsi->unit_info[i].restoration_type = RESTORE_PC_WIENER;
-      continue;
-    }
-    const double sse_per_bit = luma_sse_per_bit * uv_k;
-    const WienernsFilterParameters* const prm = get_wienerns_parameters(cm->quant_params.base_qindex, 1);
-    if (prm->ncoeffs != kWienerTaps) throw std::logic_error("chroma Wiener taps other than 18");
-    double a[kWienerTaps * kWienerTaps], v[kWienerTaps];
-    fit_wienerns(src, p, a, v);
-    int16_t fit[3][kWienerTaps], ref[kWienerTaps];
-    for (int s = 0; s < prm->nsubsets; s++) wienerns_solve(a, v, prm, s, fit[s]);
-    double best = -1e300;
-    const auto [m0, m1] = wienerns_matches(p);
-    for (int m = m0; m < m1; m++) {
-      const int bits = wienerns_syntax(p, m, -1, nullptr, ref, nullptr);
-      const double e = wienerns_gain(a, v, ref) - sse_per_bit * bits;
-      if (e > best) {
-        best = e, chosen[p] = {m, -1, bits, {}};
-        std::copy_n(ref, kWienerTaps, chosen[p].t);
-      }
-      for (int s = 0; s < prm->nsubsets; s++) {
-        const int fb = wienerns_syntax(p, m, s, fit[s], ref, nullptr);
-        const double f = wienerns_gain(a, v, fit[s]) - sse_per_bit * fb;
-        if (f > best) {
-          best = f, chosen[p] = {m, s, fb, {}};
-          std::copy_n(fit[s], kWienerTaps, chosen[p].t);
-        }
-      }
-    }
-    std::copy_n(chosen[p].t, kWienerTaps, nsfilter_taps(&rsi->frame_filters, 0));
-    for (int i = 0; i < n; i++) {
-      RestorationUnitInfo* const rui = &rsi->unit_info[i];
-      rui->restoration_type = RESTORE_WIENER_NONSEP;
-      rui->wienerns_info.num_classes = rsi->num_filter_classes;
-      copy_nsfilter_taps(&rui->wienerns_info, &rsi->frame_filters);
-    }
+    if (rsi->frame_restoration_type == RESTORE_PC_WIENER)
+      for (int i = 0; i < rsi->horz_units_per_frame * rsi->vert_units_per_frame; i++) rsi->unit_info[i].restoration_type = RESTORE_PC_WIENER;
   }
+  if (planes > 1) plan_uv_lr(src, luma_sse_per_bit * uv_k);
+  fit_cpu.reset();
+  wall.reset();
+  wall.emplace(celv2::Wall::FLrApply);
   // On the deblocking workers when there are several (1 thread: 0.91x the speed at 1080p).
   if (lf_workers_.size() > 1)
     av2_loop_restoration_filter_frame_mt(&b, cm, optimized, lf_workers_.data(), static_cast<int>(lf_workers_.size()),
                                          &lr_sync_, &lr_ctxt_);
   else
     av2_loop_restoration_filter_frame(&b, cm, optimized, &lr_ctxt_);
-  // Per plane, each unit kept where it brings the plane nearer src by more than a bit's worth; the
-  // planes' flags one after the other.
+  wall.reset();
+  wall.emplace(celv2::Wall::FLrDecide);
+  // Per plane, each unit kept where it brings the plane nearer src by more than its bits' worth.
   lr_flags_.clear();
   for (int p = 0; p < planes; p++) {
     RestorationInfo* const rsi = &cm->rst_info[p];
@@ -1494,8 +1626,6 @@ void CodecState::restore(const Frame420& src, bool optimized, double luma_sse_pe
     const int w = b.crop_widths[uv], h = b.crop_heights[uv], aw = b.widths[uv], ah = b.heights[uv], stride = b.strides[uv];
     const int size = rsi->restoration_unit_size;
     const int cols = rsi->horz_units_per_frame, rows = rsi->vert_units_per_frame;
-    const size_t base = lr_flags_.size();
-    lr_flags_.resize(base + static_cast<size_t>(cols) * rows, 0);
     const uint16_t* const s16 = src.bit_depth > 8 ? (p == 0 ? src.hy : p == 1 ? src.hu : src.hv).data() : nullptr;
     const uint8_t* const s8 = (p == 0 ? src.y : p == 1 ? src.u : src.v).data();
     const int sstride = uv ? src.stride_uv() : src.stride_y();
@@ -1511,63 +1641,924 @@ void CodecState::restore(const Frame420& src, bool optimized, double luma_sse_pe
       int x0, x1, y0, y1;
       unit(r, c, &x0, &x1, &y0, &y1);
       rsi->unit_info[r * cols + c].restoration_type = RESTORE_NONE;
-      lr_flags_[base + static_cast<size_t>(r) * cols + c] = 0;
       for (int y = y0; y < y1; y++)
         std::memcpy(buf + static_cast<size_t>(y) * stride + x0, kept.data() + static_cast<size_t>(y) * stride + x0,
                     sizeof(uint16_t) * (x1 - x0));
     };
-    std::vector<double> row_gain(rows, 0.0);
+    std::vector<int64_t> e_on(static_cast<size_t>(cols) * rows), e_no(e_on.size());
+    // Unit by unit (by unit rows, 9 tasks at 1080p, took 1 ms of the chain).
+    celv2::parallel(rows * cols, [&](int u) {
+      const int r = u / cols, c = u % cols;
+      int x0, x1, y0, y1;
+      unit(r, c, &x0, &x1, &y0, &y1);
+      int64_t on = 0, no = 0;
+      for (int y = y0; y < AVMMIN(y1, h); y++) {
+        const uint16_t *const o = buf + static_cast<size_t>(y) * stride, *const k = kept.data() + static_cast<size_t>(y) * stride;
+        const size_t at = static_cast<size_t>(y) * sstride;
+        if (s16)
+          for (int x = x0; x < AVMMIN(x1, w); x++) {
+            const int a = o[x] - s16[at + x], d = k[x] - s16[at + x];
+            on += a * a, no += d * d;
+          }
+        else
+          for (int x = x0; x < AVMMIN(x1, w); x++) {
+            const int a = o[x] - s8[at + x], d = k[x] - s8[at + x];
+            on += a * a, no += d * d;
+          }
+      }
+      e_on[u] = on, e_no[u] = no;
+    });
+    if (p == 0) {  // luma, the first plane: four symbols a unit
+      restore_luma(src, optimized, sse_per_bit, e_no, e_on);
+      continue;
+    }
+    // Chroma: a unit that was filtered is kept where its gain beats its flag and (per-unit taps) its taps' bits.
+    const UvLr& l = lr_uv_[p];
+    std::vector<double> row_gain(rows, 0.0), row_bits(rows, 0.0);
+    std::vector<int> row_kept(rows, 0);
     celv2::parallel(rows, [&](int r) {
       for (int c = 0; c < cols; c++) {
-        int x0, x1, y0, y1;
-        unit(r, c, &x0, &x1, &y0, &y1);
-        int64_t on = 0, no = 0;
-        for (int y = y0; y < AVMMIN(y1, h); y++)
-          for (int x = x0; x < AVMMIN(x1, w); x++) {
-            const size_t at = static_cast<size_t>(y) * sstride + x;
-            const int s = s16 ? s16[at] : s8[at];
-            const int a = buf[static_cast<size_t>(y) * stride + x] - s;
-            const int k = kept[static_cast<size_t>(y) * stride + x] - s;
-            on += a * a, no += k * k;
-          }
-        const bool keep = static_cast<double>(on) + sse_per_bit < static_cast<double>(no);
-        lr_flags_[base + static_cast<size_t>(r) * cols + c] = keep;
-        if (keep)
-          row_gain[r] += static_cast<double>(no - on);
+        const size_t u = static_cast<size_t>(r) * cols + c;
+        if (rsi->unit_info[u].restoration_type != RESTORE_WIENER_NONSEP) continue;
+        const double bits = l.mode == 2 ? l.bits_u[u] : 0;
+        if (static_cast<double>(e_on[u]) + sse_per_bit * (1 + bits) < static_cast<double>(e_no[u]))
+          row_gain[r] += static_cast<double>(e_no[u] - e_on[u]), row_bits[r] += bits, row_kept[r]++;
         else
           put_back(r, c);
       }
     });
-    if (rsi->frame_restoration_type != RESTORE_WIENER_NONSEP) continue;
     // Units keeping the filter for less than its bits and the flags' (their entropy): the plane goes
-    // without restoration (frame type NONE, the tiles' flags for it not coded, SymbolLog::replay()).
-    double gain = 0;
+    // without restoration (frame type NONE, no unit symbols).
+    double gain = 0, bits = l.mode == 1 ? l.bits : 0;
     int kept_units = 0;
-    for (const double g : row_gain) gain += g;
-    for (size_t i = base; i < lr_flags_.size(); i++) kept_units += lr_flags_[i];
-    const double q = static_cast<double>(kept_units) / (cols * rows);
-    const double flag_bits = q > 0 && q < 1 ? -(cols * rows) * (q * std::log2(q) + (1 - q) * std::log2(1 - q)) : 0;
-    const Choice* const c = &chosen[p];
-    if (gain <= sse_per_bit * (c->bits + flag_bits)) {
+    for (int r = 0; r < rows; r++) gain += row_gain[r], bits += row_bits[r], kept_units += row_kept[r];
+    if (gain <= sse_per_bit * (bits + flag_entropy(cols * rows, kept_units))) {
       for (int r = 0; r < rows; r++)
         for (int k = 0; k < cols; k++)
-          if (lr_flags_[base + static_cast<size_t>(r) * cols + k]) put_back(r, k);
-      std::fill(lr_flags_.begin() + base, lr_flags_.end(), kLrSkip);
+          if (rsi->unit_info[static_cast<size_t>(r) * cols + k].restoration_type == RESTORE_WIENER_NONSEP) put_back(r, k);
       rsi->frame_restoration_type = RESTORE_NONE;
       rsi->frame_filters_on = 0;
       cm->cur_frame->rst_info[p].frame_filters_on = 0;
+    } else if (l.mode == 1) {
+      int16_t ref[kWienerTaps];
+      wienerns_syntax(p, l.match, l.s, l.t, ref, &lr_filter_bits_[p]);
+      rsi->frame_filters_initialized = 1;
+      av2_copy_rst_frame_filters(&cm->cur_frame->rst_info[p], rsi);
+    } else {
+      plan_uv_units(p);
+    }
+    if (const char* e = std::getenv("CELV2_GOP_LOG"); e && *e && *e != '0')
+      std::fprintf(stderr, "celv2enc: lr uv frame %d plane %d size %d mode %d units %d on %d\n",
+                   static_cast<int>(cm->current_frame.display_order_hint), p, size,
+                   rsi->frame_restoration_type == RESTORE_NONE ? 0 : l.mode, cols * rows,
+                   rsi->frame_restoration_type == RESTORE_NONE ? 0 : kept_units);
+  }
+}
+
+void CodecState::plan_uv_lr(const Frame420& src, double sse_per_bit) {
+  AV2_COMMON* const cm = cm_;
+  const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
+  const int planes = av2_num_planes(cm);
+  bool on[MAX_MB_PLANE] = {}, any = false;
+  for (int p = 1; p < planes; p++) {
+    lr_uv_[p] = {};
+    on[p] = cm->rst_info[p].frame_restoration_type != RESTORE_NONE;
+    if (on[p] && cm->rst_info[p].frame_restoration_type != RESTORE_WIENER_NONSEP)
+      throw std::logic_error("chroma restoration other than WIENER_NONSEP");
+    any = any || on[p];
+  }
+  if (!any) return;
+  const int qindex = cm->quant_params.base_qindex;
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(qindex, 1);
+  if (prm->ncoeffs != kWienerTaps) throw std::logic_error("chroma Wiener taps other than 18");
+  // uv_tap_bits()'s symbols at the frame's starting CDFs.
+  for (int v = 0; v < 2; v++) uv_cost_.len[v] = cdf_bits(cm->fc->wienerns_length_cdf[1], v), uv_cost_.sym[v] = cdf_bits(cm->fc->wienerns_uv_sym_cdf, v);
+  for (int c = 0; c < WIENERNS_4PART_CTX_MAX; c++)
+    for (int v = 0; v < 4; v++) uv_cost_.part[c][v] = cdf_bits(cm->fc->wienerns_4part_cdf[c], v);
+  constexpr int P = celv2::kWienerPairs, kNs = 3;
+  if (prm->nsubsets > kNs) throw std::logic_error("chroma Wiener subsets above 3");
+  const int w = b.uv_crop_width, h = b.uv_crop_height;
+  const int ss = AVMMAX(cm->seq_params.subsampling_x, cm->seq_params.subsampling_y);
+  // The unit grids at 64, 128 and 256: each unit's rectangle (av2_get_rutile_rect()), the units in coding order (tiles,
+  // their superblocks in raster order, the units whose corner is in each) with their tiles, and for each 64 unit the
+  // larger unit it lies in (units start again at each tile with the same 4-row offset, the last one takes the rest).
+  struct Grid {
+    int size = 0, n = 0;
+    std::vector<std::array<int, 4>> rect;
+    std::vector<int> order, tile, of;
+  };
+  Grid g[3];
+  RestorationInfo* const r1 = &cm->rst_info[1];
+  // decode_restoration_mode(): a unit (luma's or chroma's in luma samples) divides every tile but the last of a row or
+  // column; 64 (128 luma, the superblock) always does.
+  bool allowed[3] = {};
+  for (int k = 0; k < 3; k++) {
+    const int ru = AVMMAX(cm->rst_info[0].restoration_unit_size, (RESTORATION_UNITSIZE_MAX >> (2 + ss - k)) << ss);
+    allowed[k] = true;
+    for (int i = 0; i < cm->tiles.cols - 1; i++)
+      allowed[k] = allowed[k] && ((cm->tiles.col_start_sb[i + 1] - cm->tiles.col_start_sb[i]) << (cm->mib_size_log2 + MI_SIZE_LOG2)) % ru == 0;
+    for (int i = 0; i < cm->tiles.rows - 1; i++)
+      allowed[k] = allowed[k] && ((cm->tiles.row_start_sb[i + 1] - cm->tiles.row_start_sb[i]) << (cm->mib_size_log2 + MI_SIZE_LOG2)) % ru == 0;
+  }
+  if (!allowed[0]) throw std::logic_error("64 chroma restoration units across tiles");
+  for (int k = 0; k < 3; k++) {
+    if (!allowed[k]) continue;
+    Grid& G = g[k];
+    G.size = r1->restoration_unit_size = RESTORATION_UNITSIZE_MAX >> (2 + ss - k);
+    av2_alloc_restoration_struct(cm, r1, 1);
+    const int cols = r1->horz_units_per_frame;
+    G.n = cols * r1->vert_units_per_frame;
+    for (int r = 0; r < r1->vert_units_per_frame; r++)
+      for (int c = 0; c < cols; c++) {
+        const AV2PixelRect u = av2_get_rutile_rect(cm, 1, r, r + 1, c, c + 1, G.size, G.size);
+        G.rect.push_back({u.left, u.right, u.top, u.bottom});
+      }
+    for (int tr = 0; tr < cm->tiles.rows; tr++)
+      for (int tc = 0; tc < cm->tiles.cols; tc++)
+        for (int sr = cm->tiles.row_start_sb[tr]; sr < cm->tiles.row_start_sb[tr + 1]; sr++)
+          for (int sc = cm->tiles.col_start_sb[tc]; sc < cm->tiles.col_start_sb[tc + 1]; sc++) {
+            int c0, c1, q0, q1;
+            if (!av2_loop_restoration_corners_in_sb(cm, 1, sr << cm->mib_size_log2, sc << cm->mib_size_log2, cm->sb_size,
+                                                    &c0, &c1, &q0, &q1))
+              continue;
+            for (int rr = q0; rr < q1; rr++)
+              for (int rc = c0; rc < c1; rc++) G.order.push_back(rc + rr * cols), G.tile.push_back(tr * cm->tiles.cols + tc);
+          }
+    if (static_cast<int>(G.order.size()) != G.n) throw std::logic_error("chroma restoration units not coded once each");
+    G.of.resize(g[0].n);
+    for (int i = 0; i < g[0].n; i++) {
+      const std::array<int, 4>& a = g[0].rect[i];
+      int j = 0;
+      while (j < G.n && !(G.rect[j][0] <= a[0] && a[1] <= G.rect[j][1] && G.rect[j][2] <= a[2] && a[3] <= G.rect[j][3])) j++;
+      if (j == G.n) throw std::logic_error("a 64 chroma restoration unit across larger ones");
+      G.of[i] = j;
+    }
+  }
+  // Each 64 unit's sums, on its samples 2 or more from the plane's edges (wiener_sums()'s).
+  std::vector<std::array<int, 4>> rects(g[0].n);
+  for (int i = 0; i < g[0].n; i++) {
+    const std::array<int, 4>& a = g[0].rect[i];
+    rects[i] = {std::max(a[0], 2), std::min(a[1], w - 2), std::max(a[2], 2), std::min(a[3], h - 2)};
+  }
+  for (int p = 1; p < planes; p++) {
+    if (!on[p]) continue;
+    fit_wienerns(src, p, rects, lr_uv_sums_[p]);
+    // The frame filter, as before: of a dictionary filter as it is and the least-squares taps of each subset coded
+    // against one, the one whose estimated gain less its bits' worth is best (wienerns_syntax() uses the shared
+    // dictionary: one plane at a time).
+    std::array<int64_t, P> tot = {};
+    for (int i = 0; i < g[0].n; i++)
+      for (int q = 0; q < P; q++) tot[q] += lr_uv_sums_[p][static_cast<size_t>(i) * P + q];
+    double a[kWienerTaps * kWienerTaps], v[kWienerTaps];
+    wienerns_normal(tot.data(), a, v);
+    int16_t fit[kNs][kWienerTaps], ref[kWienerTaps];
+    for (int s = 0; s < prm->nsubsets; s++) wienerns_solve(a, v, prm, s, fit[s]);
+    UvLr& l = lr_uv_[p];
+    double best = -1e300;
+    const auto [m0, m1] = wienerns_matches(p);
+    for (int m = m0; m < m1; m++) {
+      const int bits = wienerns_syntax(p, m, -1, nullptr, ref, nullptr);
+      const double e = wienerns_gain(a, v, ref) - sse_per_bit * bits;
+      if (e > best) best = e, l.match = m, l.s = -1, l.bits = bits, std::copy_n(ref, kWienerTaps, l.t);
+      for (int s = 0; s < prm->nsubsets; s++) {
+        const int fb = wienerns_syntax(p, m, s, fit[s], ref, nullptr);
+        const double f = wienerns_gain(a, v, fit[s]) - sse_per_bit * fb;
+        if (f > best) best = f, l.match = m, l.s = s, l.bits = fb, std::copy_n(fit[s], kWienerTaps, l.t);
+      }
+    }
+  }
+  // Each plane at each size: J (against no restoration) of the frame filter and of per-unit taps, by the units'
+  // estimated gains (wienerns_gain() less the filter's rounding, 1/12 a sample) less their bits.
+  struct Res {
+    double j[3] = {0, 0, 0};  // none, frame filter, per-unit taps
+    std::vector<uint8_t> pu_on;
+    std::vector<std::array<int16_t, kWienerTaps>> taps;
+    std::vector<double> bits;
+    std::vector<int64_t> sums;  // each unit's
+    std::vector<std::array<std::array<int16_t, kWienerTaps>, kNs>> fit;  // each unit's least-squares taps by subset
+    std::vector<std::array<double, kNs>> gain;  // and their gains
+  };
+  Res res[MAX_MB_PLANE][3];
+  auto used = [&](int task) { return 1 + task / 3 < planes && on[1 + task / 3] && allowed[task % 3]; };
+  celv2::parallel(2 * 3, [&](int task) {
+    if (!used(task)) return;
+    const int p = 1 + task / 3, k = task % 3;
+    const Grid& G = g[k];
+    Res& o = res[p][k];
+    o.sums.assign(static_cast<size_t>(G.n) * P, 0);
+    for (int i = 0; i < g[0].n; i++)
+      for (int q = 0; q < P; q++) o.sums[static_cast<size_t>(G.of[i]) * P + q] += lr_uv_sums_[p][static_cast<size_t>(i) * P + q];
+    o.fit.resize(G.n), o.gain.resize(G.n);
+  });
+  // The units' own taps, every unit of every plane and size at once (only the bank's pass below is in coding order).
+  int first[7] = {};
+  for (int task = 0; task < 6; task++) first[task + 1] = first[task] + (used(task) ? g[task % 3].n : 0);
+  celv2::parallel(first[6], [&](int i) {
+    int task = 0;
+    while (first[task + 1] <= i) task++;
+    Res& o = res[1 + task / 3][task % 3];
+    const int u = i - first[task];
+    double a[kWienerTaps * kWienerTaps], v[kWienerTaps];
+    wienerns_normal(&o.sums[static_cast<size_t>(u) * P], a, v);
+    for (int s = 0; s < prm->nsubsets; s++) wienerns_solve(a, v, prm, s, o.fit[u][s].data()), o.gain[u][s] = wienerns_gain(a, v, o.fit[u][s].data());
+  });
+  celv2::parallel(2 * 3, [&](int task) {
+    if (!used(task)) return;
+    const int p = 1 + task / 3, k = task % 3;
+    const Grid& G = g[k];
+    Res& o = res[p][k];
+    const UvLr& l = lr_uv_[p];
+    o.pu_on.assign(G.n, 0), o.taps.assign(G.n, {}), o.bits.assign(G.n, 0);
+    double ff = 0, pu = 0;
+    int ff_n = 0, pu_n = 0;
+    WienerNonsepInfoBank bank;
+    WienerNonsepInfo info = {};
+    info.num_classes = 1;
+    int tile = -1;
+    for (int i = 0; i < G.n; i++) {
+      const int u = G.order[i];
+      if (G.tile[i] != tile) tile = G.tile[i], av2_reset_wienerns_bank(&bank, qindex, 1, 1);
+      double a[kWienerTaps * kWienerTaps], v[kWienerTaps];
+      wienerns_normal(&o.sums[static_cast<size_t>(u) * P], a, v);
+      const std::array<int, 4>& r = G.rect[u];
+      const double round = (r[1] - r[0]) * (r[3] - r[2]) / 12.0;
+      const double gf = wienerns_gain(a, v, l.t) - round;
+      if (gf > 0) ff += gf, ff_n++;
+      // Per-unit taps: off, a bank filter as it is, or the unit's least-squares taps of a subset coded against the
+      // bank filter that codes them in the fewest bits.
+      const auto& fit = o.fit[u];
+      const int size = bank.bank_size_for_class[0];
+      double best = 0;
+      bool exact = false;
+      for (int rf = 0; rf < std::max(size, 1); rf++) {
+        const int16_t* const ref = const_nsfilter_taps(av2_constref_from_wienerns_bank(&bank, rf, 0), 0);
+        const double rb = 1 + (size > 1 ? std::min(rf + 1, size - 1) : 0);  // the exact bit and the bank index
+        const double e = wienerns_gain(a, v, ref) - round - sse_per_bit * rb;
+        if (e > best) best = e, exact = true, o.bits[u] = rb, std::copy_n(ref, kWienerTaps, o.taps[u].data());
+        for (int s = 0; s < prm->nsubsets; s++) {
+          const double nb = rb + uv_tap_bits(fit[s].data(), ref);
+          const double f = o.gain[u][s] - round - sse_per_bit * nb;
+          if (f > best) best = f, exact = false, o.bits[u] = nb, std::copy_n(fit[s].data(), kWienerTaps, o.taps[u].data());
+        }
+      }
+      if (best <= 0) continue;
+      o.pu_on[u] = 1, pu += best, pu_n++;
+      std::copy_n(o.taps[u].data(), kWienerTaps, nsfilter_taps(&info, 0));
+      if (!exact || size == 0) av2_add_to_wienerns_bank(&bank, &info, 0);
+    }
+    o.j[1] = sse_per_bit * (l.bits + flag_entropy(G.n, ff_n)) - ff;
+    o.j[2] = sse_per_bit * flag_entropy(G.n, pu_n) - pu;
+  });
+  int best_k = 0;
+  double best_j = 1e300;
+  for (int k = 0; k < 3; k++) {
+    if (!allowed[k]) continue;
+    double j = 0;
+    for (int p = 1; p < planes; p++)
+      if (on[p]) j += std::min({res[p][k].j[0], res[p][k].j[1], res[p][k].j[2]});
+    if (j < best_j) best_j = j, best_k = k;
+  }
+  const Grid& G = g[best_k];
+  lr_uv_order_ = G.order, lr_uv_tile_ = G.tile;
+  for (int p = 1; p < planes; p++) {
+    RestorationInfo* const rsi = &cm->rst_info[p];
+    rsi->restoration_unit_size = G.size;
+    av2_alloc_restoration_struct(cm, rsi, 1);
+    if (!on[p]) continue;
+    const Res& o = res[p][best_k];
+    UvLr& l = lr_uv_[p];
+    l.mode = static_cast<int>(std::min_element(o.j, o.j + 3) - o.j);
+    rsi->num_filter_classes = 1;
+    rsi->frame_filters.num_classes = 1;
+    rsi->frame_filters_on = l.mode == 1;
+    if (l.mode != 1) cm->cur_frame->rst_info[p].frame_filters_on = 0;
+    if (l.mode == 0) {
+      rsi->frame_restoration_type = RESTORE_NONE;
       continue;
     }
-    int16_t ref[kWienerTaps];
-    wienerns_syntax(p, c->match, c->s, c->t, ref, &lr_filter_bits_[p]);
-    rsi->frame_filters_initialized = 1;
-    av2_copy_rst_frame_filters(&cm->cur_frame->rst_info[p], rsi);
+    if (l.mode == 1) std::copy_n(l.t, kWienerTaps, nsfilter_taps(&rsi->frame_filters, 0));
+    if (l.mode == 2) l.bits_u = o.bits;
+    for (int u = 0; u < G.n; u++) {
+      RestorationUnitInfo* const rui = &rsi->unit_info[u];
+      rui->wienerns_info.num_classes = 1;
+      rui->restoration_type = l.mode == 1 || o.pu_on[u] ? RESTORE_WIENER_NONSEP : RESTORE_NONE;
+      if (l.mode == 1) copy_nsfilter_taps(&rui->wienerns_info, &rsi->frame_filters);
+      else std::copy_n(o.taps[u].data(), kWienerTaps, nsfilter_taps(&rui->wienerns_info, 0));
+    }
   }
+}
+
+double CodecState::uv_tap_bits(const int16_t* t, const int16_t* ref) const {
+  const AV2_COMMON* const cm = cm_;
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(cm->quant_params.base_qindex, 1);
+  int s, sym, ncoeffs1, ncoeffs2;
+  wienerns_shape(prm, t, &s, &sym);
+  config2ncoeffs(&prm->nsfilter_config, &ncoeffs1, &ncoeffs2);
+  double bits = 0;
+  for (int i = 0; i < prm->nsubsets - 1; i++) {
+    bits += uv_cost_.len[i < s];
+    if (i >= s) break;
+  }
+  if (!skip_sym_bit(prm, s)) bits += uv_cost_.sym[sym];
+  for (int i = 0; i < prm->ncoeffs; i++) {
+    if (!prm->subset_config[s][i]) continue;
+    const int lo = prm->coeffs[i][WIENERNS_MIN_ID], nb = prm->coeffs[i][WIENERNS_BIT_ID];
+    const int v = recenter_finite_nonneg(1 << nb, ref[i] - lo, t[i] - lo);
+    const int offs[4] = {0, 1 << (nb - 3), 1 << (nb - 2), 1 << (nb - 1)}, part_bits[4] = {nb - 3, nb - 3, nb - 2, nb - 1};
+    int part = 3;
+    while (v < offs[part]) part--;
+    bits += uv_cost_.part[prm->coeffs[i][WIENERNS_PAR_ID]][part] + part_bits[part];
+    if (sym && (i < prm->nsfilter_config.asymmetric || (i >= ncoeffs1 && i - ncoeffs1 < prm->nsfilter_config.asymmetric2))) i++;
+  }
+  return bits;
+}
+
+// read_wienerns_filter()'s bank, unit by unit in coding order: a unit's taps exact where a bank filter is them, else
+// coded against the bank filter that codes them in the fewest bits.
+void CodecState::plan_uv_units(int p) {
+  AV2_COMMON* const cm = cm_;
+  RestorationInfo* const rsi = &cm->rst_info[p];
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(cm->quant_params.base_qindex, 1);
+  lr_plan_[p].assign(static_cast<size_t>(rsi->horz_units_per_frame) * rsi->vert_units_per_frame, LrPlan{});
+  WienerNonsepInfoBank bank;
+  int tile = -1;
+  for (size_t k = 0; k < lr_uv_order_.size(); k++) {
+    if (lr_uv_tile_[k] != tile) tile = lr_uv_tile_[k], av2_reset_wienerns_bank(&bank, cm->quant_params.base_qindex, 1, 1);
+    RestorationUnitInfo* const rui = &rsi->unit_info[lr_uv_order_[k]];
+    if (rui->restoration_type != RESTORE_WIENER_NONSEP) continue;
+    LrPlan& plan = lr_plan_[p][lr_uv_order_[k]];
+    const int16_t* const t = const_nsfilter_taps(&rui->wienerns_info, 0);
+    const int size = bank.bank_size_for_class[0];
+    plan.size[0] = size;
+    double fewest = 1e300;
+    for (int r = 0; r < std::max(size, 1); r++) {
+      const int16_t* const ref = const_nsfilter_taps(av2_constref_from_wienerns_bank(&bank, r, 0), 0);
+      if (std::equal(t, t + prm->ncoeffs, ref)) {
+        plan.exact[0] = true, plan.ref[0] = r;
+        break;
+      }
+      const double nb = (size > 1 ? std::min(r + 1, size - 1) : 0) + uv_tap_bits(t, ref);
+      if (nb < fewest) fewest = nb, plan.ref[0] = r, std::copy_n(ref, prm->ncoeffs, plan.taps[0]);
+    }
+    if (!plan.exact[0] || size == 0) av2_add_to_wienerns_bank(&bank, &rui->wienerns_info, 0);
+  }
+}
+
+void CodecState::write_lr_uv(avm_writer* w, FRAME_CONTEXT* fc, int mi_row, int mi_col) const {
+  const AV2_COMMON* const cm = cm_;
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(cm->quant_params.base_qindex, 1);
+  int ncoeffs1, ncoeffs2;
+  config2ncoeffs(&prm->nsfilter_config, &ncoeffs1, &ncoeffs2);
+  for (int p = 1; p < av2_num_planes(cm); p++) {
+    const RestorationInfo& rsi = cm->rst_info[p];
+    int c0, c1, r0, r1;
+    if (rsi.frame_restoration_type == RESTORE_NONE ||
+        !av2_loop_restoration_corners_in_sb(cm, p, mi_row, mi_col, cm->sb_size, &c0, &c1, &r0, &r1))
+      continue;
+    for (int rr = r0; rr < r1; rr++)
+      for (int rc = c0; rc < c1; rc++) {
+        const int u = rc + rr * rsi.horz_units_per_frame;
+        const RestorationUnitInfo& rui = rsi.unit_info[u];
+        const bool wns = rui.restoration_type == RESTORE_WIENER_NONSEP;
+        avm_write_symbol(w, wns, fc->wienerns_restore_cdf, 2);
+        if (!wns || rsi.frame_filters_on) continue;
+        const LrPlan& plan = lr_plan_[p][u];
+        avm_write_literal(w, plan.exact[0], 1);
+        for (int ref = 0; ref < plan.size[0] - 1; ref++) {
+          avm_write_literal(w, ref == plan.ref[0], 1);
+          if (ref == plan.ref[0]) break;
+        }
+        if (plan.exact[0]) continue;
+        const int16_t* const t = const_nsfilter_taps(&rui.wienerns_info, 0);
+        int s, sym;
+        wienerns_shape(prm, t, &s, &sym);
+        for (int i = 0; i < prm->nsubsets - 1; i++) {
+          avm_write_symbol(w, i < s, fc->wienerns_length_cdf[1], 2);
+          if (i >= s) break;
+        }
+        if (!skip_sym_bit(prm, s)) avm_write_symbol(w, sym, fc->wienerns_uv_sym_cdf, 2);
+        for (int i = 0; i < prm->ncoeffs; i++) {
+          if (!prm->subset_config[s][i]) continue;
+          const int lo = prm->coeffs[i][WIENERNS_MIN_ID];
+          avm_write_4part_wref(w, plan.taps[0][i] - lo, t[i] - lo, fc->wienerns_4part_cdf[prm->coeffs[i][WIENERNS_PAR_ID]],
+                               prm->coeffs[i][WIENERNS_BIT_ID]);
+          if (sym && (i < prm->nsfilter_config.asymmetric || (i >= ncoeffs1 && i - ncoeffs1 < prm->nsfilter_config.asymmetric2))) i++;
+        }
+      }
+  }
+}
+
+void wienerns_shape(const WienernsFilterParameters* prm, const int16_t* t, int* s, int* sym) {
+  int ncoeffs1, ncoeffs2;
+  config2ncoeffs(&prm->nsfilter_config, &ncoeffs1, &ncoeffs2);
+  for (*s = 0; *s < prm->nsubsets - 1; ++*s) {
+    bool fits = true;
+    for (int i = 0; i < prm->ncoeffs; i++) fits = fits && (prm->subset_config[*s][i] || !t[i]);
+    if (fits) break;
+  }
+  *sym = 1;
+  for (int i = 0; i < prm->ncoeffs; i++) {
+    const bool asym = i < prm->nsfilter_config.asymmetric || (i >= ncoeffs1 && i - ncoeffs1 < prm->nsfilter_config.asymmetric2);
+    if (!prm->subset_config[*s][i] || !asym) continue;
+    if (t[i] != t[i + 1]) *sym = 0;
+    i++;
+  }
+}
+
+int CodecState::frame_filter_bits(int p) {
+  AV2_COMMON* const cm = cm_;
+  RestorationInfo* const rsi = &cm->rst_info[p];
+  WienerNonsepInfo* const ff = &rsi->frame_filters;
+  const int nopcw = disable_pcwiener_filters_in_framefilters(&cm->seq_params), base_qindex = cm->quant_params.base_qindex;
+  const int classes = rsi->num_filter_classes;
+  if (cm->frame_filter_dictionary == nullptr) throw std::logic_error("no frame filter dictionary");
+  *cm->num_ref_filters = set_frame_filter_dictionary(p, cm, classes, cm->frame_filter_dictionary, cm->frame_filter_dictionary_stride);
+  ff->num_classes = classes, ff->num_ref_filters = *cm->num_ref_filters;
+  std::vector<uint8_t> buf(1 << 14);
+  avm_write_bit_buffer wb = {buf.data(), 0};
+  int group_counts[NUM_MATCH_GROUPS];
+  set_group_counts(p, classes, ff->num_ref_filters, group_counts, nopcw);
+  int matches[WIENERNS_MAX_CLASSES];
+  std::copy_n(ff->match_indices, WIENERNS_MAX_CLASSES, matches);
+  for (int c = 0; c < classes; c++) {
+    int only;
+    ff->match_indices[c] = matches[c];  // predict_*() read the earlier ones
+    const int pred = predict_group(c, ff->match_indices, group_counts, &only);
+    const int group = index_to_group(matches[c], group_counts);
+    if (!only) {
+      avm_wb_write_bit(&wb, group != pred);
+      if (group != pred) {
+        int zero = -1;
+        for (int i = 0; i < NUM_MATCH_GROUPS && zero < 0; i++)
+          if (i != pred && group_counts[i] == 0) zero = i;
+        if (zero < 0) {
+          const int larger[] = {2, 2, 1};
+          avm_wb_write_bit(&wb, group == larger[pred]);
+        }
+      }
+    }
+    const int ref = predict_within_group(group, c, ff->match_indices, group_counts), base = get_group_base(group, group_counts);
+    const int n = group == 0 ? c + 1 : group_counts[group];
+    if (n > 1) avm_wb_write_primitive_refsubexpfin(&wb, n, 4, ref - base, matches[c] - base);
+  }
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(base_qindex, p != AVM_PLANE_Y);
+  WienerNonsepInfoBank bank = {};
+  bank.filter[0].num_classes = classes;
+  std::vector<std::vector<int16_t>> refs(classes);
+  bool exact[WIENERNS_MAX_CLASSES];
+  for (int c = 0; c < classes; c++) {
+    fill_first_slot_of_bank_with_filter_match(p, &bank, ff, ff->match_indices, base_qindex, c, cm->frame_filter_dictionary,
+                                              cm->frame_filter_dictionary_stride, nopcw);
+    const int16_t* const ref = const_nsfilter_taps(av2_constref_from_wienerns_bank(&bank, 0, c), c);
+    refs[c].assign(ref, ref + prm->ncoeffs);
+    exact[c] = std::equal(ref, ref + prm->ncoeffs, const_nsfilter_taps(ff, c));
+    avm_wb_write_bit(&wb, exact[c]);
+  }
+  int ncoeffs1, ncoeffs2;
+  config2ncoeffs(&prm->nsfilter_config, &ncoeffs1, &ncoeffs2);
+  for (int c = 0; c < classes; c++) {
+    if (exact[c]) continue;
+    const int16_t* const t = const_nsfilter_taps(ff, c);
+    int s, sym;
+    wienerns_shape(prm, t, &s, &sym);
+    for (int i = 0; i < prm->nsubsets - 1; i++) {
+      avm_wb_write_bit(&wb, i < s);
+      if (i >= s) break;
+    }
+    if (!skip_sym_bit(prm, s)) avm_wb_write_bit(&wb, sym);
+    for (int i = 0; i < prm->ncoeffs; i++) {
+      if (!prm->subset_config[s][i]) continue;
+      const int lo = prm->coeffs[i][WIENERNS_MIN_ID], nb = prm->coeffs[i][WIENERNS_BIT_ID];
+      avm_wb_write_primitive_refsubexpfin(&wb, 1 << nb, nb - 3, refs[c][i] - lo, t[i] - lo);
+      if (sym && (i < prm->nsfilter_config.asymmetric || (i >= ncoeffs1 && i - ncoeffs1 < prm->nsfilter_config.asymmetric2))) i++;
+    }
+  }
+  lr_filter_bits_[p].clear();
+  for (uint32_t i = 0; i < wb.bit_offset; i++) lr_filter_bits_[p].push_back((buf[i >> 3] >> (7 - (i & 7))) & 1);
+  rsi->frame_filters_initialized = 1;
+  av2_copy_rst_frame_filters(&cm->cur_frame->rst_info[p], rsi);
+  return static_cast<int>(wb.bit_offset);
+}
+
+
+int CodecState::frame_filter_class_bits(int p, int c, int m, const int16_t* t, int16_t* ref, WienerNonsepInfo* ff,
+                                        const int16_t* dict) const {
+  const AV2_COMMON* const cm = cm_;
+  const int nopcw = disable_pcwiener_filters_in_framefilters(&cm->seq_params), base_qindex = cm->quant_params.base_qindex;
+  int group_counts[NUM_MATCH_GROUPS];
+  set_group_counts(p, ff->num_classes, ff->num_ref_filters, group_counts, nopcw);
+  ff->match_indices[c] = m;
+  int only, bits = 1;  // the exact bit
+  const int pred = predict_group(c, ff->match_indices, group_counts, &only);
+  const int group = index_to_group(m, group_counts);
+  if (!only) {
+    bits++;
+    if (group != pred) {
+      int zero = -1;
+      for (int i = 0; i < NUM_MATCH_GROUPS && zero < 0; i++)
+        if (i != pred && group_counts[i] == 0) zero = i;
+      bits += zero < 0;
+    }
+  }
+  const int pr = predict_within_group(group, c, ff->match_indices, group_counts), base = get_group_base(group, group_counts);
+  const int n = group == 0 ? c + 1 : group_counts[group];
+  if (n > 1) bits += avm_count_primitive_refsubexpfin(n, 4, pr - base, m - base);
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(base_qindex, p != AVM_PLANE_Y);
+  const int16_t* const r = dict + get_first_match_index(m, ff->num_classes, nopcw) * cm->frame_filter_dictionary_stride;
+  if (ref) std::copy_n(r, prm->ncoeffs, ref);
+  if (!t || std::equal(t, t + prm->ncoeffs, r)) return bits;
+  int s, sym, ncoeffs1, ncoeffs2;
+  wienerns_shape(prm, t, &s, &sym);
+  config2ncoeffs(&prm->nsfilter_config, &ncoeffs1, &ncoeffs2);
+  bits += std::min(s + 1, prm->nsubsets - 1) + !skip_sym_bit(prm, s);
+  for (int i = 0; i < prm->ncoeffs; i++) {
+    if (!prm->subset_config[s][i]) continue;
+    const int lo = prm->coeffs[i][WIENERNS_MIN_ID], nb = prm->coeffs[i][WIENERNS_BIT_ID];
+    bits += avm_count_primitive_refsubexpfin(1 << nb, nb - 3, r[i] - lo, t[i] - lo);
+    if (sym && (i < prm->nsfilter_config.asymmetric || (i >= ncoeffs1 && i - ncoeffs1 < prm->nsfilter_config.asymmetric2))) i++;
+  }
+  return bits;
+}
+
+void CodecState::restore_luma(const Frame420& src, bool optimized, double sse_per_bit, const std::vector<int64_t>& e_no,
+                              const std::vector<int64_t>& e_pc) {
+  AV2_COMMON* const cm = cm_;
+  YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
+  RestorationInfo* const rsi = &cm->rst_info[0];
+  WienerNonsepInfo* const ff = &rsi->frame_filters;
+  const int cols = rsi->horz_units_per_frame, rows = rsi->vert_units_per_frame, n = cols * rows, size = rsi->restoration_unit_size;
+  const int w = b.y_crop_width, h = b.y_crop_height, aw = b.y_width, ah = b.y_height, stride = b.y_stride;
+  const std::vector<uint16_t>& kept = lr_keep_[0];
+  uint16_t* const buf = b.y_buffer;
+  const uint16_t* const s16 = src.bit_depth > 8 ? src.hy.data() : nullptr;
+  const uint8_t* const s8 = src.y.data();
+  const int sstride = src.stride_y(), qindex = cm->quant_params.base_qindex;
+  const int nopcw = disable_pcwiener_filters_in_framefilters(&cm->seq_params);
+  const WienernsFilterParameters* const prm = get_wienerns_parameters(qindex, 0);
+  // A unit's rectangle to the aligned size at the frame's right and bottom (the filter writes there too).
+  auto unit = [&](int u, int* x0, int* x1, int* y0, int* y1) {
+    const AV2PixelRect r = av2_get_rutile_rect(cm, 0, u / cols, u / cols + 1, u % cols, u % cols + 1, size, size);
+    *x0 = r.left, *x1 = r.right >= w ? aw : r.right, *y0 = r.top, *y1 = r.bottom >= h ? ah : r.bottom;
+  };
+  auto copy_unit = [&](int u, const uint16_t* from) {
+    int x0, x1, y0, y1;
+    unit(u, &x0, &x1, &y0, &y1);
+    for (int y = y0; y < y1; y++)
+      std::memcpy(buf + static_cast<size_t>(y) * stride + x0, from + static_cast<size_t>(y) * stride + x0, sizeof(uint16_t) * (x1 - x0));
+  };
+  enum : uint8_t { kNone, kPc, kWns };  // a unit's type
+  enum { kFramePc, kFrameWns, kFrameSw, kFrameNone };
+  // Each unit's type for frame type ft, the units' WIENER_NONSEP errors ew: least squared error plus sse_per_bit x the
+  // symbols' bits at the frame's own odds (counted from a first choice at 1 bit a symbol). Returns J less the header.
+  auto decide = [&](int ft, const std::vector<double>& ew, std::vector<uint8_t>& type) {
+    type.assign(n, kNone);
+    int n0 = 0, k0 = 0, n1 = 0, k1 = 0;
+    double sse = 0;
+    for (int it = 0; it < 2; it++) {
+      const double p0 = it ? (k0 + 0.5) / (n0 + 1) : 0.5, p1 = it ? (k1 + 0.5) / (n1 + 1) : 0.5;
+      const double b0[2] = {-std::log2(1 - p0), -std::log2(p0)}, b1[2] = {-std::log2(1 - p1), -std::log2(p1)};
+      n0 = k0 = n1 = k1 = 0, sse = 0;
+      for (int u = 0; u < n; u++) {
+        double cost[3] = {1e300, 1e300, 1e300};
+        if (ft == kFrameSw) {  // switchable_flex_restore_cdf[0]: none?, then [1]: PC_WIENER?
+          cost[kNone] = e_no[u] + sse_per_bit * b0[1];
+          cost[kPc] = e_pc[u] + sse_per_bit * (b0[0] + b1[1]);
+          cost[kWns] = ew[u] + sse_per_bit * (b0[0] + b1[0]);
+        } else {
+          cost[kNone] = e_no[u] + sse_per_bit * b0[0];
+          cost[ft == kFramePc ? kPc : kWns] = (ft == kFramePc ? e_pc[u] : ew[u]) + sse_per_bit * b0[1];
+        }
+        const uint8_t t = cost[kPc] < cost[kNone] ? (cost[kWns] < cost[kPc] ? kWns : kPc) : cost[kWns] < cost[kNone] ? kWns : kNone;
+        type[u] = t;
+        sse += t == kNone ? e_no[u] : t == kPc ? e_pc[u] : ew[u];
+        if (ft == kFrameSw) {
+          n0++, k0 += t == kNone;
+          if (t != kNone) n1++, k1 += t == kPc;
+        } else {
+          n0++, k0 += t != kNone;
+        }
+      }
+    }
+    auto entropy = [](int k, int m) {
+      if (k == 0 || k == m) return 0.0;
+      const double q = static_cast<double>(k) / m;
+      return -m * (q * std::log2(q) + (1 - q) * std::log2(1 - q));
+    };
+    return sse + sse_per_bit * (entropy(k0, n0) + entropy(k1, n1));
+  };
+
+  struct Plan {
+    double j = 0;
+    int ft = kFrameNone, classes = 1, bits = 0;
+    std::vector<uint8_t> type;
+    WienerNonsepInfo f;
+  };
+  Plan best;
+  for (int u = 0; u < n; u++) best.j += static_cast<double>(e_no[u]);
+  best.type.assign(n, kNone);
+  {
+    Plan pc;
+    pc.ft = kFramePc;
+    pc.j = decide(kFramePc, {}, pc.type);
+    if (pc.j < best.j) best = std::move(pc);
+  }
+  const Plan alt = best;  // without WIENER_NONSEP: its J is exact
+  std::optional<celv2::StageScope> fit_cpu(celv2::Stage::LrFit);
+  // Per (unit, 16-class index) the normal equations (wiener_class_sums()) on the luma before restoration, the classes
+  // pass 1 left in wiener_class_id (WIENER_NONSEP's are the same).
+  const NonsepFilterConfig& nc = prm->nsfilter_config;
+  celv2::WienerTaps taps;
+  for (int i = 0; i < nc.num_pixels; i += 2, taps.nx++) {
+    taps.dx[taps.nx] = nc.config[i][NONSEP_ROW_ID] * stride + nc.config[i][NONSEP_COL_ID];
+    taps.px[taps.nx] = nc.config[i][NONSEP_BUF_POS];
+    if (taps.px[taps.nx] >= kWienerTaps || prm->ncoeffs > kWienerTaps) throw std::logic_error("luma Wiener taps past 18");
+  }
+  const int k = taps.nx + 1, pairs = k * (k + 1) / 2, set = get_filter_set_index(qindex, 0);
+  const uint8_t* const sub16 = get_pc_wiener_sub_classifier(16, set);
+  // shortcut: 16 x 153 sums a 128x128 unit (170 MB at 16K), fine to 8K; per-row sums if 16K needs it.
+  std::vector<int64_t>& sums = lr_sums_;
+  sums.resize(static_cast<size_t>(n) * 16 * pairs);
+  constexpr int ystep = 2;  // every other row: 8 sources -0.10% YUV against every row (33 frames), half the CPU
+  std::vector<double>& sd = lr_sd_;  // as doubles, times ystep (the rows not summed)
+  sd.resize(sums.size());
+  celv2::parallel(n, [&](int u) {
+    const AV2PixelRect r = av2_get_rutile_rect(cm, 0, u / cols, u / cols + 1, u % cols, u % cols + 1, size, size);
+    const size_t at = static_cast<size_t>(u) * 16 * pairs;
+    celv2::wiener_class_sums(kept.data(), stride, s16, s8, sstride, std::max(4, r.left), std::min(w - 4, r.right), std::max(4, r.top),
+                             std::min(h - 4, r.bottom), ystep, taps, cm->mi_params.wiener_class_id[0],
+                             cm->mi_params.wiener_class_id_stride[0], sub16, 16, &sums[at]);
+    for (size_t i = at; i < at + 16 * pairs; i++) sd[i] = static_cast<double>(sums[i]) * ystep;
+  });
+  // Pair q of the sums as the fit's matrix a (18 x 18) and vector v.
+  auto to_av = [&](const double* q, double* a, double* v) {
+    std::fill(a, a + kWienerTaps * kWienerTaps, 0.0), std::fill(v, v + kWienerTaps, 0.0);
+    for (int i = 0, p = 0; i < k; i++)
+      for (int j = i; j < k; j++, p++) {
+        if (j < k - 1) a[taps.px[i] * kWienerTaps + taps.px[j]] = a[taps.px[j] * kWienerTaps + taps.px[i]] = q[p];
+        else if (i < k - 1) v[taps.px[i]] = q[p];
+      }
+  };
+  std::vector<double> area(n);  // visible samples
+  for (int u = 0; u < n; u++) {
+    const AV2PixelRect r = av2_get_rutile_rect(cm, 0, u / cols, u / cols + 1, u % cols, u % cols + 1, size, size);
+    area[u] = static_cast<double>(std::min(r.right, w) - r.left) * (std::min(r.bottom, h) - r.top);
+  }
+  const int refs = frame_is_intra_only(cm) || frame_is_sframe(cm) ? 0 : cm->ref_frames_info.num_total_refs;
+  const int flag_bits = 1 + (refs > 0) + NUM_FILTER_CLASSES_BITS;  // frame_filters_on, temporal_pred_flag, the class count
+  const int dstride = cm->frame_filter_dictionary_stride;
+  std::vector<double> all16(16 * static_cast<size_t>(pairs), 0.0);
+  for (int u = 0; u < n; u++)
+    for (int p = 0; p < 16 * pairs; p++) all16[p] += sd[static_cast<size_t>(u) * 16 * pairs + p];
+  static constexpr int counts[] = {1, 2, 3, 4, 6, 8, 12, 16};
+  // Each class count on its own thread (its own filters and dictionary); the least J, in count order.
+  std::vector<Plan> plans(std::size(counts));
+  celv2::parallel(static_cast<int>(std::size(counts)), [&](int ci) {
+    const int classes = counts[ci];
+    Plan& plan = plans[ci];
+    plan.j = 1e300;
+    // The 16-class index's class at this count (the 16-class map refines every smaller one).
+    uint8_t merge[16] = {};
+    const uint8_t* const subc = get_pc_wiener_sub_classifier(classes, set);
+    for (int r = 0; r < NUM_PC_WIENER_LUT_CLASSES; r++) merge[sub16[r]] = subc[r];
+    for (int r = 0; r < NUM_PC_WIENER_LUT_CLASSES; r++)
+      if (merge[sub16[r]] != subc[r]) throw std::logic_error("PC_WIENER classes that do not merge");
+    std::vector<int16_t> dict(max_dictionary_size(0));
+    WienerNonsepInfo f = {};
+    WienerNonsepInfo* const ff = &f;
+    ff->num_classes = classes;
+    ff->num_ref_filters = set_frame_filter_dictionary(0, cm, classes, dict.data(), dstride);
+    int group_counts[NUM_MATCH_GROUPS];
+    set_group_counts(0, classes, ff->num_ref_filters, group_counts, nopcw);
+    const int matches = group_counts[0] + group_counts[1] + group_counts[2];
+    std::vector<double> ew(n), agg, coef, fit16;
+    std::vector<uint8_t> in(n, 1), type;
+    // Fit over every unit, then over the units that took WIENER_NONSEP.
+    for (int round = 0; round < 2; round++) {
+      // The fit units' sums per 16-class index (every unit's for the first round), then per class.
+      std::vector<double>& s16u = round ? fit16 : all16;
+      if (round) {
+        bool any = false;
+        fit16.assign(16 * static_cast<size_t>(pairs), 0.0);
+        for (int u = 0; u < n; u++) {
+          if (!in[u]) continue;
+          any = true;
+          for (int p = 0; p < 16 * pairs; p++) fit16[p] += sd[static_cast<size_t>(u) * 16 * pairs + p];
+        }
+        if (!any) break;
+      }
+      agg.assign(static_cast<size_t>(classes) * pairs, 0.0);
+      for (int c = 0; c < 16; c++)
+        for (int p = 0; p < pairs; p++) agg[static_cast<size_t>(merge[c]) * pairs + p] += s16u[static_cast<size_t>(c) * pairs + p];
+      // Class by class (the match indices predict from the classes before): the subset by error less bits at match 0,
+      // then of the 3 dictionary filters nearest it (L1) the one coding it in the fewest bits, or one of them as it is.
+      int bits = flag_bits;
+      for (int c = 0; c < classes; c++) {
+        double a[kWienerTaps * kWienerTaps], v[kWienerTaps];
+        to_av(&agg[static_cast<size_t>(c) * pairs], a, v);
+        int16_t fit[4][kWienerTaps] = {}, t[kWienerTaps] = {};
+        int s_best = 0, m_best = 0, b_best = 0;
+        double j_best = -1e300;
+        for (int s = 0; s < prm->nsubsets && s < 4; s++) {
+          wienerns_solve(a, v, prm, s, fit[s]);
+          const int nb = frame_filter_class_bits(0, c, 0, fit[s], nullptr, ff, dict.data());
+          const double j = wienerns_gain(a, v, fit[s]) - sse_per_bit * nb;
+          if (j > j_best) j_best = j, s_best = s, b_best = nb, std::copy_n(fit[s], kWienerTaps, t);
+        }
+        const double g_fit = wienerns_gain(a, v, fit[s_best]);
+        std::pair<int, int> nearest[3] = {{INT32_MAX, 0}, {INT32_MAX, 0}, {INT32_MAX, 0}};  // (L1, match)
+        for (int m = 0; m < matches; m++) {
+          if (m < group_counts[0] && m > c) continue;  // group 0: the zero filter and the classes before this one
+          const int16_t* const r = dict.data() + get_first_match_index(m, classes, nopcw) * dstride;
+          int d = 0;
+          for (int i = 0; i < prm->ncoeffs; i++) d += std::abs(r[i] - fit[s_best][i]);
+          if (d < nearest[2].first) {
+            nearest[2] = {d, m};
+            std::sort(nearest, nearest + 3);
+          }
+        }
+        for (const auto& [d, m] : nearest) {
+          if (d == INT32_MAX) continue;
+          const int nb = frame_filter_class_bits(0, c, m, fit[s_best], nullptr, ff, dict.data());
+          double j = g_fit - sse_per_bit * nb;
+          if (j > j_best) j_best = j, m_best = m, b_best = nb, std::copy_n(fit[s_best], kWienerTaps, t);
+          int16_t ref[kWienerTaps] = {};
+          const int ne = frame_filter_class_bits(0, c, m, nullptr, ref, ff, dict.data());
+          j = wienerns_gain(a, v, ref) - sse_per_bit * ne;
+          if (j > j_best) j_best = j, m_best = m, b_best = ne, std::copy_n(ref, kWienerTaps, t);
+        }
+        ff->match_indices[c] = m_best;
+        std::copy_n(t, prm->ncoeffs, nsfilter_taps(ff, c));
+        add_filter_to_dictionary(ff, c, prm, dict.data(), dstride, nopcw);  // the next classes may match it
+        bits += b_best;
+      }
+      // Each unit's estimated gain: its sums' dot product with each class's (2 x 128 t_i on the target pairs, -t_i t_j
+      // (twice off the diagonal) on the others) / 128^2, wienerns_gain()'s terms.
+      coef.assign(static_cast<size_t>(classes) * pairs, 0.0);
+      for (int c = 0; c < classes; c++) {
+        const int16_t* const t = const_nsfilter_taps(ff, c);
+        for (int i = 0, p = 0; i < k; i++)
+          for (int j = i; j < k; j++, p++)
+            if (j < k - 1) coef[static_cast<size_t>(c) * pairs + p] = -(i == j ? 1.0 : 2.0) * t[taps.px[i]] * t[taps.px[j]] / 16384;
+            else if (i < k - 1) coef[static_cast<size_t>(c) * pairs + p] = t[taps.px[i]] / 64.0;
+      }
+      // Four units at a time: four chains of additions, each in the same order as one unit alone (the same sums).
+      for (int u0 = 0; u0 < n; u0 += 4) {
+        const int m = std::min(4, n - u0);
+        double g[4] = {};
+        for (int c = 0; c < 16; c++) {
+          const double* const cf = &coef[static_cast<size_t>(merge[c]) * pairs];
+          const double* q[4];
+          for (int i = 0; i < 4; i++) q[i] = &sd[(static_cast<size_t>(u0 + std::min(i, m - 1)) * 16 + c) * pairs];
+          for (int p = 0; p < pairs; p++)
+            g[0] += q[0][p] * cf[p], g[1] += q[1][p] * cf[p], g[2] += q[2][p] * cf[p], g[3] += q[3][p] * cf[p];
+        }
+        for (int i = 0; i < m; i++)
+          ew[u0 + i] = static_cast<double>(e_no[u0 + i]) - g[i] + area[u0 + i] / 12.0;  // the filter's rounding: 1/12 a sample
+      }
+      for (const int ft : {kFrameSw, kFrameWns}) {
+        const double j = decide(ft, ew, type) + sse_per_bit * bits;
+        if (ft == kFrameSw)
+          for (int u = 0; u < n; u++) in[u] = type[u] == kWns;
+        if (j < plan.j) plan.j = j, plan.ft = ft, plan.classes = classes, plan.bits = bits, plan.type = type, plan.f = *ff;
+      }
+    }
+  });
+  for (Plan& plan : plans)
+    if (plan.j < best.j) best = std::move(plan);
+  fit_cpu.reset();
+
+  // The plan: WIENER_NONSEP's units filtered from the kept luma (chroma left as pass 1 made it), then each unit's exact
+  // error decides between what the estimate gave and the next best type.
+  std::vector<uint8_t>& types = best.type;
+  bool wns = false;
+  for (const uint8_t t : types) wns = wns || t == kWns;
+  std::vector<uint16_t>& pc_out = lr_pc_;
+  if (wns) {
+    pc_out.resize(kept.size());
+    constexpr int kBands = 32;  // one thread copying 2 x 8 MB at 1080p took 1.2 ms of the chain
+    celv2::parallel(kBands, [&](int i) {
+      const size_t lo = kept.size() * i / kBands, len = kept.size() * (i + 1) / kBands - lo;
+      std::memcpy(pc_out.data() + lo, buf + lo, sizeof(uint16_t) * len);
+      std::memcpy(buf + lo, kept.data() + lo, sizeof(uint16_t) * len);
+    });
+    *ff = best.f;
+    rsi->num_filter_classes = best.classes;
+    rsi->frame_restoration_type = RESTORE_WIENER_NONSEP;
+    for (int u = 0; u < n; u++) {
+      RestorationUnitInfo* const rui = &rsi->unit_info[u];
+      rui->restoration_type = types[u] == kWns ? RESTORE_WIENER_NONSEP : RESTORE_NONE;
+      rui->wienerns_info.num_classes = best.classes;
+      copy_nsfilter_taps(&rui->wienerns_info, ff);
+    }
+    RestorationType chroma[MAX_MB_PLANE] = {};
+    for (int p = 1; p < av2_num_planes(cm); p++)
+      chroma[p] = cm->rst_info[p].frame_restoration_type, cm->rst_info[p].frame_restoration_type = RESTORE_NONE;
+    if (lf_workers_.size() > 1)
+      av2_loop_restoration_filter_frame_mt(&b, cm, optimized, lf_workers_.data(), static_cast<int>(lf_workers_.size()), &lr_sync_,
+                                           &lr_ctxt_);
+    else
+      av2_loop_restoration_filter_frame(&b, cm, optimized, &lr_ctxt_);
+    for (int p = 1; p < av2_num_planes(cm); p++) cm->rst_info[p].frame_restoration_type = chroma[p];
+    std::vector<int64_t> e_wns(n, 0);
+    celv2::parallel(n, [&](int u) {
+      if (types[u] == kWns) {
+        int x0, x1, y0, y1;
+        unit(u, &x0, &x1, &y0, &y1);
+        int64_t e = 0;
+        for (int y = y0; y < std::min(y1, h); y++)
+          for (int x = x0; x < std::min(x1, w); x++) {
+            const size_t at = static_cast<size_t>(y) * sstride + x;
+            const int d = buf[static_cast<size_t>(y) * stride + x] - (s16 ? s16[at] : s8[at]);
+            e += d * d;
+          }
+        e_wns[u] = e;
+        if (best.ft == kFrameSw && e_pc[u] < e_no[u] && e_pc[u] < e) types[u] = kPc;
+        else if (e_no[u] <= e) types[u] = kNone, copy_unit(u, kept.data());
+      }
+      if (types[u] == kPc) copy_unit(u, pc_out.data());
+    });
+    // The plan's exact J against the best without WIENER_NONSEP (the fit's own estimate is optimistic).
+    // Units decided again on exact errors (WIENER_NONSEP only where it was measured).
+    std::vector<double> exact(n, 1e300);
+    for (int u = 0; u < n; u++)
+      if (types[u] == kWns) exact[u] = static_cast<double>(e_wns[u]);
+    std::vector<uint8_t> again;
+    const bool keep = decide(best.ft, exact, again) + sse_per_bit * best.bits < alt.j;
+    for (int u = 0; u < n; u++) {
+      const uint8_t t = keep ? again[u] : alt.type[u];
+      if (t != types[u]) copy_unit(u, t == kPc ? pc_out.data() : kept.data());
+      types[u] = t;
+    }
+  } else {
+    for (int u = 0; u < n; u++)
+      if (types[u] == kNone) copy_unit(u, kept.data());
+  }
+  int count[3] = {};
+  for (int u = 0; u < n; u++) {
+    count[types[u]]++;
+    rsi->unit_info[u].restoration_type = types[u] == kWns ? RESTORE_WIENER_NONSEP : types[u] == kPc ? RESTORE_PC_WIENER : RESTORE_NONE;
+  }
+  const int ft = count[kWns] ? (count[kPc] ? kFrameSw : kFrameWns) : count[kPc] ? kFramePc : kFrameNone;
+  rsi->frame_restoration_type = ft == kFrameSw    ? RESTORE_SWITCHABLE
+                                : ft == kFrameWns ? RESTORE_WIENER_NONSEP
+                                : ft == kFramePc  ? RESTORE_PC_WIENER
+                                                  : RESTORE_NONE;
+  // The tiles' deferred symbols, four a unit (BlockWriter::lr_units()): PC_WIENER flag, WIENER_NONSEP flag, then
+  // SWITCHABLE's two; the ones this frame type does not code kLrSkip.
+  lr_flags_.assign(static_cast<size_t>(4) * n, kLrSkip);
+  for (int u = 0; u < n; u++) {
+    uint8_t* const f = &lr_flags_[static_cast<size_t>(4) * u];
+    if (ft == kFramePc) f[0] = types[u] == kPc;
+    if (ft == kFrameWns) f[1] = types[u] == kWns;
+    if (ft == kFrameSw) {
+      f[2] = types[u] == kNone;
+      if (types[u] != kNone) f[3] = types[u] == kPc;
+    }
+  }
+  if (count[kWns]) {
+    rsi->frame_filters_on = 1;
+    rsi->temporal_pred_flag = 0, rsi->rst_ref_pic_idx = 0;
+    if (frame_filter_bits(0) + flag_bits != best.bits) throw std::logic_error("luma frame filter bits other than counted");
+  } else {
+    rsi->frame_filters_on = 0;
+    cm->cur_frame->rst_info[0].frame_filters_on = 0;
+  }
+  if (const char* e = std::getenv("CELV2_GOP_LOG"); e && *e && *e != '0')
+    std::fprintf(stderr, "celv2enc: lr frame %d type %d classes %d units %d pc %d wns %d\n",
+                 static_cast<int>(cm->current_frame.display_order_hint), static_cast<int>(rsi->frame_restoration_type),
+                 count[kWns] ? best.classes : 0, n, count[kPc], count[kWns]);
 }
 
 #ifdef CELV2_ORACLE
 #include "filter_import.inc"
 #endif
+
+void CodecState::copy_recon(Frame420& dst) const {
+  const AV2_COMMON* const cm = cm_;
+  const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
+  const int cw = (dst.width + 1) / 2, ch = (dst.height + 1) / 2;
+  const int bands = std::max(1, std::min(static_cast<int>(std::thread::hardware_concurrency()), ch / 32));
+  const int shift = dst.bit_depth - 8;
+  auto copy_band = [&](int k) {
+    auto row = [&](std::vector<uint8_t>& p8, std::vector<uint16_t>& p16, size_t at, const uint16_t* s, int n) {
+      if (!shift) {
+        for (int c = 0; c < n; c++) p8[at + c] = static_cast<uint8_t>(s[c]);
+        return;
+      }
+      for (int c = 0; c < n; c++)
+        p16[at + c] = s[c], p8[at + c] = static_cast<uint8_t>(std::min(255, (s[c] + (1 << (shift - 1))) >> shift));
+    };
+    for (int r = ch * k / bands; r < ch * (k + 1) / bands; r++) {
+      for (int rr = 2 * r; rr < std::min(2 * r + 2, dst.height); rr++)
+        row(dst.y, dst.hy, static_cast<size_t>(rr) * dst.stride_y(), b.y_buffer + static_cast<size_t>(rr) * b.y_stride,
+            dst.width);
+      row(dst.u, dst.hu, static_cast<size_t>(r) * dst.stride_uv(), b.u_buffer + static_cast<size_t>(r) * b.uv_stride, cw);
+      row(dst.v, dst.hv, static_cast<size_t>(r) * dst.stride_uv(), b.v_buffer + static_cast<size_t>(r) * b.uv_stride, cw);
+    }
+  };
+  celv2::parallel(bands, copy_band);
+  pad_frame(dst);
+}
 
 void CodecState::end_frame(const Frame420& src, double sse_per_bit) {
   AV2_COMMON* const cm = cm_;
@@ -1575,20 +2566,23 @@ void CodecState::end_frame(const Frame420& src, double sse_per_bit) {
   // frame before it becomes a reference.
 #ifdef CELV2_ORACLE
   const bool own_filters = !celv2::oracle::filters();
-  if (!own_filters) import_end_frame();
+  if (!own_filters) import_end_frame(src, sse_per_bit);
 #else
   constexpr bool own_filters = true;
 #endif
   if (own_filters) {
   if (cm->lf.apply_deblocking_filter[0] || cm->lf.apply_deblocking_filter[1]) {
+    celv2::WallScope wall(celv2::Wall::FDeblock);
     if (cfg_.deblock_search) pick_deblock(src);
     deblock();
   }
+
   // av2_decode_tg_tiles_and_wrapup(): CCSO reads the deblocked luma, before CDEF.
   std::vector<uint16_t>& ccso_luma = ccso_luma_;
   const CcsoInfo* const ci = &cm->ccso_info;
   const bool use_ccso = ci->ccso_enable[0] || ci->ccso_enable[1] || ci->ccso_enable[2];
   if (use_ccso) {
+    celv2::WallScope wall(celv2::Wall::FPad);
     // The luma padded as extend_ccso_border() pads it, in bands of rows on several threads (one
     // thread, with a fresh buffer each frame, took about 0.1 s a 16K frame).
     const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
@@ -1612,10 +2606,10 @@ void CodecState::end_frame(const Frame420& src, double sse_per_bit) {
   // boundaries are saved before CDEF and the CCSO output's after (unless no filter runs between).
   const bool lr = cm->rst_info[0].frame_restoration_type != RESTORE_NONE;
   if (lr) av2_loop_restoration_save_boundary_lines(&cm->cur_frame->buf, cm, 0);
-  if (cm->seq_params.enable_cdef) cdef(src);
+  if (cm->seq_params.enable_cdef) cdef(src, sse_per_bit);
   if (use_ccso) ccso(src, ccso_luma, sse_per_bit);
   if (lr) {
-    const bool optimized = !cm->seq_params.disable_loopfilters_across_tiles && !use_ccso &&
+    const bool optimized = !cm->seq_params.disable_loopfilters_across_tiles && !ci->ccso_frame_flag &&  // ccso() may turn every plane off
                            !(cm->seq_params.enable_cdef && cm->cdef_info.cdef_frame_enable);
     if (!optimized) av2_loop_restoration_save_boundary_lines(&cm->cur_frame->buf, cm, 1);
     restore(src, optimized, sse_per_bit);
@@ -1626,28 +2620,7 @@ void CodecState::end_frame(const Frame420& src, double sse_per_bit) {
 
   // The 8-bit copy (and above 8 bits the full-depth one), in bands of rows on several threads (one
   // thread took 0.16 s a 16K frame).
-  const YV12_BUFFER_CONFIG& b = cm->cur_frame->buf;
-  const int cw = (recon_.width + 1) / 2, ch = (recon_.height + 1) / 2;
-  const int bands = std::max(1, std::min(static_cast<int>(std::thread::hardware_concurrency()), ch / 32));
-  const int shift = recon_.bit_depth - 8;
-  auto copy_band = [&](int k) {
-    auto row = [&](std::vector<uint8_t>& p8, std::vector<uint16_t>& p16, size_t at, const uint16_t* s, int n) {
-      if (!shift) {
-        for (int c = 0; c < n; c++) p8[at + c] = static_cast<uint8_t>(s[c]);
-        return;
-      }
-      for (int c = 0; c < n; c++)
-        p16[at + c] = s[c], p8[at + c] = static_cast<uint8_t>(std::min(255, (s[c] + (1 << (shift - 1))) >> shift));
-    };
-    for (int r = ch * k / bands; r < ch * (k + 1) / bands; r++) {
-      for (int rr = 2 * r; rr < std::min(2 * r + 2, recon_.height); rr++)
-        row(recon_.y, recon_.hy, static_cast<size_t>(rr) * recon_.stride_y(), b.y_buffer + static_cast<size_t>(rr) * b.y_stride,
-            recon_.width);
-      row(recon_.u, recon_.hu, static_cast<size_t>(r) * recon_.stride_uv(), b.u_buffer + static_cast<size_t>(r) * b.uv_stride, cw);
-      row(recon_.v, recon_.hv, static_cast<size_t>(r) * recon_.stride_uv(), b.v_buffer + static_cast<size_t>(r) * b.uv_stride, cw);
-    }
-  };
-  celv2::parallel(bands, copy_band);
-  pad_frame(recon_);
+  celv2::WallScope copy_wall(celv2::Wall::FCopy);
+  copy_recon(recon_);
   frame_number_++;
 }

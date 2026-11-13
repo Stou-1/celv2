@@ -1,20 +1,28 @@
 Third-party software in celv2enc.exe and the runtime files next to it
 ====================================================================
 
-AVM (AV2 reference decoder library, v1.0.0)
-  Statically linked. Its license and the AOMedia Patent License 1.0 are in
-  third_party\avm\LICENSE and third_party\avm\PATENTS.
+celv2enc.exe is CelV2 (BSD 3-Clause Clear License, LICENSE at the top of this package), built with
+MSVC and the DLL C/C++ runtime (/MD); the runtime DLLs it needs are next to it (below). It is
+statically linked with the libraries below; license texts that are not in third_party\avm\ are in
+licenses\, copied from the AVM source tree that was built.
 
-NVIDIA CUDA Runtime (cudart, static)
-  celv2enc.exe contains the CUDA Runtime (cudart_static, CUDA Toolkit 13.3.1, cudart 13.3.29)
-  and GPU code compiled with the CUDA Toolkit. These distributable parts are redistributed as
-  object code inside celv2enc.exe under the NVIDIA CUDA Toolkit End User License Agreement
-  (EULA, section 1.1 and Attachment A, "CUDA Runtime"): https://docs.nvidia.com/cuda/eula/
-  No NVIDIA DLL is shipped. The GPU driver (nvcuda.dll) comes with the user's NVIDIA driver.
+AVM (AV2 reference software, v1.0.0, https://github.com/AOMediaCodec/avm)
+  BSD 3-Clause Clear License and the Alliance for Open Media Patent License 1.0:
+  third_party\avm\LICENSE and third_party\avm\PATENTS. Built without TensorFlow Lite
+  (CONFIG_TENSORFLOW_LITE=0).
+
+Code from AVM's third_party folder that AVM builds into its library:
+  vector                            Copyright (c) 2016 Peter Goldsborough, MIT             licenses\vector.txt
+  x86inc (assembly macros)          Copyright (C) 2005-2012 x264 project, ISC              licenses\x86inc.txt
+
+Vulkan headers (Khronos, Apache-2.0 OR MIT) are compiled in for the GPU path. No Vulkan DLL is
+shipped: celv2enc loads the system's vulkan-1.dll (installed with the GPU driver) at run time, and
+uses the CPU when there is none.
 
 Microsoft Visual C++ runtime (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll)
-  Redistributed unchanged from Visual Studio's "VC\Redist" folder, as allowed by Microsoft's
-  Visual Studio license terms for redistributable files. Copyright (c) Microsoft Corporation.
+  Used by celv2enc.exe and av2_mux.exe. Redistributed unchanged from Visual Studio's "VC\Redist"
+  folder, as allowed by Microsoft's Visual Studio license terms for redistributable files.
+  Copyright (c) Microsoft Corporation.
 
 av2_mux.exe
   See third_party\av2-tools\ (LICENSE, PATENTS, README.txt, THIRD_PARTY_NOTICES.txt).

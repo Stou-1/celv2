@@ -97,6 +97,8 @@ class BlockWriter {
 
  private:
   void intra_modes(const BlockDecision& d);
+  // decodemv.c read_cdef(): logs where the 64x64 unit's strength index is read (SymbolLog::cdef()).
+  void cdef_index();
   // decodemv.c read_ccso(): every CCSO unit's flag on, at its first block.
   void ccso();
   void delta_qindex();
@@ -134,7 +136,7 @@ class BlockWriter {
   long long block_area() const;
   void import_single(const BlockDecision& d, MV_REFERENCE_FRAME ref_frame, MV gmv, MV wanted, int& near_idx, int& new_idx,
                      bool& global, bool& amvd, MvSubpelPrecision& new_prec);
-  void import_bawp(const OracleBlock& b);
+  void import_bawp(const OracleBlock& b, BLOCK_SIZE bsize, MV mv);
   void import_magnitude(MV diff);
   void import_compound(const BlockDecision& d, int r0, MV_REFERENCE_FRAME ref_frame, int16_t* inter_mode_ctx,
                        int_mv (*ref_mvs)[MAX_MV_REF_CANDIDATES], int* pts0, int* pts0_inref);

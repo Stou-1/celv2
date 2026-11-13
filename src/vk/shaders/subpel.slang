@@ -1,4 +1,4 @@
-// subpel_kernel (gpu/kernels.cu): quarter-pel phases 1..15 of src (phase 0 is src) at dst + k * phase.
+// subpel_kernel (gpu/kernels.cu, removed 2026-11-08): quarter-pel phases 1..15 of src (phase 0 is src) at dst + k * phase.
 import common;
 
 struct Params {

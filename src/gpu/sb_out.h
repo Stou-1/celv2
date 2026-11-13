@@ -1,4 +1,4 @@
-// A superblock's decision as the GPU kernels write it (CUDA and Vulkan; vk/shaders/finalize.slang
+// A superblock's decision as the GPU kernels write it (Vulkan; vk/shaders/finalize.slang
 // mirrors this layout field for field).
 #pragma once
 #include <cstdint>

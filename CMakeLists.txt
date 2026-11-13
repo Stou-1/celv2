@@ -1,11 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
-project(CelV2 LANGUAGES C CXX CUDA)
+project(CelV2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-# Turing (75), Ampere (80, 86), Ada (89), Hopper (90): SASS only; Blackwell (120): SASS + PTX (forward-compatible).
-set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 120)
 add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
 # 8-wide float loops in fwd_dct; MSVC does not contract to FMA under /fp:precise, so results match SSE2.
 add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>")
@@ -42,6 +39,10 @@ add_library(celv2_core STATIC
   src/core/encoder.cpp
   src/core/global_motion.cpp
   src/core/rd_pass.cpp
+  src/core/rd_int.cpp
+  src/core/wiener_sums.cpp
+  src/core/cdef_search.cpp
+  src/core/real_trellis.cpp
   src/core/quant.cpp
   src/core/ccso_search.cpp
   src/core/ccso_apply.cpp
@@ -50,6 +51,7 @@ add_library(celv2_core STATIC
   src/core/threads.cpp
   src/core/scene_cut.cpp
   src/core/transform.cpp
+  src/core/transform_avx512.cpp
   src/core/ist.cpp
   src/gpu/decision_map.cpp
   ${AVM_ROOT}/common/md5_utils.c)
@@ -75,10 +77,8 @@ if(CELV2_ORACLE)
   target_link_libraries(oracle_dump PRIVATE "${AVM_INSPECT_BUILD}/avm.lib")
 endif()
 
-# GPU decision engine (CUDA). kernels_ref.cpp is the CPU reference used by tests.
+# The decision engines' common part and the CPU engine. kernels_ref.cpp is the CPU reference used by tests.
 add_library(celv2_gpu STATIC
-  src/gpu/engine.cu
-  src/gpu/kernels.cu
   src/gpu/kernels_ref.cpp
   src/gpu/cpu_engine.cpp
   src/pipeline.cpp
@@ -91,12 +91,28 @@ if(CELV2_VULKAN)
   add_library(celv2_vk STATIC src/vk/vk_context.cpp src/vk/vk_kernels.cpp src/vk/vk_engine.cpp)
   target_include_directories(celv2_vk PUBLIC src "${CELV2_VK_INCLUDE}")
   target_link_libraries(celv2_vk PUBLIC celv2_core)
-  celv2_vk_shaders(celv2_vk downsample subpel me satd cost finalize)
+  celv2_vk_shaders(celv2_vk downsample subpel me me_wide satd cost finalize)
   target_link_libraries(celv2_gpu PUBLIC celv2_vk)
   target_compile_definitions(celv2_gpu PRIVATE CELV2_HAVE_VULKAN)
-  add_executable(engine_bench tools/engine_bench.cpp)  # the decision engines alone, Vulkan against the CPU
+  add_executable(engine_bench tools/engine_bench.cpp)  # the decision engines alone, Vulkan and the CPU
   target_link_libraries(engine_bench PRIVATE celv2_gpu celv2_vk)
+  # C17 step 0b's throwaway GPU kernel (tools/c17): transform and TCQ of dumped residuals.
+  set(_c17_spv "${CMAKE_BINARY_DIR}/vk_shaders/c17_tx.spv")
+  set(_c17_hdr "${CMAKE_BINARY_DIR}/vk_shaders/c17_tx.h")
+  add_custom_command(OUTPUT "${_c17_hdr}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/vk_shaders"
+    COMMAND "${CELV2_SLANGC}" "${CMAKE_SOURCE_DIR}/tools/c17/c17_tx.slang" -target spirv -profile spirv_1_5 -entry main -stage compute -O3 -o "${_c17_spv}"
+    COMMAND "${CMAKE_COMMAND}" -DSPV=${_c17_spv} -DHDR=${_c17_hdr} -DNAME=c17_tx -P "${CMAKE_SOURCE_DIR}/cmake/spv_header.cmake"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tools/c17/c17_tx.slang" "${CMAKE_SOURCE_DIR}/cmake/spv_header.cmake"
+    COMMENT "slangc c17_tx.slang")
+  add_executable(c17_gpu tools/c17/c17_gpu.cpp "${_c17_hdr}")
+  target_include_directories(c17_gpu PRIVATE "${CMAKE_BINARY_DIR}")
+  target_link_libraries(c17_gpu PRIVATE celv2_vk)
 endif()
+
+# C17 step 0b's throwaway benches (tools/c17): the RD pass's transforms on dumped residuals.
+add_executable(c17_bench tools/c17/c17_bench.cpp)
+target_link_libraries(c17_bench PRIVATE celv2_core)
 
 add_executable(celv2enc src/main.cpp src/utf8.manifest)
 target_link_libraries(celv2enc PRIVATE celv2_core celv2_gpu)
@@ -140,11 +156,16 @@ celv2_test(test_ccso_apply)
 celv2_test(test_tpl)
 celv2_test(test_temporal_filter)
 celv2_test(test_rd_pass)
+celv2_test(test_rd_int)
+celv2_test(test_wiener_sums)
+celv2_test(test_cdef_search)
+celv2_test(test_real_trellis)
 celv2_test(test_threads)
 celv2_test(test_size_control)
 if(CELV2_VULKAN)
   celv2_test(test_vk_kernels)
   target_link_libraries(test_vk_kernels PRIVATE celv2_vk)
+  celv2_vk_shaders(test_vk_kernels probe_plain probe_slm probe_shuffle probe_scratch probe_int64)  # probes_on_queues
 endif()
 target_compile_definitions(test_cli PRIVATE CELV2ENC_PATH="$<TARGET_FILE:celv2enc>")
 add_dependencies(test_cli celv2enc)

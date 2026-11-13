@@ -1,5 +1,5 @@
-// The decision engine on Vulkan (plan step 5): GpuEngine's work with the vk::Kernels, so the same
-// decisions on any Vulkan GPU (the RTX 5090, the Arc Pro B50), queued as GpuEngine queues them.
+// The decision engine on Vulkan (plan step 5): the CUDA engine's work (removed 2026-11-08) with the vk::Kernels, so the same
+// decisions on any Vulkan GPU (the RTX 5090, the Arc Pro B50), queued as that engine queued them.
 #pragma once
 #include <cstdint>
 #include <memory>

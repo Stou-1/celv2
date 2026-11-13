@@ -113,6 +113,9 @@ namespace CelV2.Tests
                 var workers = (ComboBox)d.Controls.Find("workers", true).Single();
                 Check.Equal(0, workers.SelectedIndex, "workers: 自動 by default");
                 workers.SelectedIndex = 2;  // 2
+                var low = (CheckBox)d.Controls.Find("lowPriority", true).Single();
+                Check.That(low.Checked, "low priority on by default");
+                low.Checked = false;
                 Check.Equal(5, ((TabControl)d.Controls.Find("tabs", true).Single()).TabPages.Count, "tabs");
                 var r = d.Result;
                 Check.Equal(80, r.SizeCapPercent, "Result.SizeCapPercent");
@@ -123,6 +126,7 @@ namespace CelV2.Tests
                 Check.Equal(-3, r.DeblockDelta, "Result.DeblockDelta");
                 Check.That(!r.Cdef, "Result.Cdef");
                 Check.Equal(25, r.Grain, "Result.Grain");
+                Check.That(!r.LowPriority, "Result.LowPriority");
                 Check.Equal(TileMode.Two, r.TileRows, "Result.TileRows");
                 Check.Equal(ParallelMode.Off, r.ParallelB, "Result.ParallelB");
                 Check.Equal(256, r.AudioKbps, "Result.AudioKbps");

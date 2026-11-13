@@ -1,6 +1,7 @@
 // One encoding pipeline: a decision engine (GPU or CPU) + CPU encoder, frame by frame (used by
 // celv2enc and tests).
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -11,15 +12,13 @@
 #include "gpu/decision_engine.h"
 
 // Vulkan / Vulkan2: the Vulkan engine on the first / second discrete GPU. Gpu: Vulkan under the name
-// saved settings and scripts use. Cuda: the CUDA engine, kept for one release to compare with.
-enum class Device { Auto, Gpu, Cuda, Cpu, Vulkan, Vulkan2 };
+// saved settings and scripts use.
+enum class Device { Auto, Gpu, Cpu, Vulkan, Vulkan2 };
 
 // Auto: the Vulkan engine on the first discrete GPU, else CpuEngine. Gpu: that engine, or
-// std::runtime_error ("no usable GPU: <reason>"). Cuda: GpuEngine, or std::runtime_error ("no usable
-// CUDA GPU: <reason>") if probe() fails; only Cuda calls probe. Cpu: CpuEngine.
-// description receives the one-line choice ("decisions on Vulkan / CUDA / CPU (...)").
+// std::runtime_error ("no usable GPU: <reason>"). Cpu: CpuEngine.
+// description receives the one-line choice ("decisions on Vulkan / CPU (...)").
 std::unique_ptr<DecisionEngine> make_engine(Device device, int width, int height, int tile_threads,
-                                            const std::function<ProbeResult()>& probe,
                                             std::string* description, int engines = 1);
 
 // The decision devices this machine can use, as (--device value, name): the first two Vulkan GPUs
@@ -82,6 +81,12 @@ class Pipeline {
   // CodecState::begin_frame); display order hint -1: none since the keyframe.
   Recon last_shown_{-1, -1, Frame420{}};
   std::vector<std::unique_ptr<Encoder>> shadows_;  // code_group's copies of enc_'s state
+  // CELV2_PROFILE: the last launch()'s wall time and end, for collect()'s engine wall times.
+  double launch_ms_ = 0;
+  std::chrono::steady_clock::time_point launch_end_{};
+  void launch(const Frame420& src, const std::vector<const Frame420*>& refs, int qindex, DecisionMap& dm,
+              const std::vector<long long>& keys, long long display);
+  void engine_collect(DecisionMap& dm, RowGate& gate);  // engine_->collect, timed
 
   // The reconstructions (and keys) of the references Encoder::begin() reported.
   void references(const std::vector<int>& hints, std::vector<const Frame420*>& refs, std::vector<long long>& keys) const;
@@ -91,5 +96,5 @@ class Pipeline {
   // its row reaches gate when cfg_.rd_pass is on, each superblock at qindex plus its sb_dq offset.
   void collect(DecisionMap& dm, RowGate& gate, const Frame420& src, const std::vector<const Frame420*>& refs,
                int qindex, const std::vector<int>& sb_dq, const celv2::AqMap* map = nullptr, bool screen = false,
-               const celv2::IntrabcIndex* ibc = nullptr);
+               const celv2::IntrabcIndex* ibc = nullptr, const SideCosts* side = nullptr);
 };

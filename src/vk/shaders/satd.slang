@@ -1,4 +1,4 @@
-// satd_kernel (gpu/kernels.cu): SATD of n block pairs, each a 64x64 tile (stride 64) of w4 x h4 4x4s.
+// satd_kernel (gpu/kernels.cu, removed 2026-11-08): SATD of n block pairs, each a 64x64 tile (stride 64) of w4 x h4 4x4s.
 import common;
 
 struct Params {

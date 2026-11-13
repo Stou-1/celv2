@@ -48,7 +48,7 @@ int wmain(int argc, wchar_t** argv) {
     THREADENTRY32 te{sizeof(te)};
     for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
       if (te.th32OwnerProcessID == pi.dwProcessId && !threads.count(te.th32ThreadID))
-        if (HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID))
+        if (HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | SYNCHRONIZE, FALSE, te.th32ThreadID))
           threads[te.th32ThreadID] = h;
     CloseHandle(snap);
     HMODULE mods[1024];
@@ -66,9 +66,10 @@ int wmain(int argc, wchar_t** argv) {
   };
   uint64_t samples = 0;
   for (int tick = 0; WaitForSingleObject(pi.hProcess, 1) == WAIT_TIMEOUT; tick++) {
-    if (tick % 50 == 0) refresh();
+    // Often: threads that live a frame (the RD pass starts its own each frame) were missed at every 50 ticks.
+    if (tick % 5 == 0) refresh();
     for (auto it = threads.begin(); it != threads.end();) {
-      if (SuspendThread(it->second) == static_cast<DWORD>(-1)) {
+      if (WaitForSingleObject(it->second, 0) == WAIT_OBJECT_0 || SuspendThread(it->second) == static_cast<DWORD>(-1)) {
         CloseHandle(it->second);
         it = threads.erase(it);
         continue;
@@ -111,9 +112,19 @@ int wmain(int argc, wchar_t** argv) {
     si2->MaxNameLen = 511;
     DWORD64 disp = 0;
     std::string name = SymFromAddr(sym, addr, &disp, si2) ? std::string(si2->Name) : "?";
+    if (name.rfind("<lambda_", 0) == 0) {  // a lambda's name says nothing: its source line where it starts
+      IMAGEHLP_LINE64 line{sizeof(IMAGEHLP_LINE64)};
+      DWORD ldisp = 0;
+      if (SymGetLineFromAddr64(sym, si2->Address, &ldisp, &line)) {
+        const std::string f = line.FileName;
+        name += " (" + f.substr(f.find_last_of("\\/") + 1) + ":" + std::to_string(line.LineNumber) + ")";
+      }
+    }
     const bool sys = mod == "ntdll.dll" || mod == "KERNELBASE.dll" || mod == "kernel32.dll" || mod == "KERNEL32.DLL";
-    if (sys && (name.find("Wait") != std::string::npos || name.find("Delay") != std::string::npos ||
-                name.find("Remove") != std::string::npos || name.find("Sleep") != std::string::npos)) {
+    // win32u's message and synchronization waits (the GPU driver's threads) are waiting too
+    const bool win32u = mod == "win32u.dll" && (name.find("GetMessage") != std::string::npos || name.find("Wait") != std::string::npos);
+    if (win32u || (sys && (name.find("Wait") != std::string::npos || name.find("Delay") != std::string::npos ||
+                           name.find("Remove") != std::string::npos || name.find("Sleep") != std::string::npos))) {
       waiting += n;
       continue;
     }

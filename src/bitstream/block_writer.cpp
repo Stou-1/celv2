@@ -4,6 +4,7 @@
 
 #include "bitstream/block_writer.h"
 
+#include "core/profile.h"
 #include "core/warp_fit.h"
 #ifdef CELV2_ORACLE
 #include "oracle.h"
@@ -19,6 +20,7 @@
 
 extern "C" {
 #include "av2/common/ccso.h"
+#include "av2/common/cdef.h"
 #include "av2/common/cfl.h"
 #include "av2/common/hr_coding.h"
 #include "av2/common/entropymv.h"
@@ -160,9 +162,7 @@ void BlockWriter::intra_frame_mode_info(const BlockDecision& d) {
   mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = 0;
   if (xd->tree_type != CHROMA_PART) mbmi->segment_id = 0;
   mbmi->seg_id_predicted = 0;
-#ifdef CELV2_ORACLE
-  if (celv2::oracle::filters() && xd->tree_type != CHROMA_PART) import_cdef();
-#endif
+  if (xd->tree_type != CHROMA_PART) cdef_index();
   if (cm->seq_params.enable_ccso && xd->tree_type != CHROMA_PART) ccso();
   if (xd->tree_type != CHROMA_PART) delta_qindex();
   mbmi->current_qindex = xd->current_base_qindex;
@@ -492,6 +492,24 @@ double BlockWriter::mv_precision_bits(MvSubpelPrecision p) {
   return bits;
 }
 
+// read_cdef(): the 64x64 unit's strength index is read at its first block that codes a residual (CDEF
+// on skipped blocks stays off, CodecState::cdef()); the index itself is decided after the tile is
+// coded, so the block's position is logged for SymbolLog::replay() (frame enable: decided there too).
+void BlockWriter::cdef_index() {
+#ifdef CELV2_ORACLE
+  if (celv2::oracle::filters()) return import_cdef();
+#endif
+  AV2_COMMON* const cm = st_.cm();
+  MACROBLOCKD* const xd = xd_;
+  if (!cm->seq_params.enable_cdef || cm->features.coded_lossless) return;
+  const int sb_mask = cm->mib_size - 1;
+  if (!(xd->mi_row & sb_mask) && !(xd->mi_col & sb_mask)) av2_zero(xd->cdef_transmitted);
+  const int index = av2_get_cdef_transmitted_index(xd->mi_row, xd->mi_col);
+  if (xd->cdef_transmitted[index] || xd->mi[0]->skip_txfm[0]) return;
+  w_->cdef(xd->mi_row, xd->mi_col);
+  xd->cdef_transmitted[index] = true;
+}
+
 void BlockWriter::ccso() {
   AV2_COMMON* const cm = st_.cm();
   MACROBLOCKD* const xd = xd_;
@@ -511,14 +529,15 @@ void BlockWriter::ccso() {
     auto get = [p](const MB_MODE_INFO* m) { return p == 0 ? m->ccso_blk_y : p == 1 ? m->ccso_blk_u : m->ccso_blk_v; };
     auto set = [p](MB_MODE_INFO* m, int v) { (p == 0 ? void(m->ccso_blk_y = v) : p == 1 ? void(m->ccso_blk_u = v) : void(m->ccso_blk_v = v)); };
     if (unit_start) {
+      int blk_idc = 1;  // provisional: CodecState::ccso() decides the flag, coded at SymbolLog::replay()
 #ifdef CELV2_ORACLE
-      const int f0 = 1 << log2 >> MI_SIZE_LOG2;
-      const int blk_idc = of ? of->ccso_flags[p][(mi_row / f0) * ((mi->mi_cols + f0 - 1) / f0) + mi_col / f0] : 1;
-      if (!of || !cm->ccso_info.sb_reuse_ccso[p])
-#else
-      constexpr int blk_idc = 1;
+      if (of) {
+        const int f0 = 1 << log2 >> MI_SIZE_LOG2;
+        blk_idc = !celv2::oracle::filt_cut('o') ? of->ccso_flags[p][(mi_row / f0) * ((mi->mi_cols + f0 - 1) / f0) + mi_col / f0] : 1;
+        if (!cm->ccso_info.sb_reuse_ccso[p]) w_->symbol(blk_idc, xd->tile_ctx->ccso_cdf[p][av2_get_ccso_context(cm, xd, p)], 2);
+      } else
 #endif
-      w_->symbol(blk_idc, xd->tile_ctx->ccso_cdf[p][av2_get_ccso_context(cm, xd, p)], 2);
+      w_->ccso(p, first, xd->neighbors[0], xd->neighbors[1]);
       (p == 0 ? xd->ccso_blk_y : p == 1 ? xd->ccso_blk_u : xd->ccso_blk_v) = blk_idc;
       set(first, blk_idc);
       // span_ccso()
@@ -862,9 +881,7 @@ void BlockWriter::inter_frame_mode_info(const BlockDecision& d) {
     w_->symbol(skip_txfm, ec_ctx->skip_txfm_cdfs[av2_get_skip_txfm_context(xd)], 2);
   }
   mbmi->skip_txfm[xd->tree_type == CHROMA_PART] = skip_txfm;
-#ifdef CELV2_ORACLE
-  if (celv2::oracle::filters() && xd->tree_type != CHROMA_PART) import_cdef();
-#endif
+  if (xd->tree_type != CHROMA_PART) cdef_index();
   if (cm->seq_params.enable_ccso && xd->tree_type != CHROMA_PART) ccso();  // after read_cdef()
   if (xd->tree_type != CHROMA_PART) delta_qindex();
   mbmi->six_param_warp_model_flag = 0;
@@ -2008,11 +2025,25 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
       // and the bounds only fall (best falls, a later index costs more bits).
       std::pair<MV, double> seen[MAX_REF_MV_STACK_SIZE + 1];
       int nseen = 0;
+      // CELV2_RD_STATS: this search's rd_cost_ calls, and those on an MV it costed before.
+      const bool stats = celv2::rd_stats();
+      MV costed[64];
+      int ncosted = 0;
+      auto note = [&](MV mv) {
+        if (!stats) return;
+        celv2::count(celv2::Count::NewmvCalls);
+        if (std::any_of(costed, costed + ncosted, [&](const MV& o) { return o.row == mv.row && o.col == mv.col; }))
+          celv2::count(celv2::Count::NewmvRepeats);
+        else if (ncosted < 64)
+          costed[ncosted++] = mv;
+      };
+      if (stats) celv2::count(celv2::Count::NewmvBlocks);
       auto rd = [&](MV mv, double bound) {
         for (int k = 0; k < nseen; k++)
           if (seen[k].first.row == mv.row && seen[k].first.col == mv.col) return seen[k].second;
         const int_mv keep = mbmi->mv[0];
         mbmi->mv[0].as_mv = mv;
+        note(mv);
         const double v = rd_cost_(bound);
         mbmi->mv[0] = keep;
         seen[nseen++] = {mv, v};
@@ -2043,6 +2074,7 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
             tried[ntried++] = t;
             const double bits = kRdBitWeight * (comp_bits(t.row - c.row) + comp_bits(t.col - c.col) + new_idx + 1);
             mbmi->mv[0].as_mv = t;
+            note(t);
             const double j = rd_cost_(best - bits) + bits;
             if (j < best) best = j, next = t;
           }
@@ -2098,6 +2130,7 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
           const double bits = kRdBitWeight * amvd_bits(r, q);
           mbmi->mv[0].as_mv.row = static_cast<int16_t>(c.row + get_mvd_from_amvd_index(r));
           mbmi->mv[0].as_mv.col = static_cast<int16_t>(c.col + get_mvd_from_amvd_index(q));
+          note(mbmi->mv[0].as_mv);
           return rd_cost_(std::min(abest, best) - bits) + bits;
         };
         abest = trial(ir, ic);
@@ -2202,7 +2235,7 @@ void BlockWriter::inter_block_mode_info(const BlockDecision& d, bool force_near,
                      nullptr, xd->warp_param_stack, MAX_WARP_REF_CANDIDATES,
                      xd->valid_num_warp_candidates);
 #ifdef CELV2_ORACLE
-    if (d.imp) import_bawp(*d.imp); else {
+    if (d.imp) import_bawp(*d.imp, bsize, mode == NEARMV ? xd->ref_mv_stack[ref_frame][near_idx].this_mv.as_mv : wanted); else {
 #endif
     // bawp_flag luma (implicit: explicit_bawp_flag 0), then chroma with it.
     mbmi->bawp_flag[0] = mbmi->bawp_flag[1] = 0;
@@ -2488,6 +2521,7 @@ int BlockWriter::choose_skip_mode(const BlockDecision& d) {
   int_mv ref_mvs[MODE_CTX_REF_FRAMES][MAX_MV_REF_CANDIDATES] = {};
   mbmi->skip_mode = 1;
   mbmi->mode = NEAR_NEARMV;
+  mbmi->interp_fltr = MULTITAP_SHARP;  // set_default_interp_filters(): what the decoder predicts skip mode with
   mbmi->ref_mv_idx[0] = mbmi->ref_mv_idx[1] = 0;
   set_skip_mode_ref_frame(cm, xd, mbmi->ref_frame);
   av2_find_mv_refs(cm, xd, mbmi, av2_ref_frame_type(mbmi->ref_frame), ref_mv_count_, xd->ref_mv_stack, xd->weight,
@@ -2562,31 +2596,46 @@ void BlockWriter::tx_partition(TX_SIZE max_tx, int blk_row, int blk_col, TX_PART
   mbmi->tx_partition_type[is_inter ? av2_get_txb_size_index(bsize, blk_row, blk_col) : 0] = p;
 }
 
-// loop_restoration_read_sb_coeffs() with a PC_WIENER or WIENER_NONSEP frame (frame filters, so no
-// side information): one flag per unit, indexed as CodecState::lr_flags() holds them.
+// loop_restoration_read_sb_coeffs(): luma (frame filters, any type, SWITCHABLE's symbols too) four deferred symbols a
+// unit, indexed as CodecState::lr_flags() holds them; chroma, whose unit size and taps restore() picks after the tiles,
+// one SymbolLog::lr() entry a superblock (CodecState::write_lr_uv()).
 void BlockWriter::lr_units(int mi_row, int mi_col, BLOCK_SIZE bsize) {
   AV2_COMMON* const cm = st_.cm();
   int base = 0;
+  bool uv = false;
   for (int plane = 0; plane < av2_num_planes(cm); plane++) {
     int rcol0, rcol1, rrow0, rrow1;
     const RestorationInfo& rsi = cm->rst_info[plane];
     if (rsi.frame_restoration_type == RESTORE_NONE) continue;
-    if (av2_loop_restoration_corners_in_sb(cm, plane, mi_row, mi_col, bsize, &rcol0, &rcol1, &rrow0, &rrow1)) {
 #ifdef CELV2_ORACLE
-      if (celv2::oracle::filters()) {
+    // The stream's units, not in lr_flags() (X_ORACLE_FILT r: restore()'s planes are).
+    if (celv2::oracle::filters() && !(celv2::oracle::filt_cut('r') && !celv2::oracle::filt_cut(plane > 0 ? 'u' : 'f'))) {
+      if (av2_loop_restoration_corners_in_sb(cm, plane, mi_row, mi_col, bsize, &rcol0, &rcol1, &rrow0, &rrow1))
         for (int rrow = rrow0; rrow < rrow1; rrow++)
           for (int rcol = rcol0; rcol < rcol1; rcol++) import_lr_unit(plane, rcol + rrow * rsi.horz_units_per_frame);
-        continue;
-      }
+      continue;
+    }
 #endif
+    if (plane > 0) {
+      if (!uv) w_->lr(mi_row, mi_col), uv = true;
+      continue;
+    }
+    if (av2_loop_restoration_corners_in_sb(cm, plane, mi_row, mi_col, bsize, &rcol0, &rcol1, &rrow0, &rrow1)) {
       const bool pc = rsi.frame_restoration_type == RESTORE_PC_WIENER;
       if (!pc && (rsi.frame_restoration_type != RESTORE_WIENER_NONSEP || !rsi.frame_filters_on))
         throw std::logic_error("loop restoration other than PC_WIENER or frame-filter WIENER_NONSEP");
-      avm_cdf_prob* const cdf = pc ? xd_->tile_ctx->pc_wiener_restore_cdf : xd_->tile_ctx->wienerns_restore_cdf;
+      FRAME_CONTEXT* const fc = xd_->tile_ctx;
       for (int rrow = rrow0; rrow < rrow1; rrow++)
-        for (int rcol = rcol0; rcol < rcol1; rcol++) w_->deferred(base + rcol + rrow * rsi.horz_units_per_frame, cdf, 2);
+        for (int rcol = rcol0; rcol < rcol1; rcol++) {
+          const int u = rcol + rrow * rsi.horz_units_per_frame;
+          // Luma's type is restore()'s, after the tiles: every symbol any type codes, the others dropped at replay.
+          w_->deferred(base + 4 * u, fc->pc_wiener_restore_cdf, 2);
+          w_->deferred(base + 4 * u + 1, fc->wienerns_restore_cdf, 2);
+          w_->deferred(base + 4 * u + 2, fc->switchable_flex_restore_cdf[0][0], 2);
+          w_->deferred(base + 4 * u + 3, fc->switchable_flex_restore_cdf[1][0], 2);
+        }
     }
-    base += rsi.horz_units_per_frame * rsi.vert_units_per_frame;
+    base += rsi.horz_units_per_frame * rsi.vert_units_per_frame * 4;
   }
 }
 

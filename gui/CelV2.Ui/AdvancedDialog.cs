@@ -34,6 +34,7 @@ namespace CelV2.Ui
         readonly ComboBox parallelB = Combo("parallelB", "自動", "する", "しない");
         readonly ComboBox workers = Combo("workers", "自動", "1", "2", "4");
         static readonly int[] WorkerCounts = { 0, 1, 2, 4 };  // workers' items as EncodeSettings.Workers
+        readonly CheckBox lowPriority = Check("lowPriority", "ほかのソフトを優先する");
         readonly ComboBox container = Combo("container", "MP4", "別ファイル");
         readonly NumericUpDown audioKbps = Num("audioKbps", 32, 512);
         readonly CheckBox heAac = Check("heAacV2", "HE-AACv2 に変換する");
@@ -96,6 +97,7 @@ namespace CelV2.Ui
             AddRow(g, "スレッド数", threads, Note("0 = 自動"));
             AddRow(g, "B フレームの並列処理", parallelB, Note("自動 = 4K の 2 倍の画素まで（速くなる範囲）"));
             AddRow(g, "場面ごとの並列", workers, Note("同時に変換する場面の数。自動 = 使えるメモリと CPU から"));
+            AddRow(g, "CPU の優先度", lowPriority, Note("オン = 通常以下。変換中もほかのソフトが動きやすい"));
 
             g = Page(tabs, "出力");
             AddRow(g, "出力形式", container, Note("MP4 は MP4Box などが必要"));
@@ -135,6 +137,7 @@ namespace CelV2.Ui
             Set(threads, s.Threads);
             parallelB.SelectedIndex = InRange((int)s.ParallelB, parallelB);
             workers.SelectedIndex = Math.Max(0, Array.IndexOf(WorkerCounts, s.Workers));
+            lowPriority.Checked = s.LowPriority;
             container.SelectedIndex = InRange((int)s.Container, container);
             Set(audioKbps, s.AudioKbps);
             heAac.Checked = s.HeAacV2;
@@ -212,6 +215,7 @@ namespace CelV2.Ui
                 r.Threads = (int)threads.Value;
                 r.ParallelB = (ParallelMode)parallelB.SelectedIndex;
                 r.Workers = WorkerCounts[workers.SelectedIndex];
+                r.LowPriority = lowPriority.Checked;
                 r.Container = (ContainerKind)container.SelectedIndex;
                 r.AudioKbps = (int)audioKbps.Value;
                 r.HeAacV2 = heAac.Checked;

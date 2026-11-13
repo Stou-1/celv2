@@ -5,7 +5,7 @@ CelV2 は、動画を AV2 形式（MP4）に変換する Windows アプリです
 
 ■ 必要なもの
 
-- Windows 10 / 11 の 64 ビット
+- Windows 10 / 11 の 64 ビットと、AVX2 に対応した CPU（AVX2 のない CPU では celv2enc が動きません）
 - ffmpeg（ffmpeg.exe と ffprobe.exe）。このアプリには入っていません（下の「ffmpeg の入手」）。
 - 速く変換するには Vulkan に対応した単体 GPU（GeForce RTX、Intel Arc など）。GPU がなくても CPU で変換できますが、とても遅くなります。
 - 音声つきの MP4 を作るには MP4Box（GPAC）。任意です。なくても変換はでき、映像（.ivf）と音声を別ファイルで保存します。
@@ -29,7 +29,8 @@ CelV2 は、動画を AV2 形式（MP4）に変換する Windows アプリです
    「詳細設定」では celv2enc のすべての設定をタブごとに変えられます:
    画質（qindex、元の動画より大きくしない・その上限）、フレーム構成（キーフレーム間隔、場面の切り替わり、B フレーム数、
    参照フレーム数、フレームの種類ごとの qindex 差）、フィルター（デブロック強度、CDEF、フィルムグレイン）、速度・処理（判定の場所、
-   タイル横・縦、スレッド数、B フレームの並列処理、場面ごとの並列）、出力（形式、音声の kbps）。
+   タイル横・縦、スレッド数、B フレームの並列処理、場面ごとの並列、CPU の優先度）、出力（形式、音声の kbps）。
+   「CPU の優先度」は既定でオンで、変換を「通常以下」で動かし、ほかのソフトを優先します。
    「判定の場所」には、このパソコンで使える GPU が名前で並びます（自動 = GPU（Vulkan）、
    なければ CPU）。どれを選んでも出力は同じで、速さだけが変わります。
    「場面ごとの並列」は、場面の切り替わりで区切って同時に変換します（自動 = CPU とメモリから決める）。出力は 1 つずつ変換したときと同じです。サイズ指定のときは、指定に近く収まるよう 1 つずつ変換します。場面の少ない動画は速くなりません。
@@ -118,7 +119,8 @@ LICENSE                   CelV2 のライセンス
 third_party\avm\          AVM のライセンスと特許ライセンス
 third_party\av2-tools\    av2-tools のライセンス、特許ライセンス、元のコミットと修正の説明、
                           av2_mux に組み込んだライブラリの著作権表示（THIRD_PARTY_NOTICES.txt）
-third_party\celv2enc\      celv2enc に含まれる NVIDIA CUDA ランタイムなどの表示（NOTICE.txt）
+third_party\celv2enc\      celv2enc に組み込んだライブラリと VC++ ランタイムの表示（NOTICE.txt）、
+                          それらのライセンス本文（licenses\）
 
 ■ ライセンス
 
@@ -127,9 +129,13 @@ third_party\celv2enc\      celv2enc に含まれる NVIDIA CUDA ランタイム�
   Alliance for Open Media Patent License 1.0（third_party\avm\LICENSE と PATENTS）。
 - av2-tools（av2_mux.exe）: 同じく BSD 3-Clause Clear License と Patent License 1.0（third_party\av2-tools\）。
   MP4 の書き出し部分を自作のものに置き換え、MPEG の libisomediafile を使わないようにしています。
-  修正の内容は third_party\av2-tools\README.txt と av2-tools-celv2.patch を見てください。
+  ループ復元のある動画で範囲外に書き込む不具合も直しています。
+  修正の内容は third_party\av2-tools\README.txt と av2-tools-celv2.patch、av2-tools-lr-fix.patch を見てください。
+- celv2enc.exe には、AVM のライブラリに入っている AVM の third_party のコード（vector、x86inc）と、
+  Vulkan のヘッダも組み込んでいます。一覧とライセンスの種類は third_party\celv2enc\NOTICE.txt に、
+  ライセンス本文は third_party\celv2enc\licenses\ にあります。
 - av2_mux.exe に組み込んだ CLI11、spdlog、{fmt}、nlohmann/json の表示は third_party\av2-tools\THIRD_PARTY_NOTICES.txt に、
-  celv2enc.exe に含まれる NVIDIA CUDA ランタイムの表示は third_party\celv2enc\NOTICE.txt にあります。
+  VC++ ランタイムの表示は third_party\celv2enc\NOTICE.txt にあります。
 - 再配布するときは、LICENSE と third_party の中のファイルを一緒に付けてください。
 - どのライセンスも、そこに書かれている以上の特許の権利は与えません。
 - ffmpeg と MP4Box は同梱していません。それぞれのライセンスに従って、利用者が入手してください。

@@ -30,6 +30,10 @@ struct CcsoPlane {
 // The 32x32 blocks of block row `row` (ccso.c av2_apply_ccso_filter_for_row()).
 void ccso_apply_row(const CcsoPlane& p, int row);
 
+// Row y's classification as the filter sees it: each of the p.w samples' offset index
+// (band << 4) + (class0 << 2) + class1 into idx (the encoder's per-unit statistics).
+void ccso_class_row(const CcsoPlane& p, int y, uint16_t* idx);
+
 // derive_ccso_sample_pos(): the two neighbours of ext_filter_support 0..6.
 void ccso_neighbours(int ext_filter_support, int luma_stride, int loc[2]);
 

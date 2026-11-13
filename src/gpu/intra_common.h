@@ -1,14 +1,10 @@
-// Integer primitives of the intra decision rule, shared by the CUDA kernel and the CPU reference
-// so both produce identical DecisionMaps. Reads the source through a clamped accessor (the
+// Integer primitives of the intra decision rule, shared by the CPU reference and, ported, the
+// Slang shaders, so both produce identical DecisionMaps. Reads the source through a clamped accessor (the
 // padded luma plane, edge-replicated beyond it).
 #pragma once
 #include <cstdint>
 
-#ifdef __CUDACC__
-#define CELV2_HD __host__ __device__ __forceinline__
-#else
 #define CELV2_HD inline
-#endif
 
 namespace celv2 {
 

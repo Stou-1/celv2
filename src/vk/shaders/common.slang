@@ -310,7 +310,7 @@ public void sb_block_geom(int b, out int x, out int y, out int w, out int h) {
 // ---- The cost / finalize kernels' shared inputs (vk/vk_kernels.cpp mirrors these layouts).
 public static const int kInterSlots = 4400;
 public static const int kNumIntra = kSbBlocks * kNumModes;
-// gpu/kernels.cu's DevRefs.
+// the removed gpu/kernels.cu's DevRefs.
 public struct KRefs {
   public int n;
   public Plane p[7];
@@ -318,7 +318,7 @@ public struct KRefs {
   public int* mvy[7];
   public int mv_cols, mv_rows;
 };
-// gpu/kernels.cu's task tables (inter_tasks_kernel), built on the host: inter_first[kSbBlocks + 1],
+// the removed gpu/kernels.cu's task tables (inter_tasks_kernel), built on the host: inter_first[kSbBlocks + 1],
 // inter_b / inter_k[kInterSlots], and the chunks, 4 ints each (block, first task, count, lanes).
 // Pointers, not arrays: a 200 KB struct type crashed NVIDIA's shader compiler.
 public struct Tables {

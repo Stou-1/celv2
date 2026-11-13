@@ -13,6 +13,8 @@
 #include "io/y4m.h"
 #include "state/codec_state.h"
 
+struct SideCosts;  // core/rd_pass.h
+
 class Encoder {
  public:
   explicit Encoder(const SeqConfig& c);
@@ -44,6 +46,8 @@ class Encoder {
   // The RD weight of a bit in squared sample error at a coded qindex: 0.025 squared quantizer steps
   // (as the CCSO search weighs its header bits).
   double sse_per_bit(int coded_qindex);
+  // The RD pass's side-information prices from the CDFs the frame begin() set up starts from.
+  void side_costs(SideCosts& out) const;
 
  private:
   friend class TileCoder;  // the per-tile block walk (encoder.cpp)

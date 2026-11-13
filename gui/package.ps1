@@ -1,6 +1,6 @@
 # Builds gui\bin, then assembles dist\celv2-gui-<date>.zip (no tests, no test data).
 # Needs build\celv2enc.exe and av2_mux.exe in -Av2MuxDir (default $env:AV2MUX_DIR), built from av2-tools with
-# third_party\av2-tools\av2-tools-celv2.patch. This script only copies build\celv2enc.exe: rebuild it first
+# third_party\av2-tools\av2-tools-celv2.patch and av2-tools-lr-fix.patch. This script only copies build\celv2enc.exe: rebuild it first
 # (scripts\build.ps1). The SHA256 and time of both exes are printed at the end. Exit code 1 on any missing file.
 param(
     [string]$Av2MuxDir = $env:AV2MUX_DIR,
@@ -33,9 +33,11 @@ foreach ($n in $crt) { $files[(Join-Path $CrtDir $n)] = $n }
 $files[(Join-Path $repo 'LICENSE')] = 'LICENSE'
 $files[(Join-Path $repo 'third_party\avm\LICENSE')] = 'third_party\avm\LICENSE'
 $files[(Join-Path $repo 'third_party\avm\PATENTS')] = 'third_party\avm\PATENTS'
-foreach ($n in 'LICENSE', 'PATENTS', 'README.txt', 'av2-tools-celv2.patch') { $files[(Join-Path $tp $n)] = "third_party\av2-tools\$n" }
+foreach ($n in 'LICENSE', 'PATENTS', 'README.txt', 'av2-tools-celv2.patch', 'av2-tools-lr-fix.patch') { $files[(Join-Path $tp $n)] = "third_party\av2-tools\$n" }
 $files[(Join-Path $tp 'THIRD_PARTY_NOTICES.txt')] = 'third_party\av2-tools\THIRD_PARTY_NOTICES.txt'
 $files[(Join-Path $gui 'third_party\celv2enc\NOTICE.txt')] = 'third_party\celv2enc\NOTICE.txt'
+# the license texts of the libraries celv2enc.exe links statically (listed in NOTICE.txt)
+foreach ($f in Get-ChildItem -File (Join-Path $gui 'third_party\celv2enc\licenses')) { $files[$f.FullName] = "third_party\celv2enc\licenses\$($f.Name)" }
 $files[(Join-Path $gui 'README_ja.txt')] = 'README_ja.txt'
 foreach ($src in $files.Keys) { if (-not (Test-Path -LiteralPath $src)) { Fail "missing $src" } }
 

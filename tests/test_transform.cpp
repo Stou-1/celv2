@@ -99,6 +99,30 @@ int main(int argc, char** argv) {
       }
     }
   }
+  // fwd_dct's AVX-512 and AVX2 paths: the same values, 8- and 10-bit residuals, a stride wider than the block.
+  if (simd_avx512()) {
+    int covered = 0;
+    for (int tx = 0; tx < TX_SIZES_ALL; tx++) {
+      const int w = tx_size_wide[tx], h = tx_size_high[tx], stride = w + 16;
+      std::vector<int16_t> r(static_cast<size_t>(stride) * h);
+      tran_low_t a[1024], b[1024];
+      for (int trial = 0; trial < 64; trial++) {
+        const int range = trial & 1 ? 1023 : 255;
+        for (auto& v : r) v = static_cast<int16_t>(trial < 4 ? (rnd() & 1 ? range : -range) : rnd() % (2 * range + 1) - range);
+        const double scale = 0.25 + (rnd() % 1000) * 0.01;
+        if (!fwd_dct_avx512(r.data(), stride, static_cast<TX_SIZE>(tx), scale, a)) break;
+        fwd_dct_avx2(r.data(), stride, static_cast<TX_SIZE>(tx), scale, b);
+        const int n = std::min(w, 32) * std::min(h, 32);
+        CHECK(std::equal(a, a + n, b));
+        covered += trial == 0;
+      }
+    }
+    CHECK_EQ(covered, 9);
+  } else {
+    const char* simd = std::getenv("CELV2_SIMD");
+    std::printf("SKIP: fwd_dct's AVX-512 path not compared with AVX2 (%s%s)\n", simd ? "CELV2_SIMD=" : "no AVX-512 on this CPU",
+                simd ? simd : "");
+  }
   // --rd-zero: a lone coefficient 0.6 steps at scan position 1 is coded off, none on (J 0.50 against 0.41), and the plain
   // path's one at 1 step; cost-only agrees. Larger ones stay.
   for (const bool tcq : {true, false}) {

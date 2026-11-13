@@ -17,6 +17,8 @@ namespace CelV2.Runner
 
         // Where this thread's tool command lines and messages go (EncodeJob.Log while a job runs); null drops them.
         [ThreadStatic] public static Action<string> Log;
+        // This thread's tools run below normal priority (EncodeJob, by EncodeSettings.LowPriority).
+        [ThreadStatic] public static bool LowPriority;
 
         public static Process Start(string exe, IEnumerable<string> args, bool stdin, bool stdout, bool stderr)
         {
@@ -33,7 +35,14 @@ namespace CelV2.Runner
             if (stdout) psi.StandardOutputEncoding = Utf8;
             if (stderr) psi.StandardErrorEncoding = Utf8;
             EnsureBomFreeStdin();
-            return Process.Start(psi);
+            var p = Process.Start(psi);
+            if (LowPriority)
+            {
+                try { p.PriorityClass = ProcessPriorityClass.BelowNormal; }
+                catch (InvalidOperationException) { }  // already ended
+                catch (Win32Exception) { }
+            }
+            return p;
         }
 
         static readonly Encoding Utf8 = new UTF8Encoding(false);

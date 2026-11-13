@@ -71,6 +71,67 @@ static int held_drawing_change_is_not_a_cut() {
   return 0;
 }
 
+// A partial change leaving 40% of the picture still (C3): the same shot, coded as P frames, no cut.
+static int partial_change_is_not_a_cut() {
+  const int w = 320, h = 240;
+  const Frame420 a = scene_frame(w, h, 0, 0), other = scene_frame(w, h, 160, 97, 9);
+  Frame420 b = a;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w * 3 / 5; x++) b.y[static_cast<size_t>(y) * b.stride_y() + x] = other.y[static_cast<size_t>(y) * other.stride_y() + x];
+  std::vector<Frame420> f;
+  for (int i = 0; i < 16; i++) f.push_back(i < 8 ? a : b);
+  CHECK(cuts(f).empty());
+  return 0;
+}
+
+// A scene inside black bars (luma 16) of `top` rows above and below and `side` columns left and right.
+static Frame420 boxed(const Frame420& s, int top, int side) {
+  Frame420 f = s;
+  for (int y = 0; y < f.height; y++)
+    for (int x = 0; x < f.width; x++)
+      if (y < top || y >= f.height - top || x < side || x >= f.width - side) f.y[static_cast<size_t>(y) * f.stride_y() + x] = 16;
+  return f;
+}
+
+// 2.39:1 in 16:9 (bars 27% of the picture) and 4:3 in 16:9 (pillars 25%): the bars always stay still,
+// but a hard cut between two shots inside them is still a cut; a partial change inside them is not.
+static int cut_inside_bars() {
+  const int w = 320, h = 180;
+  for (const auto [top, side] : {std::pair{24, 0}, std::pair{0, 40}}) {
+    std::vector<Frame420> f;
+    for (int i = 0; i < 12; i++) f.push_back(boxed(scene_frame(w, h, 2 * i, i), top, side));
+    for (int i = 0; i < 8; i++) f.push_back(boxed(scene_frame(w, h, 160 + 2 * i, 97 + i, 9), top, side));
+    const std::vector<int> c = cuts(f);
+    CHECK_EQ(c.size(), size_t{1});
+    CHECK_EQ(c[0], 12);
+    const Frame420 a = boxed(scene_frame(w, h, 0, 0), top, side), other = boxed(scene_frame(w, h, 160, 97, 9), top, side);
+    Frame420 b = a;  // 40% of the picture inside the bars still
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < side + (w - 2 * side) * 3 / 5; x++) b.y[static_cast<size_t>(y) * b.stride_y() + x] = other.y[static_cast<size_t>(y) * other.stride_y() + x];
+    std::vector<Frame420> g;
+    for (int i = 0; i < 16; i++) g.push_back(i < 8 ? a : b);
+    CHECK(cuts(g).empty());
+  }
+  return 0;
+}
+
+// A dark flat sky along the top edge only (48 of 128 rows, luma 20) over a held drawing whose lower part is
+// drawn again 45 levels brighter: one edge is no letterbox, so the still sky counts and it is the same shot.
+static int one_dark_edge_is_not_a_bar() {
+  const int w = 256, h = 128;
+  std::vector<Frame420> f;
+  for (int i = 0; i < 20; i++) {
+    Frame420 g = flat(w, h, 20);
+    for (int y = 48; y < h; y++)
+      for (int x = 0; x < w; x++)
+        g.y[static_cast<size_t>(y) * g.stride_y() + x] =
+            static_cast<uint8_t>(60 + (x * 7 + y * 13 + (x / 8) * 31 + (y / 8) * 17) % 120 + (i >= 10 ? 45 : 0));
+    f.push_back(g);
+  }
+  CHECK(cuts(f).empty());
+  return 0;
+}
+
 // Frames smaller than the 8x8 grid still work (one cell).
 static int tiny_frames() {
   std::vector<Frame420> f;
@@ -117,6 +178,9 @@ int main() {
   fails += RUN(held_drawing_change_is_not_a_cut);
   fails += RUN(tiny_frames);
   fails += RUN(change_meter_sees_halftone);
+  fails += RUN(partial_change_is_not_a_cut);
+  fails += RUN(cut_inside_bars);
+  fails += RUN(one_dark_edge_is_not_a_bar);
   if (fails) std::fprintf(stderr, "%d test(s) failed\n", fails);
   return fails ? 1 : 0;
 }

@@ -1,14 +1,21 @@
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "check.h"
+#include "gpu/cpu_engine.h"
 #include "gpu/inter_common.h"
 #include "gpu/kernels_ref.h"
 #include "io/y4m.h"
+#include "vk/vk_context.h"
 #include "vk/vk_engine.h"
 #include "test_frames.h"
 
@@ -44,6 +51,21 @@ static bool same(const DecisionMap& x, const DecisionMap& y) {
     }
   }
   return true;
+}
+
+// Superblocks of x that differ from want's; *max_mv: their largest |MV| component (1/8 pel).
+static int bad_sbs(const DecisionMap& x, const DecisionMap& want, int* max_mv) {
+  if (x.sbs.size() != want.sbs.size()) return 1 << 20;
+  int n = 0;
+  for (size_t i = 0; i < x.sbs.size(); i++) {
+    DecisionMap a, b;
+    a.sbs = {x.sbs[i]}, b.sbs = {want.sbs[i]};
+    if (same(a, b)) continue;
+    n++;
+    for (const auto& blk : x.sbs[i].blocks)
+      *max_mv = std::max({*max_mv, std::abs(static_cast<int>(blk.mv_row)), std::abs(static_cast<int>(blk.mv_col))});
+  }
+  return n;
 }
 
 static int gpu_me_matches_ref() {
@@ -137,6 +159,100 @@ static int gpu_me_finds_quarter_pel_motion() {
   }
   CHECK(inter > 0);
   CHECK(hit * 4 >= inter * 3);
+  return 0;
+}
+
+// V3 of the Vulkan wait spec (the motion search level by level across references): 7 references
+// decide as the CPU engine does, and again with one reference new to the slots and six reused.
+static int seven_refs_match_cpu() {
+  const int w = 320, h = 192;
+  std::vector<Frame420> pics;
+  for (int i = 0; i < 9; i++) pics.push_back(smooth(w, h, 1.25 * i, -0.75 * i));
+  VulkanEngine vk(w, h, 64);
+  CpuEngine cpu(w, h, 64, 4);
+  auto decide = [](DecisionEngine& e, const Frame420& src, const std::vector<const Frame420*>& refs,
+                   const std::vector<long long>& keys) {
+    DecisionMap dm;
+    RowGate gate;
+    e.launch(src, refs, 90, dm, keys);
+    e.collect(dm, gate);
+    return dm;
+  };
+  for (int first = 1; first <= 2; first++) {  // refs pics[first..first+6], src pics[0]: one new on the second pass
+    std::vector<const Frame420*> refs;
+    std::vector<long long> keys;
+    for (int i = first; i < first + 7; i++) refs.push_back(&pics[i]), keys.push_back(i);
+    const DecisionMap a = decide(vk, pics[0], refs, keys), b = decide(cpu, pics[0], refs, keys);
+    CHECK(same(a, b));
+    int inter = 0;
+    for (const SbDecision& sb : a.sbs)
+      for (const BlockDecision& bl : sb.blocks) inter += bl.inter;
+    std::fprintf(stderr, "7 references from %d: %d inter blocks\n", first, inter);
+    CHECK(inter > 0);
+  }
+  return 0;
+}
+
+// Three engines on one GPU, on three threads (the encoder's workers), decide 7 references as the CPU
+// engine does, on every GPU: the B50 gave bad motion vectors with each engine on its own queue (2026-11-08).
+// Sources alternate between two frames, so a stale readback differs from the CPU too. A lost device
+// counts as bad, not a crash. CELV2_TEST_GPU=n: that GPU only; CELV2_TEST_SERIAL=1: one decide() at
+// a time across the threads; CELV2_TEST_THREADS / CELV2_TEST_ITERS: other counts.
+static int three_engines_match_cpu() {
+  const int w = 640, h = 360;
+  std::vector<Frame420> pics;
+  for (int i = 0; i < 9; i++) pics.push_back(smooth(w, h, 1.25 * i, -0.75 * i));
+  std::vector<const Frame420*> refs;
+  std::vector<long long> keys;
+  for (int i = 1; i < 8; i++) refs.push_back(&pics[i]), keys.push_back(i);
+  auto decide = [&](DecisionEngine& e, int s) {
+    DecisionMap dm;
+    RowGate gate;
+    e.launch(pics[s ? 8 : 0], refs, 90, dm, keys);
+    e.collect(dm, gate);
+    return dm;
+  };
+  auto env = [](const char* n, int d) {
+    const char* v = std::getenv(n);
+    return v && *v ? std::atoi(v) : d;
+  };
+  const int only = env("CELV2_TEST_GPU", -1), threads = env("CELV2_TEST_THREADS", 3), iters = env("CELV2_TEST_ITERS", 30);
+  const bool serial = env("CELV2_TEST_SERIAL", 0) != 0;
+  CpuEngine cpu(w, h, 64, 4);
+  const DecisionMap want[2] = {decide(cpu, 0), decide(cpu, 1)};
+  CHECK(!same(want[0], want[1]));
+  std::mutex one;
+  for (int g = 0; g < static_cast<int>(celv2::vk::Context::devices().size()); g++) {
+    if (only >= 0 && g != only) continue;
+    std::atomic<int> bad{0}, sbs{0}, max_mv{0}, errors{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < threads; t++)
+      ts.emplace_back([&, t] {
+        try {
+          VulkanEngine vk(w, h, 64, g, threads);
+          for (int i = 0; i < iters; i++) {
+            std::unique_lock<std::mutex> lock(one, std::defer_lock);
+            if (serial) lock.lock();
+            const int s = (i + t) % 2;
+            int mv = 0;
+            const int n = bad_sbs(decide(vk, s), want[s], &mv);
+            if (!n) continue;
+            const int b = ++bad;
+            sbs += n;
+            for (int m = max_mv.load(); mv > m && !max_mv.compare_exchange_weak(m, mv);) {
+            }
+            if (b <= 3) std::fprintf(stderr, "GPU %d thread %d iter %d: %d superblocks differ, max |mv| %d\n", g, t, i, n, mv);
+          }
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "GPU %d thread %d: %s\n", g, t, e.what());
+          errors++;
+        }
+      });
+    for (std::thread& t : ts) t.join();
+    std::fprintf(stderr, "GPU %d: %d bad of %d (%d superblocks, max |mv| %d), %d threads threw\n", g, bad.load(),
+                 threads * iters, sbs.load(), max_mv.load(), errors.load());
+    CHECK_EQ(bad.load() + errors.load(), 0);
+  }
   return 0;
 }
 
@@ -248,6 +364,7 @@ static int phase_layouts() {
   CHECK_EQ(vk_phase_layout(k8, 16 * kGB), '1');
   CHECK_EQ(vk_phase_layout(k8, 16 * kGB, 4), 'B');  // four engines share the card
   CHECK_EQ(vk_phase_layout(k16, 6 * kGB), 'A');
+  CHECK_EQ(vk_phase_layout(k16, 8500000000ull), 'A');  // 4 planes need 66 B/px: 38 beside the phases (2026-11-07)
   CHECK_EQ(vk_phase_layout(k16, 1 * kGB), 0);
   return 0;
 }
@@ -257,6 +374,8 @@ int main() {
   fails += RUN(phase_layouts);
   fails += RUN(gpu_me_matches_ref);
   fails += RUN(gpu_me_finds_quarter_pel_motion);
+  fails += RUN(seven_refs_match_cpu);
+  fails += RUN(three_engines_match_cpu);
   fails += RUN(me_rows_split_matches_whole);
   fails += RUN(me_finds_large_motion);
   fails += RUN(me_cell_searches_two_centres);

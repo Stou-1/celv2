@@ -10,6 +10,11 @@ extern "C" {
 // residual: tx_w x tx_h, row-major with `stride`. out: AVM layout (pos = row * min(w,32) + col,
 // row = vertical frequency), only the top-left min(w,32) x min(h,32) frequencies.
 void fwd_dct(const int16_t* residual, int stride, TX_SIZE tx, double scale, tran_low_t* out);
+// fwd_dct()'s paths, the same values: AVX-512 (sizes with both sides >= 16, else false) when simd_avx512(), else AVX2.
+// simd_avx512(): CPUID's AVX512F, BW and VL with the OS's state, once; CELV2_SIMD=avx2 (or scalar) forces it off.
+bool simd_avx512();
+bool fwd_dct_avx512(const int16_t* residual, int stride, TX_SIZE tx, double scale, tran_low_t* out);
+void fwd_dct_avx2(const int16_t* residual, int stride, TX_SIZE tx, double scale, tran_low_t* out);
 // Any transform type of a tx at most 32x32 (ADST and FLIPADST at most 16): AVM's integer kernels
 // (av2/common tables: columns, then rows, with fwd_tx_shift and the sqrt(2) step of 2:1 sizes),
 // so the coefficients are on the scale AVM's inverse expects. Same layout as fwd_dct.

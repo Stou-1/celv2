@@ -2,7 +2,7 @@ av2_mux.exe (bundled with CelV2 GUI)
 
 Source:   https://github.com/AOMediaCodec/av2-tools
 Commit:   ffbcb39 ("adding my personal test server termporarily")
-Build:    MSVC x64, Release, with one local modification (below).
+Build:    MSVC x64, Release, with two local modifications (below).
 License:  BSD 3-Clause Clear License (LICENSE) and the Alliance for Open Media
           Patent License 1.0 (PATENTS). Both files are in this folder.
 
@@ -15,8 +15,14 @@ Local modification: av2-tools-celv2.patch (apply with "git apply" in a checkout 
   filled in (libisomedia wrote 0), the creation/modification times are 0, there
   is no iods box, the tkhd size is the picture size (libisomedia left 320x240),
   and cslg's compositionEndTime includes the last sample's duration.
-  Build (PowerShell, in the checkout; /d1trimfile keeps the checkout's path, and the
-  user name in it, out of __FILE__, which gui\package.ps1 checks):
+
+Local modification: av2-tools-lr-fix.patch (git apply, after the one above)
+  src/core/av2_sequence_header.cpp: lr_tools_disable is indexed by RestorationType
+  (RESTORE_WIENER_NONSEP is 2), so its inner vectors are sized RESTORE_SWITCHABLE + 1;
+  with 2 entries the parser wrote past their end for sequences with loop restoration.
+
+  Build (PowerShell, in the checkout with both patches applied; /d1trimfile keeps the
+  checkout's path, and the user name in it, out of __FILE__, which gui\package.ps1 checks):
          cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release `
            "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /d1trimfile:$PWD" `
            "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /d1trimfile:$PWD"

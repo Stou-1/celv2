@@ -52,6 +52,7 @@ namespace CelV2.Settings
         [DataMember] public double TargetVmaf;              // each scene at about this VMAF (celv2enc --target-vmaf); 0 = off; not with TargetSizeMB
         [DataMember] public TuneKind Tune;                  // --tune: settings by content
         [DataMember] public bool MaxEffort;                 // --preset max: speed ignored for quality and size
+        [DataMember] public bool LowPriority;               // a job's tools run below normal priority, so other software stays smooth
 
         public EncodeSettings() { SetDefaults(); }
         [OnDeserializing] void OnDeserializing(StreamingContext c) { SetDefaults(); } // JSON missing a field keeps its default
@@ -82,6 +83,7 @@ namespace CelV2.Settings
             ParallelB = ParallelMode.Auto;
             AudioKbps = 192;
             HeAacKbps = 32;
+            LowPriority = true;
         }
 
         // The --device value to pass: DeviceArg, else what Device meant before devices were listed.

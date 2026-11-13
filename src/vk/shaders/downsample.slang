@@ -1,4 +1,4 @@
-// downsample_kernel (gpu/kernels.cu): dst (w/2 x h/2) = 2x2 averages of src.
+// downsample_kernel (gpu/kernels.cu, removed 2026-11-08): dst (w/2 x h/2) = 2x2 averages of src.
 import common;
 
 struct Params {

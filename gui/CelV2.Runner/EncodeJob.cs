@@ -85,6 +85,8 @@ namespace CelV2.Runner
             var partial = new List<string>();
             var outerLog = Proc.Log;
             Proc.Log = l => { var h = Log; if (h != null) h(l); };
+            bool outerLow = Proc.LowPriority;
+            Proc.LowPriority = settings.LowPriority;
             Proc.Log("入力: " + input);
             try
             {
@@ -105,6 +107,7 @@ namespace CelV2.Runner
             }
             Proc.Log(result.Ok ? "結果: 成功 " + string.Join(", ", result.Outputs) : result.Cancelled ? "結果: 中止" : "結果: 失敗: " + result.Error);
             Proc.Log = outerLog;
+            Proc.LowPriority = outerLow;
             return result;
         }
 

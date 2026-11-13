@@ -13,6 +13,8 @@
 
 #include "check.h"
 #include "gpu/cpu_engine.h"
+#include "core/intra_block.h"
+#include "core/residual.h"
 #include "gpu/intra_common.h"
 #include "gpu/kernels_ref.h"
 #include "io/y4m.h"
@@ -259,8 +261,73 @@ static int no_intra_block_wider_than_32() {
   return 0;
 }
 
+// intra_pred_block() (the RD pass's, from edge arrays read once) equals intra_pred() / dc_value() sample by sample:
+// every mode, every block size up to 64, at the frame's top and left edges, inside, and across the right and
+// bottom edges (the clamped accessor).
+static int intra_block_matches_per_sample() {
+  const int pw = 200, ph = 150;
+  std::vector<uint8_t> px(pw * ph);
+  for (uint8_t& v : px) v = static_cast<uint8_t>(rnd(256));
+  for (int r = 0; r < ph; r++)  // smooth stretches too, so ties and flat edges show
+    for (int c = 0; c < 40; c++) px[r * pw + c] = static_cast<uint8_t>(100 + r / 4);
+  const celv2::Plane s{px.data(), pw, pw, ph};
+  const int sizes[] = {4, 8, 16, 32, 64};
+  const int at[][2] = {{0, 0}, {0, 40}, {36, 0}, {40, 36}, {pw - 16, 24}, {64, ph - 8}, {pw - 4, ph - 4}};
+  uint8_t pred[64 * 64];
+  int n = 0;
+  for (const int w : sizes)
+    for (const int h : sizes) {
+      if (w > 4 * h || h > 4 * w) continue;
+      for (const auto& xy : at)
+        for (int mode = 0; mode < celv2::kNumModes; mode++) {
+          const int x = xy[0], y = xy[1];
+          celv2::intra_pred_block(s, x, y, w, h, mode, pred);
+          const int dc = mode == 0 ? celv2::dc_value(s, x, y, w, h) : 0;
+          for (int i = 0; i < h; i++)
+            for (int j = 0; j < w; j++) {
+              const int want = mode == 0 ? dc : celv2::intra_pred(s, x, y, w, h, mode, i, j);
+              if (pred[i * w + j] != want) {
+                std::printf("mode %d %dx%d at (%d, %d), sample (%d, %d): %d, want %d\n", mode, w, h, x, y, i, j,
+                            pred[i * w + j], want);
+                return 1;
+              }
+            }
+          n++;
+        }
+    }
+  std::printf("%d blocks matched\n", n);
+  return 0;
+}
+
+// block_residual() and average_into() (the RD pass's) equal the per-sample forms: inside the plane and across its
+// right and bottom edges, every block size up to 64.
+static int block_residual_matches_per_sample() {
+  const int pw = 200, ph = 150;
+  std::vector<uint8_t> px(pw * ph), pa(64 * 64), pb(64 * 64);
+  for (uint8_t& v : px) v = static_cast<uint8_t>(rnd(256));
+  for (uint8_t& v : pa) v = static_cast<uint8_t>(rnd(256));
+  for (uint8_t& v : pb) v = static_cast<uint8_t>(rnd(256));
+  const celv2::Plane s{px.data(), pw, pw, ph};
+  const int sizes[] = {4, 8, 16, 32, 64};
+  const int at[][2] = {{0, 0}, {40, 36}, {pw - 16, 24}, {64, ph - 8}, {pw - 4, ph - 4}, {pw - 64, ph - 64}};
+  int16_t res[64 * 64];
+  for (const int w : sizes)
+    for (const int h : sizes)
+      for (const auto& xy : at) {
+        celv2::block_residual(s, xy[0], xy[1], w, h, pa.data(), res);
+        for (int i = 0; i < h; i++)
+          for (int j = 0; j < w; j++) CHECK_EQ(res[i * w + j], s.at(xy[1] + i, xy[0] + j) - pa[i * w + j]);
+      }
+  std::vector<uint8_t> avg = pa;
+  celv2::average_into(avg.data(), pb.data(), 64 * 64);
+  for (int k = 0; k < 64 * 64; k++) CHECK_EQ(avg[k], (pa[k] + pb[k] + 1) >> 1);
+  return 0;
+}
+
 int main() {
   int fails = 0;
+  fails += RUN(block_residual_matches_per_sample);
+  fails += RUN(intra_block_matches_per_sample);
   fails += RUN(no_intra_block_wider_than_32);
   fails += RUN(multi_ref_engines_match);
   fails += RUN(gpu_intra_matches_ref);

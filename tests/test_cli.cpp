@@ -36,6 +36,16 @@ static std::string read_bytes(const fs::path& p) {
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// AVM decodes `ivf` to the frames celv2enc wrote to `recon` (--recon).
+static bool decodes_as(const fs::path& ivf, const fs::path& recon) {
+  std::string expect;
+  for (const auto& f : decode_frames(read_ivf(ivf.string()))) {
+    const auto b = write_y4m_frame_bytes(f);
+    expect.append(b.begin(), b.end());
+  }
+  return read_bytes(recon) == expect;
+}
+
 // Sets an environment variable that std::system's children inherit; restores it on destruction,
 // so a failed CHECK cannot leave later tests without the GPU.
 class EnvGuard {
@@ -369,9 +379,182 @@ static int cli_psy_rd() {
   CHECK(run(" --psy-trellis 1 --workers 1") != run(" --workers 1"));
   CHECK(run(" --psy-trellis 1 --workers 2") == run(" --psy-trellis 1 --workers 1"));
   CHECK(run(" --psy-rd 1 --psy-trellis 1 --device cpu") == run(" --psy-rd 1 --psy-trellis 1"));
+  // It turns --real-trellis off unless that is given.
+  const std::string psy = run(" --psy-trellis 1 --workers 1");
+  CHECK(psy == run(" --psy-trellis 1 --real-trellis 0 --workers 1") && psy != run(" --psy-trellis 1 --real-trellis 1 --workers 1"));
   CHECK(run(" --psy-trellis 2.5") == "failed");
   CHECK(run(" --psy-rd 2.5") == "failed");
   CHECK(run(" --psy-rd -1") == "failed");
+  return 0;
+}
+
+// --real-trellis: AVM decodes the stream equal to --recon (8 and 10 bits, B frames, the qindex ends, with --rd-zero and
+// --tune animation's CCTX and IST); the bytes differ from off; 1 is the default; any worker count gives the same bytes.
+static int cli_real_trellis() {
+  const fs::path dir = fs::temp_directory_path();
+  const fs::path y4m = dir / "celv2_cli_rt.y4m", ivf = dir / "celv2_cli_rt.ivf", recon = dir / "celv2_cli_rt_recon.yuv";
+  std::string err;
+  auto run = [&](const std::string& opts) {
+    return run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\"" + opts, err) == 0 ? read_bytes(ivf) : std::string("failed");
+  };
+  auto decodes_as_recon = [&](const std::string& opts) {
+    return run(opts + " --recon \"" + recon.string() + "\"") != "failed" && decodes_as(ivf, recon);
+  };
+  for (const int depth : {8, 10}) {
+    write_paq_clip(y4m, 256, 128, 11, 1000, depth);
+    CHECK(decodes_as_recon(" --bframes 3 --real-trellis 1"));
+    CHECK(decodes_as_recon(" --bframes 3 --real-trellis 1 --tune animation"));
+    const std::string with = run(" --bframes 3"), without = run(" --bframes 3 --real-trellis 0");
+    CHECK(with != "failed" && without != "failed");
+    CHECK(with != without);
+    CHECK(run(" --bframes 3 --real-trellis 1") == with);  // the default
+  }
+  CHECK(decodes_as_recon(" --bframes 3 --qindex 250 --real-trellis 1"));
+  CHECK(decodes_as_recon(" --bframes 3 --qindex 5 --real-trellis 1 --rd-zero 1"));
+  write_paq_clip(y4m, 128, 64, 120, 60, 8);  // a scene cut at 60: two chunks
+  const std::string one = run(" --real-trellis 1 --workers 1");
+  CHECK(one != "failed");
+  CHECK(run(" --real-trellis 1 --workers 2") == one);
+  CHECK(run(" --real-trellis 1 --device cpu") == run(" --real-trellis 1"));
+  return 0;
+}
+
+// CDEF strengths per 64x64 unit: on a clip whose halves differ, some frame's set has more than one pair
+// (CELV2_GOP_LOG's cdef line), and AVM decodes the stream equal to --recon (8 and 10 bits, B frames); on two
+// superblock rows and two tile columns too, at any worker count.
+static int cli_cdef_units() {
+  const fs::path dir = fs::temp_directory_path();
+  const fs::path y4m = dir / "celv2_cli_cdef.y4m", ivf = dir / "celv2_cli_cdef.ivf", recon = dir / "celv2_cli_cdef_recon.yuv";
+  EnvGuard on("CELV2_GOP_LOG", "1");
+  std::string err;
+  auto run = [&](const std::string& opts) {
+    return run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 3" + opts, err) == 0 ? read_bytes(ivf) : std::string("failed");
+  };
+  const std::string with_recon = " --recon \"" + recon.string() + "\"";
+  for (const int depth : {8, 10}) {
+    write_paq_clip(y4m, 256, 128, 11, 1000, depth);
+    CHECK(run(with_recon) != "failed");
+    bool several = false;
+    for (size_t at = err.find("celv2enc: cdef frame"); at != std::string::npos; at = err.find("celv2enc: cdef frame", at + 1)) {
+      const size_t n = err.find("strengths ", at);
+      if (n != std::string::npos && err[n + 10] >= '2') several = true;
+    }
+    CHECK(several);
+    CHECK(decodes_as(ivf, recon));
+  }
+  write_paq_clip(y4m, 256, 256, 5, 1000, 8);
+  CHECK(run(" --tile-columns 1" + with_recon) != "failed");
+  CHECK(decodes_as(ivf, recon));
+  const std::string one = run(" --tile-columns 1 --workers 1");
+  CHECK(one != "failed" && run(" --tile-columns 1 --workers 2") == one);
+  return 0;
+}
+
+// CCSO flags per unit: on a 768x512 clip (one tile: 3x2 units of 256) whose halves differ, some frame
+// has a plane with some units on and some off (CELV2_GOP_LOG's ccso line: 0 < on < units), and AVM
+// decodes the stream equal to --recon (8 and 10 bits, B frames). At q160: at the default q120 with --real-trellis 1 every
+// unit of this clip is on.
+static int cli_ccso_units() {
+  const fs::path dir = fs::temp_directory_path();
+  const fs::path y4m = dir / "celv2_cli_ccso.y4m", ivf = dir / "celv2_cli_ccso.ivf", recon = dir / "celv2_cli_ccso_recon.yuv";
+  EnvGuard on("CELV2_GOP_LOG", "1");
+  for (const int depth : {8, 10}) {
+    write_paq_clip(y4m, 768, 512, 5, 1000, depth);
+    std::string err;
+    CHECK_EQ(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 3 --qindex 160 --recon \"" + recon.string() + "\"", err), 0);
+    bool mixed = false;
+    for (size_t at = err.find("celv2enc: ccso frame"); at != std::string::npos; at = err.find("celv2enc: ccso frame", at + 1)) {
+      int frame, units, on_units[3];
+      if (std::sscanf(err.c_str() + at, "celv2enc: ccso frame %d units %d on %d %d %d", &frame, &units, &on_units[0], &on_units[1],
+                      &on_units[2]) == 5)
+        for (const int n : on_units) mixed |= 0 < n && n < units;
+    }
+    CHECK(mixed);
+    CHECK(decodes_as(ivf, recon));
+  }
+  return 0;
+}
+
+// A w x h clip (768x512 by default: 6x4 luma restoration units of 128) at 8 or 10 bits: the left half crossed sine
+// waves moving a little each frame (where PC_WIENER and WIENER_NONSEP each win some units), the right half a smooth
+// ramp; grey chroma.
+static void write_lr_clip(const fs::path& y4m, int frames, int depth, int w = 768, int h = 512) {
+  std::ofstream out(y4m, std::ios::binary);
+  out << "YUV4MPEG2 W" << w << " H" << h << " F30:1 Ip " << (depth > 8 ? "C420p10" : "C420jpeg") << "\n";
+  for (int i = 0; i < frames; i++) {
+    Frame420 f = make_frame(w, h, depth);
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        const double v = x < w / 2 ? 128 + 50 * std::sin((x + 3 * i) / 5.3 + y / 7.1) + 30 * std::cos(x / 3.1 - (y + i) / 2.7)
+                                   : 150 + (x + y) / 32.0;
+        const int l = std::clamp(static_cast<int>(v), 0, 255);
+        if (depth > 8) f.hy[y * f.stride_y() + x] = static_cast<uint16_t>(l * 4);
+        else f.y[y * f.stride_y() + x] = static_cast<uint8_t>(l);
+      }
+    if (depth > 8) std::fill(f.hu.begin(), f.hu.end(), uint16_t(512)), std::fill(f.hv.begin(), f.hv.end(), uint16_t(512));
+    else std::fill(f.u.begin(), f.u.end(), uint8_t(128)), std::fill(f.v.begin(), f.v.end(), uint8_t(128));
+    // Chroma: U textured on the left half, V on the top half, each with its own pattern (units that want their own taps).
+    for (int y = 0; y < h / 2; y++)
+      for (int x = 0; x < w / 2; x++) {
+        const int u = x < w / 4 ? 128 + static_cast<int>(40 * std::sin((x + 2 * i) / 2.3 + y / 4.1)) : 110 + x / 24;
+        const int v = y < h / 4 ? 128 + static_cast<int>(30 * std::cos(y / 1.9 - (x + i) / 3.7)) : 140 - y / 16;
+        const size_t at = static_cast<size_t>(y) * f.stride_uv() + x;
+        if (depth > 8) f.hu[at] = static_cast<uint16_t>(u * 4), f.hv[at] = static_cast<uint16_t>(v * 4);
+        else f.u[at] = static_cast<uint8_t>(u), f.v[at] = static_cast<uint8_t>(v);
+      }
+    const auto bytes = write_y4m_frame_bytes(f);
+    out << "FRAME\n";
+    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  }
+}
+
+// Luma loop restoration per unit (restore_luma()): on write_lr_clip()'s clip some frame has WIENER_NONSEP units and
+// some PC_WIENER units (CELV2_GOP_LOG's lr line), AVM decodes the stream equal to --recon (8 and 10 bits, B frames),
+// and --workers 1, --workers 2 and --device cpu give the same bytes. Chroma (plan_uv_lr()): some plane takes per-unit taps
+// on two or more units (the lr uv line's mode 2), coded against the bank. An odd size in two tile columns (units cut by
+// the tile edge, the frame's odd last row and column) decodes equal to --recon too.
+static int cli_lr_units() {
+  const fs::path dir = fs::temp_directory_path();
+  const fs::path y4m = dir / "celv2_cli_lr.y4m", ivf = dir / "celv2_cli_lr.ivf", recon = dir / "celv2_cli_lr_recon.yuv";
+  EnvGuard on("CELV2_GOP_LOG", "1");
+  for (const int depth : {8, 10}) {
+    write_lr_clip(y4m, 5, depth);
+    std::string err;
+    auto run = [&](const std::string& opts) {
+      return run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 3 --qindex 100" + opts, err) == 0
+                 ? read_bytes(ivf)
+                 : std::string("failed");
+    };
+    const std::string bytes = run(" --recon \"" + recon.string() + "\"");
+    CHECK(bytes != "failed");
+    int wns = 0, pc = 0;
+    for (size_t at = err.find("celv2enc: lr frame"); at != std::string::npos; at = err.find("celv2enc: lr frame", at + 1)) {
+      int frame, type, classes, units, pcu, wnsu;
+      if (std::sscanf(err.c_str() + at, "celv2enc: lr frame %d type %d classes %d units %d pc %d wns %d", &frame, &type, &classes,
+                      &units, &pcu, &wnsu) == 6)
+        wns += wnsu, pc += pcu;
+    }
+    CHECK(wns > 0 && pc > 0);
+    int per_unit = 0;
+    for (size_t at = err.find("celv2enc: lr uv frame"); at != std::string::npos; at = err.find("celv2enc: lr uv frame", at + 1)) {
+      int frame, plane, size, mode, units, on;
+      if (std::sscanf(err.c_str() + at, "celv2enc: lr uv frame %d plane %d size %d mode %d units %d on %d", &frame, &plane, &size,
+                      &mode, &units, &on) == 6 && mode == 2)
+        per_unit = std::max(per_unit, on);
+      std::fprintf(stderr, "%.*s\n", static_cast<int>(err.find('\n', at) - at), err.c_str() + at);
+    }
+    CHECK(per_unit >= 2);
+    CHECK(decodes_as(ivf, recon));
+    if (depth == 8) {
+      const std::string one = run(" --workers 1");
+      CHECK(one == bytes && run(" --workers 2") == one && run(" --device cpu") == one);
+    }
+  }
+  write_lr_clip(y4m, 3, 8, 765, 509);
+  std::string err;
+  CHECK(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --qindex 100 --tile-columns 1 --recon \"" + recon.string() + "\"", err) == 0);
+  CHECK(err.find("celv2enc: lr frame") != std::string::npos);
+  CHECK(decodes_as(ivf, recon));
   return 0;
 }
 
@@ -767,7 +950,8 @@ static int cli_rd_zero() {
   return 0;
 }
 
-// CELV2_PROFILE=1: per-stage CPU time lines at the end, the same bytes as without.
+// CELV2_PROFILE=1: per-stage CPU time lines at the end, and the engine's wall times (the Vulkan wait spec's V0),
+// the same bytes as without.
 static int cli_profile() {
   const fs::path y4m = device_input();
   const fs::path ivf = fs::temp_directory_path() / "celv2_cli_profile.ivf";
@@ -781,8 +965,52 @@ static int cli_profile() {
   }
   CHECK(read_bytes(ivf) == plain);
   for (const char* stage : {"profile: CPU", "profile: reading", "profile: decision", "profile: RD pass", "profile: coder",
-                            "profile: quantization", "profile: entropy coding", "profile: deblocking", "profile: CDEF"})
+                            "profile: quantization", "profile: entropy coding", "profile: deblocking", "profile: CDEF",
+                            "profile: engine wall: launch()", "ms to row 0",
+                            // the hot stages split by the stage they ran under (the speed-first spec's step 0)
+                            "profile:   transforms under RD pass", "profile:   quantization under RD pass",
+                            "profile:   transforms under coder", "profile: RD pass with its transforms and quantization"})
     CHECK(err.find(stage) != std::string::npos);
+  return 0;
+}
+
+// The RD pass's tx_cost() memo (C20) changes no byte: on (the default) and CELV2_TX_MEMO=0 give the same stream,
+// with --tune animation, with --psy-rd (where it is off) and with --preset max.
+static int cli_tx_memo_same_bytes() {
+  const fs::path y4m = device_input();
+  const fs::path ivf = fs::temp_directory_path() / "celv2_cli_tx_memo.ivf";
+  for (const char* extra : {" --tune animation", " --psy-rd 1", " --preset max"}) {
+    std::string err;
+    const std::string args = "-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 1" + extra;
+    CHECK_EQ(run_cli(args, err), 0);
+    const std::string on = read_bytes(ivf);
+    {
+      EnvGuard off("CELV2_TX_MEMO", "0");
+      CHECK_EQ(run_cli(args, err), 0);
+    }
+    CHECK(read_bytes(ivf) == on);
+  }
+  return 0;
+}
+
+// CELV2_RD_STATS=1: the repeat counts and the SATD miss log (the speed-first spec's step 0), the same bytes as
+// without; key frame 64-size intra blocks are scored, so the intra64 line counts some.
+static int cli_rd_stats() {
+  const fs::path y4m = device_input();
+  const fs::path ivf = fs::temp_directory_path() / "celv2_cli_rd_stats.ivf";
+  std::string err;
+  CHECK_EQ(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 1", err), 0);
+  CHECK(err.find("rd-stats:") == std::string::npos);
+  const std::string plain = read_bytes(ivf);
+  {
+    EnvGuard on("CELV2_RD_STATS", "1");
+    CHECK_EQ(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --bframes 1", err), 0);
+  }
+  CHECK(read_bytes(ivf) == plain);
+  for (const char* line : {"rd-stats: tx_cost ", "rd-stats: tx_cost 32x32", "rd-stats: inter_cost", "rd-stats: coder NEWMV",
+                           "rd-stats: intra64", "rd-stats: rd-intra"})
+    CHECK(err.find(line) != std::string::npos);
+  CHECK(err.find("rd-stats: intra64 0 blocks") == std::string::npos);
   return 0;
 }
 
@@ -1384,6 +1612,9 @@ static int cli_workers() {
   CHECK(err.find("--workers") != std::string::npos);
   CHECK(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --chunk-memory 10", err) != 0);
   CHECK(err.find("--chunk-memory") != std::string::npos);
+  CHECK(bytes_of(" --priority below") == bytes_of(""));
+  CHECK(run_cli("-i \"" + y4m.string() + "\" -o \"" + ivf.string() + "\" --priority high", err) != 0);
+  CHECK(err.find("--priority") != std::string::npos);
   return 0;
 }
 
@@ -1617,19 +1848,6 @@ static int cli_device_cpu_matches_gpu() {
   return 0;
 }
 
-// --device cuda: the CUDA engine, kept for one release to compare with; the same bytes (no CUDA GPU: skipped).
-static int cli_device_cuda_matches_gpu() {
-  const fs::path ivf = fs::temp_directory_path() / "celv2_cli_dev_cuda.ivf";
-  std::string err;
-  if (run_cli("-i \"" + device_input().string() + "\" -o \"" + ivf.string() + "\" --device cuda", err) != 0) {
-    CHECK(err.find("no usable CUDA GPU") != std::string::npos);
-    return 0;
-  }
-  CHECK(err.find("decisions on CUDA") != std::string::npos);
-  CHECK(read_bytes(ivf) == read_bytes(kDevGpuIvf));  // written by cli_device_cpu_matches_gpu
-  return 0;
-}
-
 // CELV2_VK_PHASES=A / B (the Vulkan engine's other layouts of the quarter-pel phases): the same
 // bytes as every phase kept, on each Vulkan device (none: skipped).
 static int cli_vk_phase_layouts() {
@@ -1786,7 +2004,6 @@ int main() {
   fails += RUN(cli_rejects_bad_args);
   fails += RUN(cli_tiles_deterministic);
   fails += RUN(cli_device_cpu_matches_gpu);
-  fails += RUN(cli_device_cuda_matches_gpu);
   fails += RUN(cli_device_bogus_rejected);
   fails += RUN(cli_auto_falls_back_without_gpu);
   fails += RUN(cli_device_gpu_without_gpu_fails);
@@ -1794,6 +2011,8 @@ int main() {
   fails += RUN(cli_paq_args);
   fails += RUN(cli_paq);
   fails += RUN(cli_profile);
+  fails += RUN(cli_rd_stats);
+  fails += RUN(cli_tx_memo_same_bytes);
   fails += RUN(cli_vk_phase_layouts);
   fails += RUN(cli_gop_log);
   fails += RUN(cli_gop_change);
@@ -1804,6 +2023,10 @@ int main() {
   fails += RUN(cli_wide_real_cost);
   fails += RUN(cli_wide_switches);
   fails += RUN(cli_rd_zero);
+  fails += RUN(cli_real_trellis);
+  fails += RUN(cli_cdef_units);
+  fails += RUN(cli_ccso_units);
+  fails += RUN(cli_lr_units);
   fails += RUN(cli_frame_list);
 #ifdef CELV2_ORACLE
   fails += RUN(cli_oracle_replay);

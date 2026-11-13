@@ -5,6 +5,7 @@
 #include "core/encoder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,8 @@
 #include "core/profile.h"
 #include "core/psy.h"
 #include "core/quant.h"
+#include "core/rd_pass.h"
+#include "core/real_trellis.h"
 #include "core/global_motion.h"
 #include "gpu/sb_blocks.h"
 #include "core/threads.h"
@@ -30,8 +33,12 @@
 #include "core/transform.h"
 #include "core/wide.h"
 #include "gpu/intra_common.h"
+extern "C" {
+#include "av2/common/txb_common.h"  // get_txb_ctx(), for --real-trellis
+}
 #ifdef CELV2_ORACLE
 #include "oracle.h"
+#include <map>
 extern "C" {
 #include "av2/common/hr_coding.h"
 #include "av2/common/scan.h"
@@ -42,6 +49,7 @@ extern "C" {
 #endif
 
 extern "C" {
+#include "av2/common/cdef.h"
 #include "av2/common/idct.h"
 #include "av2/common/pred_common.h"
 #include "av2/common/quant_common.h"
@@ -339,12 +347,17 @@ class TileCoder {
   int q_ = 0;  // the coded qindex of the superblock being coded (CodecState::sb_qindex())
   double trellis_ = 0;  // --psy-trellis: the strength times the current block's weight (luma only)
   std::vector<Node> nodes_;
+  // --real-trellis: coeff's TCQ levels by the bits BlockWriter::coeffs() will write for them, on the live CDFs and the
+  // block's contexts (core/real_trellis.h). Luma only: AVM's TCQ is.
+  int real_levels(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const tran_low_t* coeff, tran_low_t* q, tran_low_t* dq);
 #ifdef CELV2_ORACLE  // tools/oracle/tile_import.inc
   const celv2::oracle::Frame* imp_frame_ = nullptr;  // from L3 on
   bool imp_again_ = false;  // reconstructing what is already written
   std::unique_ptr<FRAME_CONTEXT> imp_fc_;  // Qc: the superblock's CDFs
   double imp_rate_[2] = {};  // real_quant()'s last bits, by plane > 0 + V
   TXB_CTX imp_ctx_[2] = {};  // and the contexts
+  double q0b_mult_ = 1;      // Q0b: real_quant()'s weight times this
+  void q0b(int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const int16_t* res, const tran_low_t* f0, int f0_eob);
   void real_check(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const tran_low_t* coeff, const tran_low_t* q, int eob);
   bool real_on(int plane, TX_TYPE type, bool tcq) const;
   int real_quant(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const tran_low_t* coeff, tran_low_t* q, tran_low_t* dq, bool tcq, bool eob_u);
@@ -1025,7 +1038,13 @@ void TileCoder::residual_code(int plane, TX_SIZE tx_size, uint16_t* dst, int dst
   tran_low_t coeff[1024], qcoeff[1024], dqcoeff[MAX_TX_SQUARE];
   tran_low_t try_q[1024], try_dq[MAX_TX_SQUARE], prim[1024];
   std::memset(dqcoeff, 0, sizeof(tran_low_t) * tx_size_2d[tx_size]);
-  const bool inter_luma = plane == 0 && is_inter_block(xd->mi[0], xd->tree_type);
+  const bool inter = is_inter_block(xd->mi[0], xd->tree_type);
+  const bool inter_luma = plane == 0 && inter;
+  // Inter IDTX with forward skip coding has no TCQ (av2_read_coeffs_txb_skip()).
+  auto tcq_of = [&](TX_TYPE t) {
+    return tcq_enable(cm->features.tcq_mode, xd->lossless[xd->mi[0]->segment_id], plane, tx_type_to_class[get_primary_tx_type(t)]) &&
+           !use_inter_fsc(cm, get_plane_type(plane), t, inter);
+  };
   const int reduced_set = cm->features.reduced_tx_set_used;
   const TxSetType set = av2_get_ext_tx_set_type(tx_size, inter_luma, reduced_set);
   TX_TYPE types[TX_TYPES] = {DCT_DCT};
@@ -1057,10 +1076,7 @@ void TileCoder::residual_code(int plane, TX_SIZE tx_size, uint16_t* dst, int dst
       else types[1] = most_compact(res, w, tx_size, types + 1, ntypes - 1, coeff), ntypes = 2;
     }
     const TX_TYPE type = types[k];
-    // Inter IDTX with forward skip coding has no TCQ (av2_read_coeffs_txb_skip()).
-    const bool tcq = tcq_enable(cm->features.tcq_mode, xd->lossless[xd->mi[0]->segment_id], plane,
-                                tx_type_to_class[get_primary_tx_type(type)]) &&
-                     !use_inter_fsc(cm, get_plane_type(plane), type, is_inter_block(xd->mi[0], xd->tree_type));
+    const bool tcq = tcq_of(type);
     if (type == DCT_DCT) fwd_dct(res, w, tx_size, enc_.coef_scale(plane, tx_size, xd_), coeff);
     double cost = 0;
     // Rates weighted x0.5 against quantize()'s in the choice (33 frames 1080p q100-190, BD-rate AM demo /
@@ -1085,6 +1101,32 @@ void TileCoder::residual_code(int plane, TX_SIZE tx_size, uint16_t* dst, int dst
     std::memcpy(prim, coeff, sizeof(tran_low_t) * nq);
   }
   if (plane == 0 && eob > 0) ist_search(tx_size, prim, eob, chosen, qcoeff, dqcoeff);
+  // --real-trellis: the chosen coding's levels again, by real bits (a block quantize() left all zero stays so). Where the
+  // levels no longer allow the type (IST's end-of-block limits, a lone intra DC), the type falls back as the decoder reads.
+  if (enc_.cfg_.real_trellis && eob > 0 && tcq_of(chosen)) {
+    tran_low_t c[1024];
+    auto requant = [&](TX_TYPE t) {
+      const int stx = get_secondary_tx_type(t);
+      if (stx) {
+        std::memcpy(c, prim, sizeof(tran_low_t) * nq);
+        const PREDICTION_MODE mode = inter ? DC_PRED : static_cast<PREDICTION_MODE>(get_intra_mode(xd->mi[0], PLANE_TYPE_Y));
+        fwd_ist(c, tx_size, get_primary_tx_type(t), mode, get_secondary_tx_set(t), stx, cm->seq_params.bit_depth);
+      }
+      return real_levels(plane, blk_row, blk_col, tx_size, t, stx ? c : prim, qcoeff, dqcoeff);
+    };
+    eob = requant(chosen);
+    if (get_secondary_tx_type(chosen) &&
+        ((inter ? eob <= 3 : eob == 1) || !block_signals_sec_tx_type(xd, tx_size, get_primary_tx_type(chosen), eob))) {
+      chosen = get_primary_tx_type(chosen);
+      eob = requant(chosen);
+    }
+    if (plane == 0 && !inter && eob == 1 && chosen != DCT_DCT) {  // a lone DC codes no type: the decoder takes DCT
+      chosen = DCT_DCT;
+      fwd_dct(res, w, tx_size, enc_.coef_scale(plane, tx_size, xd_), prim);
+      eob = requant(chosen);
+    }
+    if (!eob) chosen = DCT_DCT;
+  }
   bw_->coeffs(plane, blk_row, blk_col, tx_size, qcoeff, eob, chosen);
   if (eob) {
     const PLANE_TYPE plane_type = get_plane_type(plane);
@@ -1266,6 +1308,29 @@ void TileCoder::ist_search(TX_SIZE tx, const tran_low_t* prim, int& eob, TX_TYPE
   std::memcpy(dqcoeff, best_dq, sizeof(tran_low_t) * tx_size_2d[tx]);
 }
 
+int TileCoder::real_levels(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const tran_low_t* coeff, tran_low_t* q,
+                           tran_low_t* dq) {
+  AV2_COMMON* const cm = cm_;
+  MACROBLOCKD* const xd = xd_;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  struct macroblockd_plane* const pd = &xd->plane[plane];
+  const BLOCK_SIZE plane_bsize = get_mb_plane_block_size(xd, mbmi, plane, pd->subsampling_x, pd->subsampling_y);
+  const bool inter = is_inter_block(mbmi, xd->tree_type), fsc = mbmi->fsc_mode[xd->tree_type == CHROMA_PART] != 0;
+  TXB_CTX ctx;
+  get_txb_ctx(plane_bsize, tx, plane, pd->above_entropy_context + blk_col, pd->left_entropy_context + blk_row, &ctx,
+              fsc && cm->seq_params.enable_fsc);
+  const FRAME_CONTEXT* const fc = xd->tile_ctx;  // what BlockWriter::coeffs() codes this block's symbols with
+  const avm_cdf_prob* const flag = fc->txb_skip_cdf[inter || fsc][get_txsize_entropy_ctx(tx)][ctx.txb_skip_ctx];
+  // Half avmenc's weight (of the DC step; Q0's Qa):
+  // 33 frames, 8 sources, BD-rate against off x1 +1.91%, x0.7 -0.83%, x0.5 -1.91% (every source), x0.35 -1.74%, x0.25 -0.85%.
+  // tcq true: TCQ is luma 2D only (tcq_enable()), and only TCQ blocks come here.
+  const celv2::real::Block b{fc, tx, type, plane, get_eob_plane_ctx(plane, inter), ctx.dc_sign_ctx, q_, cm->seq_params.bit_depth, true,
+                             {celv2::real::bits512(flag, 0), celv2::real::bits512(flag, 1)},
+                             celv2::real::lam_of(q_, tx, celv2::real::avmenc_weight(inter, plane) * 0.5)};
+  int64_t bits = 0;
+  return celv2::real::levels(b, coeff, q, dq, &bits);
+}
+
 #ifdef CELV2_ORACLE
 #include "tile_import.inc"
 #endif
@@ -1276,6 +1341,88 @@ double Encoder::sse_per_bit(int coded_qindex) {
   const double step = av2_ac_quant_QTX(coded_qindex, 0, 0, kQDepth) / static_cast<double>(1 << QUANT_TABLE_BITS) /
                       luma_scale(TX_8X8);
   return 0.025 * step * step;
+}
+
+void Encoder::side_costs(SideCosts& o) const {
+  const AV2_COMMON* const cm = st_->cm();
+  const FRAME_CONTEXT* const fc = cm->fc;
+  auto bits = [](const avm_cdf_prob* icdf, int s) {  // as BlockWriter's symbol_bits()
+    const int hi = s > 0 ? icdf[s - 1] : CDF_PROB_TOP, p = hi - icdf[s];
+    return std::log2(static_cast<double>(CDF_PROB_TOP) / (p > 0 ? p : 1));
+  };
+  auto mean = [](int n, auto f) {  // a symbol's bits over its n contexts
+    double s = 0;
+    for (int c = 0; c < n; c++) s += f(c);
+    return s / n;
+  };
+  auto q = [](double b) { return static_cast<int>(std::lround(b * 512)); };
+  // BlockWriter::partition()'s symbols, where an inner block has them (frame edges force theirs).
+  auto part = [&](BLOCK_SIZE bs, PARTITION_TYPE p) -> double {
+    bool allowed[ALL_PARTITION_TYPES] = {};
+    const CHROMA_REF_INFO cri{1, 0, 0, 0, bs, bs};
+    // The writer's region: inter frames code their trees in MIXED_INTER_INTRA_REGION (8x4 / 4x8: NONE only).
+    const REGION_TYPE region = frame_is_intra_only(cm) ? INTRA_REGION : MIXED_INTER_INTRA_REGION;
+    init_allowed_partitions_for_signaling(allowed, cm, SHARED_PART, region, 0, 0, cm->seq_params.subsampling_x,
+                                          cm->seq_params.subsampling_y, bs, &cri);
+    if (!allowed[p]) return 64;  // shortcut: the pass never builds these but where the frame edge forces them
+    if (only_allowed_partition(allowed) != PARTITION_INVALID) return 0;
+    double b = 0;
+    bool implied;
+    if (!is_do_split_implied(allowed, &implied))
+      b += mean(4, [&](int c) { return bits(fc->do_split_cdf[0][partition_plane_context_helper(c, bs, SPLIT_CTX_MODE)], p != PARTITION_NONE); });
+    if (p == PARTITION_NONE) return b;
+    if (allowed[PARTITION_SPLIT]) {
+      b += mean(4, [&](int c) {
+        return bits(fc->do_square_split_cdf[0][partition_plane_context_helper(c, bs, SQUARE_SPLIT_CTX_MODE)], p == PARTITION_SPLIT);
+      });
+      if (p == PARTITION_SPLIT) return b;
+    }
+    RECT_PART_TYPE rect = rect_type_implied_by_bsize(bs, SHARED_PART);
+    if (rect == RECT_INVALID) rect = only_allowed_rect_type(allowed);
+    if (rect == RECT_INVALID)
+      b += mean(4, [&](int c) {
+        return bits(fc->rect_type_cdf[0][partition_plane_context_helper(c, bs, RECT_TYPE_CTX_MODE)], p == PARTITION_VERT ? VERT : HORZ);
+      });
+    return b;
+  };
+  const BLOCK_SIZE sq[4] = {BLOCK_64X64, BLOCK_32X32, BLOCK_16X16, BLOCK_8X8};
+  const BLOCK_SIZE half[4][2] = {{BLOCK_64X32, BLOCK_32X64}, {BLOCK_32X16, BLOCK_16X32}, {BLOCK_16X8, BLOCK_8X16}, {BLOCK_8X4, BLOCK_4X8}};
+  const PARTITION_TYPE sq_parts[4] = {PARTITION_NONE, PARTITION_HORZ, PARTITION_VERT, PARTITION_SPLIT};
+  for (int l = 0; l < 4; l++) {
+    for (int k = 0; k < 4; k++) o.part_sq[l][k] = q(part(sq[l], sq_parts[k]));
+    for (int dir = 0; dir < 2; dir++) {  // a HORZ half splits into its squares VERT, a VERT half HORZ
+      o.part_half[l][dir][0] = q(part(half[l][dir], PARTITION_NONE));
+      o.part_half[l][dir][1] = q(part(half[l][dir], dir == 0 ? PARTITION_VERT : PARTITION_HORZ));
+    }
+    // AV2 has square SPLIT only from 128x128: TileCoder::parse_tree() codes it as HORZ, then VERT on each half.
+    o.part_sq[l][3] = o.part_sq[l][1] + 2 * o.part_half[l][0][1];
+  }
+  // inter_frame_mode_info()'s flags of an inter block. Intra blocks keep the constants: their real flags (skip_mode
+  // 0, is_inter 0) besides the modes' bits and kIntraInInterBits, 33 frames at bit weight 0.025: YUV -0.61% against
+  // -0.70%.
+  const double skip_mode =
+      cm->current_frame.skip_mode_info.skip_mode_flag ? mean(SKIP_MODE_CONTEXTS, [&](int c) { return bits(fc->skip_mode_cdfs[c], 0); }) : 0;
+  const double skip_txfm = mean(SKIP_CONTEXTS, [&](int c) { return bits(fc->skip_txfm_cdfs[c], 0); });
+  o.inter_block = q(skip_mode + mean(INTRA_INTER_CONTEXTS, [&](int c) { return bits(fc->intra_inter_cdf[c], 1); }) + skip_txfm);
+  o.skip_txfm = q(skip_txfm);
+  const bool select = cm->current_frame.reference_mode == REFERENCE_MODE_SELECT;
+  o.single = select ? q(mean(COMP_INTER_CONTEXTS, [&](int c) { return bits(fc->comp_inter_cdf[c], 0); })) : 0;
+  o.compound = select ? q(mean(COMP_INTER_CONTEXTS, [&](int c) { return bits(fc->comp_inter_cdf[c], 1); })) : 0;
+  // inter_block_mode_info()'s single reference: truncated unary.
+  const int n_refs = std::max(1, std::min<int>(8, cm->ref_frames_info.num_total_refs));
+  for (int r = 0; r < 8; r++) {
+    double b = 0;
+    for (int i = 0; i < std::min(r, n_refs - 1); i++) b += mean(REF_CONTEXTS, [&](int c) { return bits(fc->single_ref_cdf[c][i], 0); });
+    if (r < n_refs - 1) b += mean(REF_CONTEXTS, [&](int c) { return bits(fc->single_ref_cdf[c][r], 1); });
+    o.ref[r] = q(b);
+  }
+  const double drl = mean(DRL_MODE_CONTEXTS, [&](int c) { return bits(fc->drl_cdf[0][c], 0); });
+  o.nearmv = q(drl + mean(INTER_MODE_CONTEXTS, [&](int c) { return bits(fc->inter_single_mode_cdf[c], NEARMV - SINGLE_INTER_MODE_START); }));
+  o.newmv = q(drl + mean(INTER_MODE_CONTEXTS, [&](int c) { return bits(fc->inter_single_mode_cdf[c], NEWMV - SINGLE_INTER_MODE_START); }));
+  o.new_new = q(drl + mean(NUM_CTX_IS_JOINT, [&](int c) { return bits(fc->inter_compound_mode_is_joint_cdf[c], 0); }) +
+                mean(NUM_CTX_NON_JOINT_TYPE, [&](int c) {
+                  return bits(fc->inter_compound_mode_non_joint_type_cdf[c], INTER_COMPOUND_OFFSET(NEW_NEWMV));
+                }));
 }
 
 double Encoder::luma_scale(TX_SIZE tx) {
@@ -1535,11 +1682,17 @@ static void set_global_motion(AV2_COMMON* cm, const Frame420& src, int* dist) {
 
 std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, const RowGate* gate) {
   celv2::StageScope prof(celv2::Stage::Coder);
+  auto t = std::chrono::steady_clock::now();
+  auto lap = [&](celv2::Wall w) {
+    const auto n = std::chrono::steady_clock::now();
+    celv2::add_wall(w, std::chrono::duration<double, std::milli>(n - t).count());
+    t = n;
+  };
   const bool key = key_;
   if (src.width != cfg_.width || src.height != cfg_.height)
     throw std::invalid_argument("source frame size does not match the sequence");
   AV2_COMMON* const cm = st_->cm();
-  // Sizes only: GpuEngine::launch() sets them before any row is published.
+  // Sizes only: the engine's launch() sets them before any row is published.
   // 64x64 decisions also serve 128x128 superblocks (compose_sb()).
   if ((dm.sb_size != block_size_wide[cm->seq_params.sb_size] &&
        !(dm.sb_size == 64 && cm->seq_params.sb_size == BLOCK_128X128)) ||
@@ -1561,6 +1714,7 @@ std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, c
     celv2::StageScope gm(celv2::Stage::GlobalMotion);
     set_global_motion(cm, src, st_->gm_ref_dist);
   }
+  lap(celv2::Wall::Gm);
 
   // Tiles are independent (own contexts, CDFs and above-context range); within a tile the
   // superblock rows run in a wavefront (Wavefront), each logging its symbols, and the rows' logs
@@ -1619,8 +1773,10 @@ std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, c
   } else {
     celv2::parallel(static_cast<int>(rows.size()), code_row);
   }
+  lap(celv2::Wall::Rows);
   // The in-loop filters before the range coding: the restoration flags the tiles defer come from them.
   st_->end_frame(src, sse_per_bit(cm->quant_params.base_qindex));
+  lap(celv2::Wall::Filters);
   celv2::parallel(n, [&](int t) {
     const TileInfo& ti = st_->xd(t)->tile;
     const size_t pels = static_cast<size_t>(ti.mi_row_end - ti.mi_row_start) *
@@ -1630,10 +1786,34 @@ std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, c
     avm_start_encode(&w, out[t].buf.data());
     w.allow_update_cdf = update;
     int base_qindex = cm->quant_params.base_qindex;
+    // read_cdef() of the 64x64 unit at the block (mi_row, mi_col): its index into the frame's set
+    // (CodecState::cdef() wrote it into the unit's first MB_MODE_INFO), on its final neighbours'
+    // context, which the decoder also has by then (left and above units are read before it).
+    MACROBLOCKD* const xd = st_->xd(t);
+    auto cdef_index = [&](avm_writer* w, int mi_row, int mi_col) {
+      const CdefInfo& ci = cm->cdef_info;
+      if (!ci.cdef_frame_enable || ci.nb_cdef_strengths == 1) return;
+      xd->mi_row = mi_row, xd->mi_col = mi_col;
+      const int v = cm->mi_params.mi_grid_base[fetch_cdef_mi_grid_index(cm, xd)]->cdef_strength;
+      if (v < 0) throw std::logic_error("a CDEF index logged for an unfiltered unit");
+      avm_write_symbol(w, v == 0, xd->tile_ctx->cdef_strength_index0_cdf[av2_get_cdef_context(cm, xd)], 2);
+      if (v && ci.nb_cdef_strengths > 2) avm_write_symbol(w, v - 1, xd->tile_ctx->cdef_cdf[ci.nb_cdef_strengths - 3], ci.nb_cdef_strengths - 1);
+    };
+    // read_ccso() of plane's unit at a block: the flag CodecState::ccso() wrote into the unit's first
+    // MB_MODE_INFO, on the context of the block's neighbours, whose flags are final by now too.
+    auto ccso_flag = [&](avm_writer* w, int plane, MB_MODE_INFO* first, MB_MODE_INFO* n0, MB_MODE_INFO* n1) {
+      const CcsoInfo& ci = cm->ccso_info;
+      if (!ci.ccso_frame_flag || !ci.ccso_enable[plane]) return;
+      xd->neighbors[0] = n0, xd->neighbors[1] = n1;
+      const int v = plane == 0 ? first->ccso_blk_y : plane == 1 ? first->ccso_blk_u : first->ccso_blk_v;
+      avm_write_symbol(w, v, xd->tile_ctx->ccso_cdf[plane][av2_get_ccso_context(cm, xd, plane)], 2);
+    };
     try {
       // tile_ctx: the CDFs as begin_tile() set them; the replay leaves the tile's final ones there.
       celv2::StageScope ec(celv2::Stage::Entropy);
-      for (const SymbolLog& log : out[t].logs) log.replay(&w, st_->xd(t)->tile_ctx, &base_qindex, st_->lr_flags().data());
+      auto lr_uv = [&](avm_writer* w, int mi_row, int mi_col) { st_->write_lr_uv(w, xd->tile_ctx, mi_row, mi_col); };
+      for (const SymbolLog& log : out[t].logs)
+        log.replay(&w, xd->tile_ctx, &base_qindex, st_->lr_flags().data(), cdef_index, ccso_flag, lr_uv);
     } catch (...) {
       avm_stop_encode(&w);
       throw;
@@ -1642,6 +1822,7 @@ std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, c
     out[t].size = w.pos;
   });
   st_->save_contexts();
+  lap(celv2::Wall::Entropy);
 
   // After the in-loop filters: the header carries the CDEF strengths chosen on the frame.
   std::vector<uint8_t> payload = write_frame_header(cfg_, *st_, key);
@@ -1665,6 +1846,7 @@ std::vector<uint8_t> Encoder::code(const Frame420& src, const DecisionMap& dm, c
   }
   const auto frame = make_obu(key ? OBU_CLOSED_LOOP_KEY : OBU_REGULAR_TILE_GROUP, payload);
   tu.insert(tu.end(), frame.begin(), frame.end());
+  lap(celv2::Wall::Header);
   return tu;
 }
 

@@ -30,10 +30,14 @@ int TileCoder::real_quant(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_TY
   // avmenc's weight: RDMULT_FROM_Q2_NUM / _DEN, plane_rd_mult, rshift 2 and RDCOST's scale; of the DC step.
   static const int plane_mult[2][2] = {{17, 13}, {16, 10}};
   static const double depth_factor[6] = {1, 1, 1.125, 1.25, 1.25, 1.40625};  // rd_layer_depth_factor
-  double weight = 84.0 / 32 * plane_mult[inter][plane > 0] / 4 / 128;
-  if (mode & oracle::kRealDepth) weight *= depth_factor[oracle::depth(static_cast<int>(cm->current_frame.display_order_hint))];
-  const real::Block b{fc, tx, type, plane, get_eob_plane_ctx(plane, inter), ctx.dc_sign_ctx, q_, cm->seq_params.bit_depth, tcq,
-                      {real::bits(flag, 0), real::bits(flag, 1)}, weight};
+  const int display = static_cast<int>(cm->current_frame.display_order_hint), bd = cm->seq_params.bit_depth;
+  double weight = 84.0 / 32 * plane_mult[inter][plane > 0] / 4 / 128 * q0b_mult_ * oracle::real_weight(display);
+  if (mode & oracle::kRealDepth) weight *= depth_factor[oracle::depth(display)];
+  real::Block b{fc, tx, type, plane, get_eob_plane_ctx(plane, inter), ctx.dc_sign_ctx, q_, bd, tcq,
+                {real::bits(flag, 0), real::bits(flag, 1)}, weight};
+  if (mode & oracle::kRealZbin) {  // get_qzbin_factor(): the first quantizer's zero bin, where av2_trellis_quant() starts
+    b.start = (av2_dc_quant_QTX(q_, 0, 0, kQDepth) < (2368 << QUANT_TABLE_BITS) ? 84 : 80) / 128.0;  // the 12-bit table, as levels()
+  }
   return real::levels(b, coeff, q, dq, &imp_rate_[plane == AVM_PLANE_V]);
 }
 
@@ -74,6 +78,84 @@ void TileCoder::real_check(int plane, int blk_row, int blk_col, TX_SIZE tx, TX_T
       golomb++;
       break;
     }
+}
+
+// Q0b of the real-cost trellis spec (X_ORACLE_Q0B=file, at L6 beside X_ORACLE_Q): F0's luma TCQ residual through
+// real::levels() at seven weights, changing no byte. Per frame and per 64x64: the area with F0's levels, and where a block
+// differs, end of block past F0's, before it, the same end with other levels, or F0 all zero; nonzero levels against F0's.
+namespace q0b_log {
+constexpr int kW = 7;
+constexpr double kMult[kW] = {0.7, 0.85, 1, 1.19, 1.41, 1.68, 2};
+enum { kSame, kPast, kShort, kOther, kF0Zero, kNz, kKinds };
+struct Cell {
+  long long area = 0, f0_nz = 0, v[kW][kKinds] = {};
+};
+const char* path() {
+  static const char* const p = std::getenv("X_ORACLE_Q0B");
+  return p && *p ? p : nullptr;
+}
+struct Log {
+  std::mutex m;
+  std::map<std::pair<int, int>, Cell> cells;  // (display, 64x64 as y << 16 | x; -1: the frame)
+  ~Log() {
+    FILE* const f = path() ? std::fopen(path(), "w") : nullptr;
+    if (!f) return;
+    std::fprintf(f, "# display cell area f0_nz, then per weight x0.7..x2: same past short other f0zero nz\n");
+    for (const auto& [k, c] : cells) {
+      std::fprintf(f, "%d %d %lld %lld", k.first, k.second, c.area, c.f0_nz);
+      for (int w = 0; w < kW; w++)
+        for (int i = 0; i < kKinds; i++) std::fprintf(f, " %lld", c.v[w][i]);
+      std::fputc('\n', f);
+    }
+    std::fclose(f);
+  }
+};
+Log& log() {
+  static Log l;
+  return l;
+}
+}  // namespace q0b_log
+
+void TileCoder::q0b(int blk_row, int blk_col, TX_SIZE tx, TX_TYPE type, const int16_t* res, const tran_low_t* f0, int f0_eob) {
+  MACROBLOCKD* const xd = xd_;
+  MB_MODE_INFO* const mbmi = xd->mi[0];
+  const bool inter = is_inter_block(mbmi, xd->tree_type);
+  const TX_TYPE primary = get_primary_tx_type(type);
+  if (mbmi->fsc_mode[0] || use_inter_fsc(cm_, PLANE_TYPE_Y, type, inter) ||
+      !tcq_enable(cm_->features.tcq_mode, xd->lossless[mbmi->segment_id], 0, tx_type_to_class[primary]) || !real_on(0, type, true))
+    return;
+  const int w = tx_size_wide[tx], h = tx_size_high[tx], n = get_txb_wide(tx) * get_txb_high(tx);
+  tran_low_t coeff[1024], q[1024], dq[MAX_TX_SQUARE];
+  import_forward(res, w, tx, primary, 0, coeff);
+  if (const int stx = get_secondary_tx_type(type)) {
+    const PREDICTION_MODE mode = inter ? DC_PRED : static_cast<PREDICTION_MODE>(get_intra_mode(mbmi, PLANE_TYPE_Y));
+    fwd_ist(coeff, tx, primary, mode, get_secondary_tx_set(type), stx, cm_->seq_params.bit_depth);
+  }
+  q0b_log::Cell c;
+  c.area = static_cast<long long>(w) * h;
+  for (int i = 0; i < n; i++) c.f0_nz += f0[i] != 0;
+  const double saved = imp_rate_[0];
+  const TXB_CTX saved_ctx = imp_ctx_[0];
+  for (int k = 0; k < q0b_log::kW; k++) {
+    q0b_mult_ = q0b_log::kMult[k];
+    const int eob = real_quant(0, blk_row, blk_col, tx, type, coeff, q, dq, true, false);
+    bool same = eob == f0_eob;
+    long long nz = 0;
+    for (int i = 0; i < n; i++) nz += q[i] != 0, same = same && q[i] == f0[i];
+    c.v[k][q0b_log::kNz] = nz;
+    c.v[k][same ? q0b_log::kSame : !f0_eob ? q0b_log::kF0Zero : eob > f0_eob ? q0b_log::kPast : eob < f0_eob ? q0b_log::kShort : q0b_log::kOther] = c.area;
+  }
+  q0b_mult_ = 1, imp_rate_[0] = saved, imp_ctx_[0] = saved_ctx;
+  const int x = (xd->mi_col + blk_col) * MI_SIZE, y = (xd->mi_row + blk_row) * MI_SIZE;
+  const int disp = static_cast<int>(cm_->current_frame.display_order_hint);
+  q0b_log::Log& l = q0b_log::log();
+  std::lock_guard<std::mutex> lock(l.m);
+  for (const int cell : {-1, (y >> 6) << 16 | (x >> 6)}) {
+    q0b_log::Cell& t = l.cells[{disp, cell}];
+    t.area += c.area, t.f0_nz += c.f0_nz;
+    for (int k = 0; k < q0b_log::kW; k++)
+      for (int i = 0; i < q0b_log::kKinds; i++) t.v[k][i] += c.v[k][i];
+  }
 }
 
 const OracleTx* TileCoder::imp_tx(int plane, int blk_row, int blk_col, TX_SIZE tx) const {
@@ -169,6 +251,7 @@ void TileCoder::import_residual(int plane, TX_SIZE tx, uint16_t* dst, int dst_st
   if (lv >= 6) {
     if (!plane && t) full = mbmi->fsc_mode[0] ? IDTX : static_cast<TX_TYPE>(t->tx_type);
     eob = import_levels(t, tx, q, dq);
+    if (!plane && !imp_again_ && q0b_log::path()) q0b(blk_row, blk_col, tx, full, res, q, eob);
   } else {
     eob = code(full);
     if (!plane && get_secondary_tx_type(full) &&

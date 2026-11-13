@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
 extern "C" {
+#include "av2/common/blockd.h"
 #include "av2/common/entropy.h"
 #include "av2/common/entropymode.h"
 #include "avm_dsp/binary_codes_writer.h"
@@ -52,6 +54,22 @@ class SymbolLog {
     bits_ += 1;
   }
   void quniform(uint16_t n, uint16_t v) { log_.push_back({static_cast<uint32_t>(n) << 3 | kQuniform, v}); }
+  // read_cdef()'s strength index of the 64x64 unit at this block, decided after the tile is logged
+  // (CodecState::cdef()): replay() hands the position to its cdef callback, which codes it on the
+  // unit's final neighbours. No CDF adapts here (nothing estimates bits from the CDEF CDFs).
+  void cdef(int mi_row, int mi_col) { log_.push_back({kCdef, mi_row << 16 | mi_col}); }
+  // loop_restoration_read_sb_coeffs() of the chroma units in the superblock at this position, decided after the tile
+  // is logged (CodecState::restore(): unit size, types and taps): replay() hands the position to its lr callback. A
+  // kCdef entry with bit 3 set. No CDF adapts here.
+  void lr(int mi_row, int mi_col) { log_.push_back({1u << 3 | kCdef, mi_row << 16 | mi_col}); }
+  // read_ccso()'s flag of plane's unit at this block, decided after the tile is logged
+  // (CodecState::ccso()): replay() hands its ccso callback the unit's first MB_MODE_INFO (the flag's
+  // home) and the block's context neighbours (xd->neighbors, as av2_get_ccso_context() reads them;
+  // the frame's mi grid keeps them valid). No CDF adapts here.
+  void ccso(int plane, MB_MODE_INFO* first, MB_MODE_INFO* n0, MB_MODE_INFO* n1) {
+    log_.push_back({kCcso, static_cast<int32_t>(ccso_.size())});
+    ccso_.push_back({plane, first, n0, n1});
+  }
   // read_delta_qindex() for a superblock coded at qindex: the step from the qindex of the superblock
   // coded before it in raster order, which another row may decide, so replay() takes it. abs: the
   // step's size as the row sees it, adapting delta_q_cdf meanwhile.
@@ -63,8 +81,12 @@ class SymbolLog {
 
   // Codes the log into w, adapting the CDFs at fc (same layout as the logged ones) as it goes;
   // base_qindex: the qindex delta_q() steps from, carried over to the next row's log. deferred:
-  // the values of deferred() symbols, by their index.
-  void replay(avm_writer* w, FRAME_CONTEXT* fc, int* base_qindex, const uint8_t* deferred = nullptr) const {
+  // the values of deferred() symbols, by their index. cdef: codes a cdef() entry's index; ccso: a
+  // ccso() entry's flag; lr: an lr() entry's units.
+  void replay(avm_writer* w, FRAME_CONTEXT* fc, int* base_qindex, const uint8_t* deferred = nullptr,
+              const std::function<void(avm_writer*, int, int)>& cdef = {},
+              const std::function<void(avm_writer*, int, MB_MODE_INFO*, MB_MODE_INFO*, MB_MODE_INFO*)>& ccso = {},
+              const std::function<void(avm_writer*, int, int)>& lr = {}) const {
     avm_cdf_prob* const base = reinterpret_cast<avm_cdf_prob*>(fc);
     for (const Entry& e : log_) {
       switch (e.a & 7) {
@@ -73,6 +95,16 @@ class SymbolLog {
           if (!deferred) throw std::logic_error("a deferred symbol without its values");
           if (deferred[e.v] < ((e.a >> 3) & 63)) avm_write_symbol(w, deferred[e.v], base + (e.a >> 9), (e.a >> 3) & 63);
           break;
+        case kCdef:
+          if (!((e.a >> 3) ? lr : cdef)) throw std::logic_error("a CDEF index or restoration units without their writer");
+          ((e.a >> 3) ? lr : cdef)(w, e.v >> 16, e.v & 0xffff);
+          break;
+        case kCcso: {
+          if (!ccso) throw std::logic_error("a CCSO flag without its writer");
+          const CcsoRef& r = ccso_[e.v];
+          ccso(w, r.plane, r.first, r.n0, r.n1);
+          break;
+        }
         case kLiteral: avm_write_literal(w, e.v, static_cast<int>(e.a >> 3)); break;
         case kBit: avm_write_bit(w, e.v); break;
         case kQuniform:
@@ -102,13 +134,17 @@ class SymbolLog {
   void truncate(size_t n) { log_.resize(n); }
 
  private:
-  enum : uint32_t { kSymbol, kLiteral, kBit, kQuniform, kDeltaQ, kDeferred };
+  enum : uint32_t { kSymbol, kLiteral, kBit, kQuniform, kDeltaQ, kDeferred, kCdef, kCcso };
   static constexpr size_t kCdfs = sizeof(FRAME_CONTEXT) / sizeof(avm_cdf_prob);
   static constexpr size_t kDeltaQCdf = offsetof(FRAME_CONTEXT, delta_q_cdf) / sizeof(avm_cdf_prob);
   static_assert(kCdfs < (1u << 23), "CDF offsets take 23 bits");
   struct Entry {
     uint32_t a;  // symbol: CDF offset << 9 | symbols << 3 | kind; others: width, n or res << 3 | kind
     int32_t v;
+  };
+  struct CcsoRef {
+    int plane;
+    MB_MODE_INFO *first, *n0, *n1;
   };
   void add_bits(const avm_cdf_prob* cdf, int v) {
     const int hi = v ? cdf[v - 1] : CDF_PROB_TOP, p = hi - cdf[v];
@@ -119,4 +155,5 @@ class SymbolLog {
   bool count_ = false;
   double bits_ = 0;
   std::vector<Entry> log_;
+  std::vector<CcsoRef> ccso_;  // ccso() entries' operands (truncate() leaves it: the indices stay unique)
 };
